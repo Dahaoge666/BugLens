@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from app import api
 from app.agents import NodeExecutionError, NodeRuntimeContext, OpenAINodeRunner
+from app.config import Settings
 from app.graph import DiagnosisGraph
 from app.models import (
     AnalyzeInput,
@@ -432,6 +433,35 @@ def test_api_cancel(tmp_path):
         run = client.post("/diagnoses", json={"question": "timeout"}).json()["run_id"]
         result = client.post(f"/diagnoses/{run}/cancel")
         assert result.status_code == 200 and result.json()["status"] == "inconclusive"
+
+
+def test_health_endpoint(tmp_path):
+    graph, _ = setup_graph(tmp_path, [])
+    with TestClient(api.create_app(DiagnosisService(graph))) as client:
+        assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_settings_from_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("BUGLENS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("BUGLENS_PROMPT_CONFIG", "config/prompts.yaml")
+    monkeypatch.setenv("BUGLENS_HOST", "0.0.0.0")
+    monkeypatch.setenv("BUGLENS_PORT", "9000")
+    monkeypatch.setenv("BUGLENS_LOG_LEVEL", "DEBUG")
+    settings = Settings.from_env()
+    assert settings.state_dir == tmp_path
+    assert settings.prompt_config == Path("config/prompts.yaml")
+    assert (settings.host, settings.port, settings.log_level) == (
+        "0.0.0.0",
+        9000,
+        "debug",
+    )
+
+
+@pytest.mark.parametrize("port", ["invalid", "0", "65536"])
+def test_settings_reject_invalid_port(monkeypatch, port):
+    monkeypatch.setenv("BUGLENS_PORT", port)
+    with pytest.raises(ValueError):
+        Settings.from_env()
 
 
 def test_api_provider_failure_is_persisted_without_details(tmp_path):

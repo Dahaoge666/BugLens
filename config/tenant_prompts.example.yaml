@@ -1,0 +1,8 @@
+version: team-v1
+tenants:
+  example-team:
+    categories:
+      performance: |
+        P99 延迟目标为 500ms，优先检查 PostgreSQL 和 Redis。
+      integration: |
+        所有上下游调用均应通过 request_id 关联。

@@ -1,9 +1,12 @@
 .venv/
+.package-test/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
 data/
+dist/
+build/
 .env
 .env.*
 !.env.example

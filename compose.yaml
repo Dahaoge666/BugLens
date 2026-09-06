@@ -1,0 +1,19 @@
+services:
+  buglens:
+    build: .
+    image: buglens:local
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in the environment or .env}
+      BUGLENS_HOST: 0.0.0.0
+      BUGLENS_STATE_DIR: /var/lib/buglens/runs
+      BUGLENS_LOG_LEVEL: ${BUGLENS_LOG_LEVEL:-info}
+      BUGLENS_PROMPT_CONFIG: ${BUGLENS_PROMPT_CONFIG:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - buglens-data:/var/lib/buglens
+      - ./config:/etc/buglens:ro
+    restart: unless-stopped
+
+volumes:
+  buglens-data:

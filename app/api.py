@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .agents import OpenAINodeRunner
+from .config import Settings
 from .graph import DiagnosisGraph
 from .models import (
     CreateDiagnosisRequest,
@@ -71,11 +72,17 @@ def response_payload(state: DiagnosisState) -> dict:
     return base
 
 
-def create_app(service: DiagnosisService | None = None) -> FastAPI:
+def create_app(
+    service: DiagnosisService | None = None,
+    settings: Settings | None = None,
+) -> FastAPI:
     if service is None:
-        prompts = PromptRegistry()
+        settings = settings or Settings.from_env()
+        prompts = PromptRegistry(settings.prompt_config)
         service = DiagnosisService(
-            DiagnosisGraph(OpenAINodeRunner(prompts), JsonStateStore(), prompts)
+            DiagnosisGraph(
+                OpenAINodeRunner(prompts), JsonStateStore(settings.state_dir), prompts
+            )
         )
     app = FastAPI(title="BugLens", version="0.1.0")
 
@@ -101,6 +108,10 @@ def create_app(service: DiagnosisService | None = None) -> FastAPI:
     @app.post("/diagnoses", status_code=201)
     async def create_diagnosis(request: CreateDiagnosisRequest) -> dict:
         return response_payload(await service.create(request))
+
+    @app.get("/health", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
     @app.post("/diagnoses/{run_id}/answers")
     async def submit_answers(run_id: str, request: SubmitAnswersRequest) -> dict:
