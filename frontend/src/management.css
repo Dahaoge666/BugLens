@@ -179,6 +179,7 @@
 .setup-banner p { margin: 5px 0 0; color: #749993; font-size: 10px; }
 .setup-step { margin-left: auto; color: #6bbeb2; font: 10px 'DM Mono', monospace; }
 .settings-layout { display: grid; grid-template-columns: 1.2fr .8fr; gap: 20px; }
+.settings-full { grid-column: 1 / -1; }
 .settings-form label { display: block; color: #acbfcb; font-size: 11px; margin: 20px 0; }
 .settings-form label:first-of-type { margin-top: 0; }
 .settings-form input, .settings-form select { display: block; width: 100%; margin-top: 8px; border: 1px solid #293f52; border-radius: 6px; padding: 10px 11px; color: #d9e7ed; outline: 0; background: rgba(7, 14, 22, .72); }
@@ -198,6 +199,11 @@
 .model-add { margin-top: 4px; }
 .node-config-row .node-name select { appearance: none; }
 .config-preview { background: rgba(16, 28, 40, .6); }
+.model-card label { display: block; color: #acbfcb; font-size: 11px; margin: 12px 0; }
+.model-card label:first-of-type { margin-top: 0; }
+.model-card input, .model-card select { display: block; width: 100%; margin-top: 8px; border: 1px solid #293f52; border-radius: 6px; padding: 10px 11px; color: #d9e7ed; outline: 0; background: rgba(7, 14, 22, .72); }
+.model-card input:focus, .model-card select:focus { border-color: #42d4bb; }
+.model-card .form-row { gap: 14px; }
 .config-callout { margin-top: 17px; border-left: 2px solid #346767; color: #76949a; padding: 2px 0 2px 10px; font-size: 10px; line-height: 1.6; }
 .form-message { border-top: 1px solid #223447; color: #76cfc0; font-size: 10px; line-height: 1.5; margin-top: 14px; padding-top: 12px; }
 .system-hero { display: flex; align-items: center; gap: 15px; border: 1px solid #2b5d57; border-radius: 10px; padding: 22px 25px; background: radial-gradient(circle at 0 0, rgba(52, 126, 116, .2), transparent 19rem), rgba(18, 40, 43, .72); }
