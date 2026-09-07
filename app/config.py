@@ -17,9 +17,27 @@ from pydantic import ConfigDict, Field
 from .models import StrictModel
 
 
+class ModelConfig(StrictModel):
+    """A named, provider-neutral model endpoint.
+
+    ``model`` is the concrete model name sent to the provider; ``base_url`` /
+    ``api_key`` are optional and fall back to the ``OPENAI_BASE_URL`` /
+    ``OPENAI_API_KEY`` environment variables when unset, so a single profile can
+    mix OpenAI-hosted and self-hosted gateways. ``streaming`` overrides the
+    runner default per model (some gateways only work in streaming mode).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    model: str = Field(min_length=1, max_length=128)
+    base_url: str | None = None
+    api_key: str | None = None
+    timeout: float = Field(default=60.0, gt=0, le=600)
+    streaming: bool | None = None
+
+
 class NodePolicy(StrictModel):
     model_config = ConfigDict(extra="forbid")
-    model: str = "gpt-4.1-mini"
+    model: str = "default"
     max_turns: int = Field(default=6, ge=1, le=20)
     prompt_version: str = Field(default="default-v1", min_length=1, max_length=128)
 
@@ -49,6 +67,7 @@ class RuntimePolicy(StrictModel):
     """Only strategy values belong here; credentials are deliberately absent."""
 
     model_config = ConfigDict(extra="forbid")
+    models: dict[str, ModelConfig] = Field(default_factory=dict)
     graph: GraphPolicy = Field(default_factory=GraphPolicy)
     evaluation: EvaluationPolicy = Field(default_factory=EvaluationPolicy)
     nodes: dict[str, NodePolicy] = Field(default_factory=dict)
@@ -56,6 +75,18 @@ class RuntimePolicy(StrictModel):
 
     def node(self, name: str) -> NodePolicy:
         return self.nodes.get(name, NodePolicy())
+
+    def model(self, name: str) -> ModelConfig:
+        """Resolve a node's model reference.
+
+        If ``name`` is a key in the ``models`` registry, return that config.
+        Otherwise treat ``name`` as a bare model name and build an ephemeral
+        config that inherits provider credentials from the environment; this
+        keeps older profiles (which inlined the model name) working.
+        """
+        if name in self.models:
+            return self.models[name]
+        return ModelConfig(model=name)
 
 
 class ResolvedRunConfig(StrictModel):
@@ -76,6 +107,7 @@ class ResolvedRunConfig(StrictModel):
 DEFAULT_PROFILE: dict[str, Any] = {
     "config_version": "default-v1",
     "prompt_config_version": "tenant-prompts-v1",
+    "models": {"default": {"model": "gpt-4.1-mini"}},
     "graph": {"max_investigation_attempts": 2, "max_clarification_rounds": 2},
     "evaluation": {
         "passing_score": 75,
@@ -84,10 +116,22 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "rubric_version": "rubric-v1",
     },
     "nodes": {
-        "analyze": {"max_turns": 6, "prompt_version": "analyzer-v1"},
-        "investigate": {"max_turns": 6, "prompt_version": "tenant-prompts-v1"},
-        "evaluate": {"max_turns": 6, "prompt_version": "rubric-v1"},
-        "summarize": {"max_turns": 6, "prompt_version": "summary-v1"},
+        "analyze": {
+            "model": "default",
+            "max_turns": 6,
+            "prompt_version": "analyzer-v1",
+        },
+        "investigate": {
+            "model": "default",
+            "max_turns": 6,
+            "prompt_version": "tenant-prompts-v1",
+        },
+        "evaluate": {"model": "default", "max_turns": 6, "prompt_version": "rubric-v1"},
+        "summarize": {
+            "model": "default",
+            "max_turns": 6,
+            "prompt_version": "summary-v1",
+        },
     },
     "tools": {"enabled": False, "max_results": 20, "timeout_seconds": 30},
 }
@@ -226,12 +270,17 @@ class ConfigRepository:
         if len(prompt_versions) != len(set(prompt_versions)):
             raise ValueError("node prompt_version values must be unique")
         policy = RuntimePolicy.model_validate(raw)
+        # snapshot identity excludes api_key so rotating a key never invalidates
+        # in-flight runs (the run keeps its own resolved ModelConfig in memory).
+        policy_dump = policy.model_dump(mode="json")
+        for model_cfg in policy_dump.get("models", {}).values():
+            model_cfg.pop("api_key", None)
         canonical = json.dumps(
             {
                 "profile": profile,
                 "config_version": config_version,
                 "prompt_config_version": prompt_version,
-                "policy": policy.model_dump(mode="json"),
+                "policy": policy_dump,
             },
             sort_keys=True,
             separators=(",", ":"),

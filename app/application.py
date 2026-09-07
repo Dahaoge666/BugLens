@@ -56,18 +56,27 @@ class ApplicationService:
     def _check_model_credentials(self) -> None:
         """Fail fast with an actionable error instead of deep inside Runner.
 
-        The OpenAI SDK reads ``OPENAI_API_KEY`` lazily, so a missing key surfaces
-        only when a node runs, wrapped as an opaque ``NodeExecutionError``. This
-        guard keeps the root cause visible at the application boundary. It is opt-in
-        (``require_model_credentials``) so tests that never call a model stay green.
+        Credentials can come from two places now: the environment variables
+        (used by bare model names that fall back to the SDK global client) or the
+        ``models`` registry in a profile (each named model may carry its own
+        ``api_key`` / ``base_url``). Pass if either source is configured.
         """
-        # A custom endpoint with its own auth may not need an api_key header; only
-        # the default OpenAI path strictly requires one.
-        if not self._openai_base_url and not self._openai_api_key:
-            raise ModelCredentialsError(
-                "OPENAI_API_KEY is not configured; set it (or OPENAI_BASE_URL for an "
-                "OpenAI-compatible gateway) before starting a diagnosis"
-            )
+        # 1) Environment-level credentials (bare-name / global-client path).
+        if self._openai_base_url or self._openai_api_key:
+            return
+        # 2) Per-model credentials in the default profile's models registry.
+        try:
+            resolved = self.configs.resolve("default")
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            for model_cfg in resolved.policy.models.values():
+                if model_cfg.api_key or model_cfg.base_url:
+                    return
+        raise ModelCredentialsError(
+            "no model credentials configured; set OPENAI_API_KEY/OPENAI_BASE_URL "
+            "or define api_key/base_url on a model in the config profile"
+        )
 
     async def get_run(self, run_id: str, identity: Identity | None = None) -> RunView:
         return await self.runtime.get_run(run_id)

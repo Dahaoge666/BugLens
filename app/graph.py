@@ -399,6 +399,7 @@ class DiagnosisGraph:
             prompt_config_version=config.prompt_config_version,
             max_turns=node_policy.max_turns,
             model=node_policy.model,
+            model_config=config.policy.model(node_policy.model),
         )
 
     @staticmethod

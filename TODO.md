@@ -10,6 +10,8 @@
   - `_schema_hint` 对四个 `output_type` 均生成非空 JSON Schema 片段且包含 `properties`。
   - 幂等性：多次导入 `app.agents` 不会重复包装 `validate_json`。
 - [ ] **`streaming` 开关单测**：`OpenAINodeRunner(streaming=True)` 使用 `Runner.run_streamed`，`streaming=False` 使用 `Runner.run`（既有 `test_sdk_runner_uses_same_session_per_node_and_separate_node_sessions` 等用例需保持绿）。
+- [ ] **多模型解耦路径单测**：`NodeRuntimeContext.model_config` 携带 `ModelConfig` 时，`_model_instance` 构造的 `OpenAIChatCompletionsModel` 绑定了对应的 `base_url/api_key/timeout`，且按 `(model, base_url, timeout, api_key)` 缓存复用；`model_config=None` 时退回裸名 + 全局客户端；per-model `streaming` 覆盖 `default_streaming`。
+- [ ] **admin API key 脱敏 / 回填单测**：`AdminApplicationService.config()` 对 `models.*.api_key` 做脱敏；`apply_config` 收到空或含 `****` 的 api_key 时回填原值，收到新值时覆盖。
 
 ## 可观测性
 

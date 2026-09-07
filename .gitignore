@@ -11,3 +11,4 @@ build/
 .env.*
 !.env.example
 .idea/
+config/buglens.maas.yaml

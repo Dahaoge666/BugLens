@@ -62,7 +62,9 @@ def build_local_service(
     )
     configs = ConfigRepository(settings.config_path)
     prompts = PromptRegistry(settings.prompt_config)
-    runner = OpenAINodeRunner(prompts, settings.session_db, streaming=custom_endpoint)
+    runner = OpenAINodeRunner(
+        prompts, settings.session_db, default_streaming=custom_endpoint
+    )
     # A custom gateway's tracing endpoint usually differs from OpenAI's; default
     # to disabling tracing there unless the operator explicitly enables it.
     tracing_enabled = settings.tracing_enabled and not custom_endpoint

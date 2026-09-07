@@ -7,6 +7,7 @@ through :class:`ApplicationService` and :class:`DiagnosisRuntime`.
 
 from __future__ import annotations
 
+import copy
 import importlib.metadata
 import os
 from datetime import UTC, datetime
@@ -118,6 +119,15 @@ class BootstrapStatus(StrictModel):
     health: HealthView
 
 
+def _mask_api_key(key: str | None) -> str | None:
+    """Mask an api_key for safe display: keep the prefix and last 4 chars."""
+    if not key:
+        return key
+    if len(key) <= 8:
+        return "****"
+    return f"{key[:3]}****{key[-4:]}"
+
+
 class AdminApplicationService:
     """Control-plane operations used by the HTTP adapter and admin UI."""
 
@@ -185,15 +195,26 @@ class AdminApplicationService:
                     checked_at=checked_at,
                 )
             )
-        key_configured = bool(os.getenv("OPENAI_API_KEY"))
+        key_configured = bool(os.getenv("OPENAI_API_KEY")) or bool(
+            os.getenv("OPENAI_BASE_URL")
+        )
+        if not key_configured:
+            try:
+                resolved = self.service.configs.resolve("default")
+                key_configured = any(
+                    mc.api_key or mc.base_url for mc in resolved.policy.models.values()
+                )
+            except Exception:
+                pass
         components.append(
             HealthComponent(
                 name="model_credentials",
                 status="ok" if key_configured else "degraded",
                 detail=(
-                    "OPENAI_API_KEY is configured"
+                    "model credentials are configured"
                     if key_configured
-                    else "OPENAI_API_KEY is not configured; setup is required"
+                    else "no model credentials; set OPENAI_API_KEY/OPENAI_BASE_URL "
+                    "or define api_key/base_url on a model in the config profile"
                 ),
                 checked_at=checked_at,
             )
@@ -209,8 +230,9 @@ class AdminApplicationService:
     def bootstrap_status(self) -> BootstrapStatus:
         health = self.health()
         initialized = bool(self.service.configs.profiles())
-        setup_required = (
-            not bool(os.getenv("OPENAI_API_KEY")) or health.status == "error"
+        setup_required = health.status == "error" or any(
+            c.name == "model_credentials" and c.status != "ok"
+            for c in health.components
         )
         return BootstrapStatus(
             initialized=initialized,
@@ -220,11 +242,21 @@ class AdminApplicationService:
         )
 
     def config(self) -> ConfigView:
+        profiles = self.service.configs.profiles()
+        # Mask api_key in the models registry before exposing via the admin API.
+        for profile_cfg in profiles.values():
+            models = (
+                profile_cfg.get("models") if isinstance(profile_cfg, dict) else None
+            )
+            if isinstance(models, dict):
+                for model_cfg in models.values():
+                    if isinstance(model_cfg, dict) and model_cfg.get("api_key"):
+                        model_cfg["api_key"] = _mask_api_key(model_cfg["api_key"])
         return ConfigView(
             revision=self.service.configs.revision,
             writable=self.service.configs.writable,
             active_profile="default",
-            profiles=self.service.configs.profiles(),
+            profiles=profiles,
         )
 
     def validate_config(self, mutation: ConfigMutation) -> ConfigValidationView:
@@ -252,8 +284,24 @@ class AdminApplicationService:
         )
 
     def apply_config(self, mutation: ConfigMutation) -> ConfigView:
+        config = copy.deepcopy(mutation.config)
+        # A masked or empty api_key means "keep the existing value"; only an
+        # explicitly typed new key is persisted. This lets the admin UI show keys
+        # masked without forcing re-entry on every save.
+        existing = self.service.configs.profiles().get(mutation.profile, {})
+        existing_models = existing.get("models") if isinstance(existing, dict) else {}
+        existing_models = existing_models if isinstance(existing_models, dict) else {}
+        models = config.get("models") if isinstance(config.get("models"), dict) else {}
+        for name, model_cfg in models.items():
+            if not isinstance(model_cfg, dict):
+                continue
+            submitted = model_cfg.get("api_key")
+            if not submitted or "****" in str(submitted):
+                orig = existing_models.get(name)
+                if isinstance(orig, dict):
+                    model_cfg["api_key"] = orig.get("api_key")
         self.service.configs.apply_profile(
-            mutation.profile, mutation.config, mutation.expected_revision
+            mutation.profile, config, mutation.expected_revision
         )
         return self.config()
 

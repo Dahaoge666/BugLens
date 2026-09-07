@@ -187,6 +187,17 @@
 .settings-actions { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid #223346; padding-top: 17px; }
 .config-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid #1d2c3b; padding: 13px 0; color: #91a8b7; font-size: 11px; }
 .config-row code { color: #7bc6bb; font: 10px 'DM Mono', monospace; }
+.node-config-row { grid-template-columns: 1fr 110px; align-items: end; border-bottom: 1px solid #1d2c3b; padding-bottom: 13px; }
+.node-config-row .node-name { color: #91a8b7; font-size: 11px; text-transform: capitalize; }
+.node-config-row .node-name input { display: block; margin-top: 6px; width: 100%; }
+.node-config-row .turns-field { color: #668095; font-size: 9px; }
+.node-config-row .node-name select { display: block; margin-top: 6px; width: 100%; }
+.model-card { background: rgba(28, 42, 57, 0.45); border: 1px solid #1d2c3b; border-radius: 6px; padding: 12px; margin-bottom: 11px; }
+.model-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.model-card-head .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #66c9bd; font-size: 12px; }
+.model-add { margin-top: 4px; }
+.node-config-row .node-name select { appearance: none; }
+.config-preview { background: rgba(16, 28, 40, .6); }
 .config-callout { margin-top: 17px; border-left: 2px solid #346767; color: #76949a; padding: 2px 0 2px 10px; font-size: 10px; line-height: 1.6; }
 .form-message { border-top: 1px solid #223447; color: #76cfc0; font-size: 10px; line-height: 1.5; margin-top: 14px; padding-top: 12px; }
 .system-hero { display: flex; align-items: center; gap: 15px; border: 1px solid #2b5d57; border-radius: 10px; padding: 22px 25px; background: radial-gradient(circle at 0 0, rgba(52, 126, 116, .2), transparent 19rem), rgba(18, 40, 43, .72); }

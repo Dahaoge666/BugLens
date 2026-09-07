@@ -316,13 +316,17 @@ function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpe
   return <div className="management-content"><PageHeading eyebrow="控制台 / Agent Sessions" title="Session 管理" description="每个 run_id + node 使用独立 SDK SQLiteSession；这里只展示生命周期元数据。" /><div className="session-summary"><MetricCard label="活跃 Session" value={String(active)} detail="正在执行" tone="teal" /><MetricCard label="等待输入" value={String(waiting)} detail="可恢复" tone="amber" /><MetricCard label="历史 Session" value={String(sessions.length)} detail="仅保留元数据" tone="blue" /></div><section className="panel sessions-panel"><PanelHeader title="Session 列表" meta={`${sessions.length} 个可见记录`} /><div className="session-table"><div className="session-header"><span>Session</span><span>节点</span><span>状态</span><span>消息数</span><span>更新时间</span><span /></div>{sessions.map((session) => <div className="session-row" key={session.session_id}><span><strong className="mono">{session.session_id}</strong><small>run {session.run_id}</small></span><span className="node-badge">{nodeLabel(session.node ?? 'unknown')}</span><span><span className={`session-status ${session.status}`}>{sessionStatusLabel(session.status)}</span></span><span className="mono">{session.message_count}</span><span className="muted">{session.updated_at}</span><button className="row-link" onClick={() => onOpenRun(session.run_id)}>查看运行 →</button></div>)}</div><div className="session-note">模型消息由 Agents SDK SQLiteSession 管理，业务状态和 checkpoint 不会复制消息内容。</div></section></div>
 }
 
+type ModelEntry = { model: string; base_url: string; api_key: string; timeout: number; streaming: boolean | null }
 function SettingsPage({ config, onConfigChange }: { config: AdminConfig | null; onConfigChange: (config: AdminConfig) => void }) {
   const [profile, setProfile] = useState(config?.active_profile ?? 'default')
   const [configVersion, setConfigVersion] = useState(String(config?.profiles[config?.active_profile ?? 'default']?.config_version ?? 'default-v1'))
   const [maxAttempts, setMaxAttempts] = useState(2)
   const [maxClarifications, setMaxClarifications] = useState(2)
   const [passingScore, setPassingScore] = useState(75)
-  const [apiKey, setApiKey] = useState('')
+  const nodeKeys = ['analyze', 'investigate', 'evaluate', 'summarize'] as const
+  const [nodeModels, setNodeModels] = useState<Record<string, string>>(Object.fromEntries(nodeKeys.map((k) => [k, 'default'])))
+  const [nodeTurns, setNodeTurns] = useState<Record<string, number>>(Object.fromEntries(nodeKeys.map((k) => [k, 6])))
+  const [models, setModels] = useState<Record<string, ModelEntry>>({})
   const [saved, setSaved] = useState(false)
   const [message, setMessage] = useState('')
   useEffect(() => {
@@ -330,9 +334,10 @@ function SettingsPage({ config, onConfigChange }: { config: AdminConfig | null; 
     const raw = config.profiles[profile]
     if (!raw) {
       setConfigVersion(`${profile || 'new-profile'}-v1`)
-      setMaxAttempts(2)
-      setMaxClarifications(2)
-      setPassingScore(75)
+      setMaxAttempts(2); setMaxClarifications(2); setPassingScore(75)
+      setNodeModels(Object.fromEntries(nodeKeys.map((k) => [k, 'default'])))
+      setNodeTurns(Object.fromEntries(nodeKeys.map((k) => [k, 6])))
+      setModels({})
       return
     }
     setConfigVersion(String(raw.config_version ?? `${profile}-v1`))
@@ -341,27 +346,39 @@ function SettingsPage({ config, onConfigChange }: { config: AdminConfig | null; 
     setMaxAttempts(Number(graph.max_investigation_attempts ?? 2))
     setMaxClarifications(Number(graph.max_clarification_rounds ?? 2))
     setPassingScore(Number(evaluation.passing_score ?? 75))
+    const nodes = isRecord(raw.nodes) ? raw.nodes : {}
+    const readNode = (key: string) => { const n = isRecord(nodes[key]) ? nodes[key] : {}; return { model: String(n.model ?? 'default'), max_turns: Number(n.max_turns ?? 6) } }
+    setNodeModels(Object.fromEntries(nodeKeys.map((k) => [k, readNode(k).model])))
+    setNodeTurns(Object.fromEntries(nodeKeys.map((k) => [k, readNode(k).max_turns])))
+    const rawModels = isRecord(raw.models) ? raw.models : {}
+    const parsed: Record<string, ModelEntry> = {}
+    for (const [name, val] of Object.entries(rawModels)) {
+      const m = isRecord(val) ? val : {}
+      parsed[name] = { model: String(m.model ?? ''), base_url: String(m.base_url ?? ''), api_key: String(m.api_key ?? ''), timeout: Number(m.timeout ?? 60), streaming: m.streaming === null || m.streaming === undefined ? null : Boolean(m.streaming) }
+    }
+    setModels(parsed)
   }, [config, profile])
   function buildPayload() {
     const current = config?.profiles[profile] ?? config?.profiles.default ?? {}
     const graph = isRecord(current.graph) ? current.graph : {}
     const evaluation = isRecord(current.evaluation) ? current.evaluation : {}
-    return {
-      ...current,
-      config_version: configVersion,
-      graph: { ...graph, max_investigation_attempts: maxAttempts, max_clarification_rounds: maxClarifications },
-      evaluation: { ...evaluation, passing_score: passingScore },
+    const nodesIn = isRecord(current.nodes) ? current.nodes : {}
+    const buildNode = (key: string) => { const base = isRecord(nodesIn[key]) ? nodesIn[key] : {}; return { ...base, model: nodeModels[key], max_turns: nodeTurns[key] } }
+    const modelsOut: Record<string, Record<string, unknown>> = {}
+    for (const [name, m] of Object.entries(models)) {
+      const entry: Record<string, unknown> = { model: m.model, timeout: m.timeout }
+      if (m.base_url) entry.base_url = m.base_url
+      if (m.api_key) entry.api_key = m.api_key
+      if (m.streaming !== null) entry.streaming = m.streaming
+      modelsOut[name] = entry
     }
+    return { ...current, config_version: configVersion, models: modelsOut, graph: { ...graph, max_investigation_attempts: maxAttempts, max_clarification_rounds: maxClarifications }, evaluation: { ...evaluation, passing_score: passingScore }, nodes: Object.fromEntries(nodeKeys.map((k) => [k, buildNode(k)])) }
   }
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (!config) {
-      setMessage('当前为演示模式，后端连接后可保存配置')
-      return
-    }
-    const payload = buildPayload()
+    if (!config) { setMessage('当前为演示模式，后端连接后可保存配置'); return }
     try {
-      const next = await applyAdminConfig({ profile, config: payload, expected_revision: config.revision })
+      const next = await applyAdminConfig({ profile, config: buildPayload(), expected_revision: config.revision })
       onConfigChange(next)
       setSaved(true)
       setMessage('配置已保存；新运行会使用新的快照')
@@ -379,15 +396,17 @@ function SettingsPage({ config, onConfigChange }: { config: AdminConfig | null; 
       setMessage(error instanceof Error ? error.message : '校验失败，请重试')
     }
   }
+  function addModel() { let i = 1; while (models[`model-${i}`]) i++; setModels((c) => ({ ...c, [`model-${i}`]: { model: 'gpt-4.1-mini', base_url: '', api_key: '', timeout: 60, streaming: null } })) }
+  function updateModel(name: string, patch: Partial<ModelEntry>) { setModels((c) => ({ ...c, [name]: { ...c[name], ...patch } })) }
+  function removeModel(name: string) { setModels((c) => { const next = { ...c }; delete next[name]; return next }) }
+  const modelNames = Object.keys(models)
   const profiles = Object.keys(config?.profiles ?? { default: {} })
-  return <div className="management-content"><PageHeading eyebrow="管理 / 配置与初始化" title="配置与初始化" description="首次启动可以在这里完成后端连接、模型凭据和运行 profile 配置。" /><div className="setup-banner"><span className="setup-icon">✓</span><div><strong>{config === null ? '等待后端连接' : config.writable === false ? '使用内置默认配置' : '后端已初始化'}</strong><p>{config === null ? '当前显示演示状态' : `配置文件${config.writable === false ? '只读' : '可写'} · 当前 profile：${profile} · revision ${config.revision}`}</p></div><span className="setup-step">1 / 3</span></div><form className="settings-layout" onSubmit={submit}><section className="panel settings-form"><PanelHeader title="运行配置" meta="保存前会先校验" /><label>配置 Profile<input value={profile} onChange={(event) => setProfile(event.target.value)} list="profile-options" /><datalist id="profile-options">{profiles.map((name) => <option key={name} value={name} />)}</datalist><small>可选择已有 profile，也可以输入名称创建新的版本化 profile。</small></label><label>配置版本<input value={configVersion} onChange={(event) => setConfigVersion(event.target.value)} /><small>用于审计和恢复；不能与其他 profile 重复。</small></label><div className="form-row number-row"><label>定位尝试上限<input type="number" min="1" max="2" value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} /></label><label>澄清轮数上限<input type="number" min="0" max="10" value={maxClarifications} onChange={(event) => setMaxClarifications(Number(event.target.value))} /></label></div><label>评测通过分<input type="number" min="0" max="100" value={passingScore} onChange={(event) => setPassingScore(Number(event.target.value))} /><small>运行中的任务继续使用原 config snapshot；这里只影响新运行。</small></label><label>OPENAI_API_KEY <span className="optional">仅状态提示</span><input value={apiKey} onChange={(event) => setApiKey(event.target.value)} type="password" placeholder="请在部署环境或 Secret 中设置" /><small>此字段不会发送或写入 profile；后端通过环境变量检测密钥是否已配置。</small></label><div className="settings-actions"><button type="button" className="quiet-button" onClick={validate}>验证配置</button><button type="submit" className="primary-button">{saved ? '已保存 ✓' : '保存配置'}</button></div>{message && <div className="form-message">{message}</div>}</section><section className="panel config-preview"><PanelHeader title="当前生效策略" meta={String(config?.profiles[profile]?.config_version ?? configVersion)} /><ConfigRow label="Analyze" value="gpt-4.1-mini · 6 turns" /><ConfigRow label="Investigate" value="gpt-4.1-mini · 6 turns" /><ConfigRow label="Evaluate" value="gpt-4.1-mini · 6 turns" /><ConfigRow label="Summarize" value="gpt-4.1-mini · 6 turns" /><div className="config-callout">保存新的 profile 后，新运行使用新配置；已创建运行继续使用自己的快照。</div></section></form></div>
+  return <div className="management-content"><PageHeading eyebrow="管理 / 配置与初始化" title="配置与初始化" description="先配置可用模型（含凭据），再为每个节点选择模型；策略与凭据解耦。" /><div className="setup-banner"><span className="setup-icon">✓</span><div><strong>{config === null ? '等待后端连接' : config.writable === false ? '使用内置默认配置' : '后端已初始化'}</strong><p>{config === null ? '当前显示演示状态' : `配置文件${config.writable === false ? '只读' : '可写'} · 当前 profile：${profile} · revision ${config.revision}`}</p></div><span className="setup-step">1 / 3</span></div><form className="settings-layout" onSubmit={submit}><section className="panel settings-form"><PanelHeader title="运行配置" meta="保存前会先校验" /><label>配置 Profile<input value={profile} onChange={(event) => setProfile(event.target.value)} list="profile-options" /><datalist id="profile-options">{profiles.map((name) => <option key={name} value={name} />)}</datalist><small>可选择已有 profile，也可以输入名称创建新的版本化 profile。</small></label><label>配置版本<input value={configVersion} onChange={(event) => setConfigVersion(event.target.value)} /><small>用于审计和恢复；不能与其他 profile 重复。</small></label><div className="form-row number-row"><label>定位尝试上限<input type="number" min="1" max="2" value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} /></label><label>澄清轮数上限<input type="number" min="0" max="10" value={maxClarifications} onChange={(event) => setMaxClarifications(Number(event.target.value))} /></label></div><label>评测通过分<input type="number" min="0" max="100" value={passingScore} onChange={(event) => setPassingScore(Number(event.target.value))} /><small>运行中的任务继续使用原 config snapshot；这里只影响新运行。</small></label><div className="settings-actions"><button type="button" className="quiet-button" onClick={validate}>验证配置</button><button type="submit" className="primary-button">{saved ? '已保存 ✓' : '保存配置'}</button></div>{message && <div className="form-message">{message}</div>}</section><section className="panel config-preview"><PanelHeader title="模型管理" meta={`${modelNames.length} 个模型`} /><p className="config-callout">每个模型是一个命名的端点（模型名 + 凭据）。节点通过引用名选择模型；留空 base_url/api_key 则回退到环境变量 OPENAI_BASE_URL / OPENAI_API_KEY。</p>{Object.entries(models).map(([name, m]) => <div className="model-card" key={name}><div className="model-card-head"><strong className="mono">{name}</strong><button type="button" className="row-link" onClick={() => removeModel(name)}>删除</button></div><label>模型名<input value={m.model} onChange={(e) => updateModel(name, { model: e.target.value })} placeholder="如 gpt-4.1-mini 或 maas-glm-5.2-volcengine-codeagent" /></label><div className="form-row"><label>Base URL<input value={m.base_url} onChange={(e) => updateModel(name, { base_url: e.target.value })} placeholder="留空=环境变量" /></label><label>API Key<input value={m.api_key} onChange={(e) => updateModel(name, { api_key: e.target.value })} type="password" placeholder="留空=保留原值" /></label></div><div className="form-row"><label>超时(秒)<input type="number" min="1" max="600" value={m.timeout} onChange={(e) => updateModel(name, { timeout: Number(e.target.value) })} /></label><label>流式<select value={m.streaming === null ? '' : String(m.streaming)} onChange={(e) => updateModel(name, { streaming: e.target.value === '' ? null : e.target.value === 'true' })}><option value="">默认</option><option value="true">开</option><option value="false">关</option></select></label></div></div>)}<button type="button" className="quiet-button model-add" onClick={addModel}>＋ 新增模型</button></section><section className="panel config-preview"><PanelHeader title="节点策略（当前生效）" meta={String(config?.profiles[profile]?.config_version ?? configVersion)} />{nodeKeys.map((key) => <div className="form-row node-config-row" key={key}><label className="node-name">{key}<select value={nodeModels[key]} onChange={(e) => setNodeModels((c) => ({ ...c, [key]: e.target.value }))}>{modelNames.map((n) => <option key={n} value={n}>{n}</option>)}{nodeModels[key] && !modelNames.includes(nodeModels[key]) && <option value={nodeModels[key]}>{nodeModels[key]}</option>}</select></label><label className="turns-field">轮数<input type="number" min="1" max="20" value={nodeTurns[key]} onChange={(e) => setNodeTurns((c) => ({ ...c, [key]: Number(e.target.value) }))} /></label></div>)}<div className="config-callout">保存新的 profile 后，新运行使用新配置；已创建运行继续使用自己的快照。</div></section></form></div>
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
-
-function ConfigRow({ label, value }: { label: string; value: string }) { return <div className="config-row"><span>{label}</span><code>{value}</code></div> }
 
 function SystemPage({ health, version }: { health: AdminHealth | null; version: string }) {
   const healthy = health?.status === 'ok' || health === null

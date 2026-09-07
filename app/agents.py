@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from agents import Agent, Runner, SQLiteSession
+from agents import Agent, OpenAIChatCompletionsModel, Runner, SQLiteSession
 from agents.exceptions import ModelBehaviorError
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+from .config import ModelConfig
 from .models import (
     DiagnosisReport,
     EvaluationResult,
@@ -31,6 +33,7 @@ class NodeRuntimeContext:
     prompt_config_version: str = "tenant-prompts-v1"
     max_turns: int = 6
     model: str | None = None
+    model_config: ModelConfig | None = None
 
 
 class NodeRunner(Protocol):
@@ -119,14 +122,24 @@ class OpenAINodeRunner:
     }
 
     def __init__(
-        self, prompts: PromptRegistry, session_db: Path, *, streaming: bool = False
+        self,
+        prompts: PromptRegistry,
+        session_db: Path,
+        *,
+        streaming: bool = False,
+        default_streaming: bool | None = None,
     ) -> None:
         session_db.parent.mkdir(parents=True, exist_ok=True)
         self.prompts = prompts
         self.session_db = session_db
-        self.streaming = streaming
+        # ``default_streaming`` is the per-model source of truth; ``streaming`` is
+        # kept as a back-compat alias so existing callers/tests are unaffected.
+        self.default_streaming = (
+            default_streaming if default_streaming is not None else streaming
+        )
         self._sessions: dict[str, SQLiteSession] = {}
         self._agents: dict[str, Agent] = {}
+        self._model_cache: dict[tuple, OpenAIChatCompletionsModel] = {}
 
     def _session(self, runtime: NodeRuntimeContext) -> SQLiteSession:
         session_id = f"{runtime.graph_run_id}:{runtime.node_name}"
@@ -134,14 +147,51 @@ class OpenAINodeRunner:
             self._sessions[session_id] = SQLiteSession(session_id, self.session_db)
         return self._sessions[session_id]
 
+    def _model_instance(self, model_config: ModelConfig) -> OpenAIChatCompletionsModel:
+        """Build (and cache) a chat-completions model bound to a specific client.
+
+        Each named model can point at a different provider/credentials, so we
+        cannot rely on the SDK's global default client. The client is cached by
+        endpoint identity so repeated nodes on the same model reuse one pool.
+        """
+        cache_key = (
+            model_config.model,
+            model_config.base_url,
+            model_config.timeout,
+            model_config.api_key,
+        )
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+        client_kwargs: dict[str, Any] = {"timeout": model_config.timeout}
+        if model_config.base_url:
+            client_kwargs["base_url"] = model_config.base_url
+        if model_config.api_key:
+            client_kwargs["api_key"] = model_config.api_key
+        client = AsyncOpenAI(**client_kwargs)
+        instance = OpenAIChatCompletionsModel(
+            model=model_config.model, openai_client=client
+        )
+        self._model_cache[cache_key] = instance
+        return instance
+
+    def _model_arg(
+        self, model_name: str | None, model_config: ModelConfig | None
+    ) -> str | OpenAIChatCompletionsModel:
+        if model_config is not None:
+            return self._model_instance(model_config)
+        # Back-compat: a bare model name with no registered config uses the SDK
+        # global default client (set by configure_openai_provider).
+        return model_name or "gpt-4.1-mini"
+
     def _agent(
         self,
         node_name: str,
         category: ProblemCategory | None,
         tenant_id: str | None,
-        model: str | None,
+        model_name: str | None,
+        model_config: ModelConfig | None = None,
     ) -> Agent:
-        key = f"{node_name}:{category}:{tenant_id}:{model}"
+        key = f"{node_name}:{category}:{tenant_id}:{model_name}"
         if key in self._agents:
             return self._agents[key]
         instructions = {
@@ -161,7 +211,7 @@ class OpenAINodeRunner:
             + _schema_hint(self.OUTPUT_TYPES[node_name]),
             output_type=self.OUTPUT_TYPES[node_name],
             tools=[],
-            model=model,
+            model=self._model_arg(model_name, model_config),
         )
         self._agents[key] = agent
         return agent
@@ -173,11 +223,23 @@ class OpenAINodeRunner:
         runtime: NodeRuntimeContext,
         category: ProblemCategory | None = None,
     ) -> BaseModel:
-        agent = self._agent(node_name, category, runtime.tenant_id, runtime.model)
+        agent = self._agent(
+            node_name,
+            category,
+            runtime.tenant_id,
+            runtime.model,
+            runtime.model_config,
+        )
         output_type = self.OUTPUT_TYPES[node_name]
+        streaming = self.default_streaming
+        if (
+            runtime.model_config is not None
+            and runtime.model_config.streaming is not None
+        ):
+            streaming = runtime.model_config.streaming
         for attempt in range(2):
             try:
-                if self.streaming:
+                if streaming:
                     result = Runner.run_streamed(
                         agent,
                         input=payload.model_dump_json(),

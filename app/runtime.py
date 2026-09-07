@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import AsyncIterator, Protocol
 from uuid import uuid4
@@ -142,6 +143,11 @@ class DiagnosisRuntime:
         ):
             raise
         except Exception as exc:
+            logging.exception(
+                "Runtime execution failed for run %s at node %s",
+                getattr(state, "run_id", "?"),
+                getattr(state, "current_node", None),
+            )
             failure = FailureRecord(
                 code="node_execution_failed"
                 if isinstance(exc, NodeExecutionError)
