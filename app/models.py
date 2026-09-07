@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import TypedDict
 
 from .security import sanitize_data
@@ -28,6 +29,50 @@ class ProblemCategory(StrEnum):
     INTEGRATION = "integration"
     SECURITY_ACCESS = "security_access"
     UNKNOWN = "unknown"
+
+
+class LifecycleStatus(StrEnum):
+    CREATED = "created"
+    RUNNING = "running"
+    WAITING_USER = "waiting_user"
+    WAITING_TOOL = "waiting_tool"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class DiagnosisOutcome(StrEnum):
+    CONFIRMED = "confirmed"
+    INCONCLUSIVE = "inconclusive"
+
+
+class GraphNode(StrEnum):
+    ANALYZE = "analyze"
+    INVESTIGATE = "investigate"
+    EVALUATE = "evaluate"
+    SUMMARIZE = "summarize"
+    DONE = "done"
+
+
+class FailureRecord(StrictModel):
+    code: str = Field(min_length=1, max_length=64)
+    message: str = Field(min_length=1, max_length=1_000)
+    node: GraphNode | None = None
+    retryable: bool = False
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class PendingToolRequest(StrictModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    tool_name: str = Field(min_length=1, max_length=128)
+    arguments: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class PendingApproval(StrictModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    tool_name: str = Field(min_length=1, max_length=128)
+    explanation: str = Field(min_length=1, max_length=2_000)
 
 
 class Evidence(StrictModel):
@@ -170,14 +215,21 @@ class EvaluationResult(StrictModel):
     deficiencies: list[str] = Field(default_factory=list)
     retry_guidance: list[str] = Field(default_factory=list, max_length=3)
 
-    def enforce_rubric(self) -> EvaluationResult:
+    def enforce_rubric(
+        self,
+        passing_score: int = 75,
+        min_evidence_traceability: int = 15,
+        min_verification_executability: int = 15,
+    ) -> EvaluationResult:
         """Recompute the total; an evaluator rejection always remains a rejection."""
         score = sum(self.criteria_scores.values())
         passed = (
             self.passed
-            and score >= 75
-            and self.criteria_scores["evidence_traceability"] >= 15
-            and self.criteria_scores["verification_executability"] >= 15
+            and score >= passing_score
+            and self.criteria_scores["evidence_traceability"]
+            >= min_evidence_traceability
+            and self.criteria_scores["verification_executability"]
+            >= min_verification_executability
         )
         guidance = self.retry_guidance or (
             [] if passed else ["补充可追溯证据与明确验证步骤，并完整填写五项评分。"]
@@ -208,7 +260,70 @@ class DiagnosisState(StrictModel):
     max_clarification_rounds: int = Field(default=2, ge=0, le=10)
     attempt: int = 0
     max_attempts: int = Field(default=2, ge=1, le=2)
-    status: Literal["running", "completed", "inconclusive"] = "running"
+    lifecycle_status: LifecycleStatus = LifecycleStatus.CREATED
+    outcome: DiagnosisOutcome | None = None
+    current_node: GraphNode = GraphNode.ANALYZE
+    pending_interaction: UserInteractionRequest | None = None
+    pending_tool: PendingToolRequest | None = None
+    pending_approval: PendingApproval | None = None
+    revision: int = Field(default=0, ge=0)
+    schema_version: int = Field(default=1, ge=1)
+    config_snapshot_id: str = Field(default="pending", min_length=1, max_length=128)
+    config_profile: str = "default"
+    config_version: str = "default-v1"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_error: FailureRecord | None = None
+    # This is a serialized, typed node input used only to resume a deterministic
+    # graph step. It never contains SDK messages.
+    next_node_input: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def validate_lifecycle_invariants(self) -> DiagnosisState:
+        pending = [
+            self.pending_interaction,
+            self.pending_tool,
+            self.pending_approval,
+        ]
+        if sum(item is not None for item in pending) > 1:
+            raise ValueError("at most one pending interaction/tool/approval is allowed")
+        waiting_map = {
+            LifecycleStatus.WAITING_USER: self.pending_interaction,
+            LifecycleStatus.WAITING_TOOL: self.pending_tool,
+            LifecycleStatus.WAITING_APPROVAL: self.pending_approval,
+        }
+        if (
+            self.lifecycle_status in waiting_map
+            and waiting_map[self.lifecycle_status] is None
+        ):
+            raise ValueError("waiting status requires its pending request")
+        if self.lifecycle_status in {
+            LifecycleStatus.RUNNING,
+            LifecycleStatus.COMPLETED,
+            LifecycleStatus.FAILED,
+            LifecycleStatus.CANCELED,
+        } and any(item is not None for item in pending):
+            raise ValueError("running and terminal states cannot have pending work")
+        if self.lifecycle_status == LifecycleStatus.COMPLETED and self.outcome is None:
+            raise ValueError("completed state requires a diagnosis outcome")
+        if self.current_node == GraphNode.DONE and self.lifecycle_status not in {
+            LifecycleStatus.COMPLETED,
+            LifecycleStatus.FAILED,
+            LifecycleStatus.CANCELED,
+        }:
+            raise ValueError("done cursor is only valid for a terminal state")
+        return self
+
+    @property
+    def status(self) -> str:
+        """Compatibility view for the original CLI/API shape."""
+        if self.lifecycle_status == LifecycleStatus.COMPLETED:
+            return (
+                "inconclusive"
+                if self.outcome == DiagnosisOutcome.INCONCLUSIVE
+                else "completed"
+            )
+        return self.lifecycle_status.value
 
     @classmethod
     def create(
@@ -218,6 +333,10 @@ class DiagnosisState(StrictModel):
         evidence: list[Evidence],
         max_attempts: int = 2,
         max_clarification_rounds: int = 2,
+        *,
+        config_snapshot_id: str = "pending",
+        profile: str = "default",
+        config_version: str = "default-v1",
     ) -> DiagnosisState:
         """Validate and redact all user data before it enters graph state."""
         return cls.model_validate(
@@ -229,6 +348,9 @@ class DiagnosisState(StrictModel):
                     "source_evidence": [item.model_dump() for item in evidence],
                     "max_attempts": max_attempts,
                     "max_clarification_rounds": max_clarification_rounds,
+                    "config_snapshot_id": config_snapshot_id,
+                    "config_profile": profile,
+                    "config_version": config_version,
                 }
             )
         )

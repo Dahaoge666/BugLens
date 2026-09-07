@@ -4,7 +4,10 @@
 
 ```mermaid
 flowchart TD
-    CLI[交互式 CLI] --> G[DiagnosisGraph]
+    CLI[CLI Adapter] --> C[LocalAgentClient]
+    C --> APP[Application Service]
+    APP --> R[Agent Runtime]
+    R --> G[DiagnosisGraph]
     G --> A[Analyze Agent + SQLiteSession]
     A --> I[Investigate Agent + SQLiteSession]
     I --> E[Evaluate Agent + SQLiteSession]
@@ -14,7 +17,7 @@ flowchart TD
     I -- 澄清 --> I
 ```
 
-`DiagnosisGraph` 保存确定性的业务状态，SDK Session 保存模型消息。同一个节点复用 Session，所以澄清答案和评测反馈可以利用该节点已有上下文；不同节点的 Session ID 不同，因此评测节点不会继承定位节点的完整对话。
+`DiagnosisGraph` 只负责确定性节点转换，Runtime 保存可恢复业务状态和事件；SDK Session 保存模型消息。同一个节点复用 Session，所以澄清答案和评测反馈可以利用该节点已有上下文；不同节点的 Session ID 不同，因此评测节点不会继承定位节点的完整对话。
 
 | SDK 能力 | 项目用途 |
 | --- | --- |
@@ -28,11 +31,11 @@ flowchart TD
 
 没有使用 handoff，因为当前流程需要确定性的评测门禁和重试上限。当前实现只处理用户输入证据，尚未使用 function tools 或 MCP；后续接入日志、指标和 Trace 时优先使用 SDK 工具能力。
 
-CLI 退出后，SDK 会话保存在 `BUGLENS_SESSION_DB` 指定的 SQLite 文件中。目前业务 Graph 不支持中断恢复；数据库用于 SDK 对话管理和审计基础，不替代未来的业务检查点。
+CLI 退出后，SDK 会话、业务 checkpoint、配置快照和 Event 均保存在 `BUGLENS_SESSION_DB` 指定的 SQLite 文件中。
 
 ## 目标架构
 
-当前 CLI 直接调用 Graph 是待重构现状，不是长期边界。目标为：
+CLI 不直接调用 Graph。当前架构为：
 
 ```mermaid
 flowchart TD

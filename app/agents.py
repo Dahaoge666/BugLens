@@ -26,6 +26,9 @@ class NodeRuntimeContext:
     node_name: str
     config_version: str
     tenant_id: str | None = None
+    config_snapshot_id: str = "pending"
+    prompt_config_version: str = "tenant-prompts-v1"
+    max_turns: int = 6
 
 
 class NodeRunner(Protocol):
@@ -110,7 +113,7 @@ class OpenAINodeRunner:
                     input=payload.model_dump_json(),
                     context=runtime,
                     session=self._session(runtime),
-                    max_turns=6,
+                    max_turns=runtime.max_turns,
                 )
                 output = result.final_output
                 if not isinstance(output, output_type):

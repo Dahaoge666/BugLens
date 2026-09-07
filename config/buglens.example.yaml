@@ -1,0 +1,18 @@
+profiles:
+  default:
+    config_version: default-v1
+    prompt_config_version: tenant-prompts-v1
+    graph:
+      max_investigation_attempts: 2
+      max_clarification_rounds: 2
+    evaluation:
+      passing_score: 75
+      min_evidence_traceability: 15
+      min_verification_executability: 15
+      rubric_version: rubric-v1
+    nodes:
+      analyze: {max_turns: 6, prompt_version: analyzer-v1}
+      investigate: {max_turns: 6, prompt_version: tenant-prompts-v1}
+      evaluate: {max_turns: 6, prompt_version: rubric-v1}
+      summarize: {max_turns: 6, prompt_version: summary-v1}
+    tools: {enabled: false, max_results: 20, timeout_seconds: 30}

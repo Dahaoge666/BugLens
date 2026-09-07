@@ -1,8 +1,8 @@
 # BugLens
 
-BugLens 是一个基于 OpenAI Agents SDK 的故障定位项目。当前版本提供交互式 CLI，依次使用分析、定位、评测和总结四个 Agent，并在当前终端进程中完成必要澄清。
+BugLens 是一个基于 OpenAI Agents SDK 的可恢复故障定位项目。CLI 和 HTTP/SSE Web Adapter 共享同一个 Application Service、Runtime 和确定性 Agent Graph，依次使用分析、定位、评测和总结四个 Agent。
 
-目标架构将增加共享 Agent Runtime、可恢复检查点和 Web/API Adapter；CLI 与 Web 将作为同一 Runtime 的薄入口。下文“使用”和“手工测试”描述当前已实现版本，不代表目标能力已经完成。
+Runtime 将每次短执行持久化为 checkpoint 和 Event；需要用户补充信息时进入 waiting_user，进程可以退出，之后用新的 Command 恢复。
 
 ## 安装
 
@@ -34,6 +34,14 @@ $env:OPENAI_API_KEY = "你的密钥"
 
 如果 Agent 需要更多信息，CLI 会说明原因并在终端逐项提问。使用 `--json` 可以输出完整结构化结果；运行 `buglens --help` 查看所有选项。
 
+固定策略只能通过 profile 选择，不能由普通请求逐项覆盖：
+
+```powershell
+.\.venv\Scripts\buglens.exe "订单接口大量超时" --profile default --config .\config\buglens.example.yaml
+```
+
+也支持 `--resume RUN_ID`、`--status RUN_ID` 和 `--cancel RUN_ID`。远程 CLI 使用 `--remote URL`，渲染方式与本地 CLI 相同。
+
 ## SDK 使用方式
 
 - 四个节点使用 SDK `Agent` 和 Pydantic `output_type`。
@@ -42,6 +50,7 @@ $env:OPENAI_API_KEY = "你的密钥"
 - 一次完整诊断使用 SDK tracing 归组，`run_id` 作为 `group_id`。
 - 当前不使用 handoff：评测失败后的确定性循环仍由 Graph 控制。
 - 当前没有证据查询工具；`tools=[]` 保证第一阶段无外部副作用。
+- `ApplicationService`、`DiagnosisRuntime` 和 `SQLiteCheckpointStore` 负责统一 Command/Event、生命周期、revision、幂等和配置快照。
 
 当前与目标架构见[架构文档](docs/architecture.md)，SDK 边界见
 [SDK 能力采用规范](docs/sdk-capability-spec.md)。目标设计拆分为：
@@ -57,6 +66,8 @@ $env:OPENAI_API_KEY = "你的密钥"
 | --- | --- | --- |
 | `OPENAI_API_KEY` | 无 | 真实运行必需 |
 | `BUGLENS_SESSION_DB` | `data/buglens.db` | SDK SQLite Session 数据库 |
+| `BUGLENS_CONFIG` | 无 | 运行 profile YAML |
+| `BUGLENS_PROFILE` | `default` | 默认运行 profile |
 | `BUGLENS_TRACING` | `true` | 是否启用 SDK tracing |
 | `BUGLENS_PROMPT_CONFIG` | 无 | 可选租户提示词 YAML |
 
@@ -71,7 +82,7 @@ $env:OPENAI_API_KEY = "你的密钥"
 .\.venv\Scripts\python.exe -m build
 ```
 
-构建产物位于 `dist/`。当前实现支持用户输入的文本证据，尚未实现共享 Runtime、Web Adapter、业务检查点，也未接入日志、指标或 Trace 等只读工具。
+构建产物位于 `dist/`。当前实现支持用户输入的文本证据，Web Adapter 提供 HTTP Command + SSE Event；尚未接入日志、指标或 Trace 等只读工具。
 
 ## 端到端手工测试
 
@@ -108,7 +119,7 @@ $env:BUGLENS_TRACING = "true"
   --output .\data\manual-result.json
 ```
 
-当前 CLI 仍兼容 `--max-attempts` 和 `--max-clarifications`，但它们属于待废弃参数；默认值已经是两次定位和两轮澄清。目标版本由配置 profile 决定固定策略，并把解析结果保存为运行配置快照。
+最大定位次数、澄清轮数、评测门槛和节点 max turns 均来自 profile，并在创建 run 时保存为不可变运行配置快照。
 
 当前版本如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。当前退出码 `0` 表示评测通过，`2` 表示证据不足或评测未通过。目标 Runtime 实现后将使用独立 lifecycle/outcome 字段，等待态和诊断未决不再混用同一状态：
 
