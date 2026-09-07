@@ -1,35 +1,61 @@
 # BugLens
 
-基于 OpenAI Agents SDK 的故障定位工具。四个独立 Agent 负责分析、定位、评测和总结，
-由 Python 状态机控制流转。支持结构化澄清、有限重试和 JSON 状态持久化。
+BugLens 是一个基于 OpenAI Agents SDK 的交互式故障定位 CLI。它依次使用分析、定位、评测和总结四个 Agent，并在终端中完成必要的澄清。
 
-## 快速开始
+## 安装
+
+需要 Python 3.11 或 3.12。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 $env:OPENAI_API_KEY = "你的密钥"
-.\.venv\Scripts\buglens.exe
 ```
 
-服务默认监听 `http://127.0.0.1:8000`。访问 `/docs` 调试 API，访问 `/health` 检查服务状态。
+## 使用
 
-创建定位任务：
+直接提交问题：
 
 ```powershell
-$body = @{
-  question = "生产环境订单接口从 10:20 开始超时"
-  context = @{ environment = "production"; tenant_id = "example-team" }
-  evidence = @(@{ source = "log"; content = "timeout waiting for connection" })
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/diagnoses `
-  -ContentType application/json -Body $body
+.\.venv\Scripts\buglens.exe "生产环境订单接口从 10:20 开始超时"
 ```
 
-当状态为 `awaiting_user_input` 时，把响应中的 `request_id` 和问题 ID 提交到 `POST /diagnoses/{run_id}/answers`。
+附加上下文和证据：
 
-## 开发验证
+```powershell
+.\.venv\Scripts\buglens.exe `
+  "订单接口大量超时" `
+  --context environment=production `
+  --tenant example-team `
+  --evidence log="timeout waiting for connection"
+```
+
+如果 Agent 需要更多信息，CLI 会说明原因并在终端逐项提问。使用 `--json` 可以输出完整结构化结果；运行 `buglens --help` 查看所有选项。
+
+## SDK 使用方式
+
+- 四个节点使用 SDK `Agent` 和 Pydantic `output_type`。
+- 所有执行通过 SDK `Runner.run()`，并限制 `max_turns`。
+- 每个诊断节点使用独立的 SDK `SQLiteSession`。同一节点的澄清和重试自动延续会话，不同节点不共享历史。
+- 一次完整诊断使用 SDK tracing 归组，`run_id` 作为 `group_id`。
+- 当前不使用 handoff：评测失败后的确定性循环仍由 Graph 控制。
+- 当前没有证据查询工具；`tools=[]` 保证第一阶段无外部副作用。
+
+详细说明见[架构文档](docs/architecture.md)和
+[SDK 能力采用规范](docs/sdk-capability-spec.md)。
+
+## 配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 无 | 真实运行必需 |
+| `BUGLENS_SESSION_DB` | `data/buglens.db` | SDK SQLite Session 数据库 |
+| `BUGLENS_TRACING` | `true` | 是否启用 SDK tracing |
+| `BUGLENS_PROMPT_CONFIG` | 无 | 可选租户提示词 YAML |
+
+租户配置模板位于 `config/tenant_prompts.example.yaml`。
+
+## 测试与打包
 
 ```powershell
 .\.venv\Scripts\python.exe -m ruff check app tests
@@ -38,20 +64,89 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/diagnoses `
 .\.venv\Scripts\python.exe -m build
 ```
 
-测试模拟模型返回值，同时检查实际 SDK 的严格输出 Schema，不需要 API 密钥。完整配置、Python 包、Docker 和发布流程见[构建与部署指南](docs/build-and-deploy.md)。设计约束见 [AGENTS.md](AGENTS.md)。
+构建产物位于 `dist/`。项目仍处于 Phase 1：支持用户输入的文本证据，尚未接入日志、指标或 Trace 等只读工具。
 
-## 接口与行为
+## 端到端手工测试
 
-- `POST /diagnoses`：提交 `question`、可选 `context` 和 `evidence`。
-- `GET /diagnoses/{run_id}`：查询已保存状态。
-- `POST /diagnoses/{run_id}/answers`：提交 `request_id` 与 `answers`，每项包含 `question_id`、`answer` 和可选 `attachments`。
-- `POST /diagnoses/{run_id}/cancel`：取消等待澄清的任务。
+以下命令适用于 PowerShell。先在一个新的终端进入项目并创建独立环境：
 
-默认最多两轮定位和两轮澄清。澄清恢复使用新的 Agent 运行，继续当前定位轮次。
-多选题的 `answer` 为选项 JSON 数组字符串；单选题直接填写选项。
-未确认根因时主结论为 null；节点执行失败返回 502 和可查询的 run ID。
+```powershell
+cd D:\Project\BugLens
+python --version
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\buglens.exe --help
+```
 
-状态默认保存在 `data/runs/`，运行参数见 `.env.example`，租户提示词模板见 `config/tenant_prompts.example.yaml`。
+设置 API Key。输入内容只保存在当前 PowerShell 进程的环境变量中：
 
-当前是本地 Phase 1 原型，使用单进程，同一任务依次提交答案。
-生产鉴权、并发控制、完整审计、只读数据源接入和真实故障质量评测尚未实现。
+```powershell
+$env:OPENAI_API_KEY = Read-Host "OPENAI_API_KEY"
+$env:BUGLENS_SESSION_DB = "data/manual-test.db"
+$env:BUGLENS_TRACING = "true"
+```
+
+运行一次包含问题、环境、日志、指标和变更记录的 Bug 检查：
+
+```powershell
+.\.venv\Scripts\buglens.exe `
+  "2026-09-06 10:20 至 10:45，生产环境 order-api 的 POST /orders P99 从 350ms 升至 8s，并出现超时" `
+  --context environment=production `
+  --context service=order-api `
+  --context time_window="2026-09-06T10:20:00+08:00/2026-09-06T10:45:00+08:00" `
+  --evidence log="10:31:08 timeout waiting for database connection; trace_id=tr_1001" `
+  --evidence metric="db_pool_active=100, db_pool_max=100, http_p99=8s at 10:31" `
+  --evidence change="order-api 2.4.1 deployed at 10:15; database pool max unchanged" `
+  --max-attempts 2 `
+  --max-clarifications 2 `
+  --output .\data\manual-result.json
+```
+
+如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。命令退出码为 `0` 表示评测通过，`2` 表示证据不足或评测未通过：
+
+```powershell
+$LASTEXITCODE
+Get-Content .\data\manual-result.json
+$result = Get-Content .\data\manual-result.json -Raw | ConvertFrom-Json
+$result | Select-Object run_id, status, attempt, clarification_round
+$result.report | Format-List
+$result.evaluation | Format-List
+```
+
+确认 SDK Session 已创建。正常完成一次流程时应看到同一个 `run_id` 下的 `analyze`、`investigate`、`evaluate` 和 `summarize` 节点会话：
+
+```powershell
+Test-Path .\data\manual-test.db
+.\.venv\Scripts\python.exe -c "import sqlite3; db=sqlite3.connect(r'data/manual-test.db'); print(*[row[0] for row in db.execute('select session_id from agent_sessions order by session_id')], sep='\n')"
+```
+
+也可以要求完整 JSON 直接输出到终端：
+
+```powershell
+.\.venv\Scripts\buglens.exe `
+  "测试环境 checkout-api 返回 500，日志显示 KeyError: currency" `
+  --context environment=test `
+  --evidence log="KeyError: currency; trace_id=tr_2001" `
+  --json
+```
+
+最后运行代码检查、测试和打包，确认本地安装与发布包都可用：
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check app tests
+.\.venv\Scripts\python.exe -m ruff format --check app tests
+.\.venv\Scripts\python.exe -m pytest -q
+Remove-Item .\dist\* -Force -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -m build
+.\.venv\Scripts\python.exe -m pip install --force-reinstall .\dist\buglens-0.1.0-py3-none-any.whl
+.\.venv\Scripts\buglens.exe --help
+```
+
+完成后清除当前终端中的 Key，并按需删除手工测试文件：
+
+```powershell
+Remove-Item Env:OPENAI_API_KEY
+Remove-Item .\data\manual-result.json -ErrorAction SilentlyContinue
+Remove-Item .\data\manual-test.db -ErrorAction SilentlyContinue
+```

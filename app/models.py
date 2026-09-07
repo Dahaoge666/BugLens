@@ -203,15 +203,12 @@ class DiagnosisState(StrictModel):
     investigation: InvestigationResult | None = None
     evaluation: EvaluationResult | None = None
     report: DiagnosisReport | None = None
-    pending_interaction: UserInteractionRequest | None = None
     answers: list[UserAnswer] = Field(default_factory=list)
     clarification_round: int = 0
     max_clarification_rounds: int = Field(default=2, ge=0, le=10)
     attempt: int = 0
     max_attempts: int = Field(default=2, ge=1, le=2)
-    status: Literal["running", "awaiting_user_input", "completed", "inconclusive"] = (
-        "running"
-    )
+    status: Literal["running", "completed", "inconclusive"] = "running"
 
     @classmethod
     def create(
@@ -266,20 +263,9 @@ class SummaryInput(StrictModel):
     attempts: int
 
 
-class CreateDiagnosisRequest(StrictModel):
-    question: str = Field(min_length=1, max_length=12_000)
-    context: dict[str, str | list[str]] = Field(default_factory=dict)
-    evidence: list[Evidence] = Field(default_factory=list, max_length=30)
-    max_attempts: int = Field(default=2, ge=1, le=2)
-    max_clarification_rounds: int = Field(default=2, ge=0, le=10)
+class ClarificationInput(StrictModel):
+    answers: list[UserAnswer] = Field(min_length=1, max_length=3)
 
 
-class SubmitAnswer(StrictModel):
-    question_id: str = Field(min_length=1, max_length=128)
-    answer: str = Field(default="", max_length=12_000)
-    attachments: list[Evidence] = Field(default_factory=list, max_length=10)
-
-
-class SubmitAnswersRequest(StrictModel):
-    request_id: str
-    answers: list[SubmitAnswer] = Field(min_length=1, max_length=3)
+class RetryInput(StrictModel):
+    evaluation: EvaluationResult

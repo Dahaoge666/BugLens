@@ -3,31 +3,28 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app import api
 from app.agents import NodeExecutionError, NodeRuntimeContext, OpenAINodeRunner
+from app.cli import _key_values, build_parser
 from app.config import Settings
 from app.graph import DiagnosisGraph
 from app.models import (
     AnalyzeInput,
+    ClarificationInput,
     ClarificationQuestion,
     DiagnosisReport,
-    DiagnosisState,
     EvaluationResult,
-    Evidence,
     GraphContractError,
     InvestigationResult,
     ProblemAnalysis,
     ProblemCategory,
+    RetryInput,
     RootCauseHypothesis,
     UserAnswer,
     UserInteractionRequest,
 )
 from app.prompts import PromptRegistry
-from app.service import DiagnosisService
-from app.storage import JsonStateStore
 
 
 class FakeRunner:
@@ -35,9 +32,38 @@ class FakeRunner:
         self.outputs = iter(outputs)
         self.calls = []
 
-    async def run(self, node_name, payload, runtime: NodeRuntimeContext, category=None):
+    async def run(self, node_name, payload, runtime, category=None):
         self.calls.append((node_name, payload, runtime, category))
         return next(self.outputs)
+
+
+class FakeClarifier:
+    def __init__(self, answers=None):
+        self.answers = iter(answers or [])
+        self.requests = []
+
+    async def ask(self, request):
+        self.requests.append(request)
+        return next(self.answers)
+
+
+def interaction(node="investigate"):
+    return UserInteractionRequest(
+        request_id="ask",
+        source_node=node,
+        resume_node=node,
+        reason="insufficient_evidence",
+        explanation="Need a metric",
+        questions=[
+            ClarificationQuestion(
+                id="pool", question="Pool usage?", rationale="Confirm saturation"
+            )
+        ],
+    )
+
+
+def answer():
+    return UserAnswer(request_id="ask", question_id="pool", answer="100/100")
 
 
 def analysis(request=None):
@@ -46,9 +72,6 @@ def analysis(request=None):
         category_confidence=0.9,
         summary="slow",
         symptoms=["timeout"],
-        time_window="10:00",
-        environment="prod",
-        extracted_evidence=[],
         interaction_request=request,
     )
 
@@ -66,6 +89,7 @@ def investigation(request=None):
                 verification_steps=["inspect pool metric"],
             )
         ],
+        primary_conclusion="connection pool saturation",
         interaction_request=request,
     )
 
@@ -81,26 +105,29 @@ def evaluation(passed=True):
             "verification_executability": 18,
             "uncertainty_expression": 12,
         },
+        retry_guidance=[] if passed else ["add evidence"],
     )
 
 
-def summary():
+def report():
     return DiagnosisReport(
-        executive_summary="pool saturation is the leading hypothesis",
-        primary_conclusion=None,
-        status_explanation="verified enough",
+        executive_summary="pool saturation",
+        primary_conclusion="connection pool saturation",
+        status_explanation="supported",
         next_actions=["inspect pool metric"],
     )
 
 
+def graph(outputs):
+    prompts = PromptRegistry(Path("missing.yml"))
+    runner = FakeRunner(outputs)
+    return DiagnosisGraph(runner, prompts, tracing_enabled=False), runner
+
+
 @pytest.mark.asyncio
-async def test_completed_graph_keeps_nodes_isolated(tmp_path: Path):
-    runner = FakeRunner([analysis(), investigation(), evaluation(), summary()])
-    graph = DiagnosisGraph(
-        runner, JsonStateStore(tmp_path), PromptRegistry(Path("missing.yml"))
-    )
-    state = DiagnosisState.create("timeouts", {"tenant_id": "a"}, [])
-    result = await graph.start(state)
+async def test_completed_workflow_uses_four_isolated_nodes():
+    workflow, runner = graph([analysis(), investigation(), evaluation(), report()])
+    result = await workflow.run("timeouts", {}, [], FakeClarifier())
     assert result.status == "completed"
     assert [call[0] for call in runner.calls] == [
         "analyze",
@@ -108,238 +135,126 @@ async def test_completed_graph_keeps_nodes_isolated(tmp_path: Path):
         "evaluate",
         "summarize",
     ]
-    assert all(isinstance(call[2], NodeRuntimeContext) for call in runner.calls)
-    assert runner.calls[2][1].model_dump().keys() == {
-        "analysis",
-        "investigation",
-        "rubric_version",
-    }
-    assert runner.calls[3][1].model_dump().keys() == {
-        "analysis",
-        "investigation",
-        "evaluation",
-        "status",
-        "attempts",
-    }
+    assert len({call[2].node_name for call in runner.calls}) == 4
 
 
 @pytest.mark.asyncio
-async def test_investigation_clarification_resumes_fresh_investigator(tmp_path: Path):
-    request = UserInteractionRequest(
-        request_id="ask_1",
-        source_node="investigate",
-        resume_node="investigate",
-        reason="insufficient_evidence",
-        explanation="need pool metric",
-        questions=[
-            ClarificationQuestion(
-                id="pool", question="metric?", rationale="confirm saturation"
-            )
-        ],
-    )
-    runner = FakeRunner(
-        [analysis(), investigation(request), investigation(), evaluation(), summary()]
-    )
-    store = JsonStateStore(tmp_path)
-    graph = DiagnosisGraph(runner, store, PromptRegistry(Path("missing.yml")))
-    paused = await graph.start(DiagnosisState.create("timeouts", {}, []))
-    assert paused.status == "awaiting_user_input"
-    resumed = await graph.resume(
-        paused,
+async def test_analyzer_clarification_continues_with_typed_followup():
+    workflow, runner = graph(
         [
-            UserAnswer(
-                request_id="ask_1", question_id="pool", answer="active=100 max=100"
-            )
-        ],
+            analysis(interaction("analyze")),
+            analysis(),
+            investigation(),
+            evaluation(),
+            report(),
+        ]
     )
-    assert resumed.status == "completed"
-    assert [call[0] for call in runner.calls] == [
-        "analyze",
-        "investigate",
-        "investigate",
-        "evaluate",
-        "summarize",
-    ]
-    assert runner.calls[1][2] is not runner.calls[2][2]
+    result = await workflow.run("timeouts", {}, [], FakeClarifier([[answer()]]))
+    assert result.status == "completed"
+    assert isinstance(runner.calls[1][1], ClarificationInput)
+    assert runner.calls[0][2].graph_run_id == runner.calls[1][2].graph_run_id
 
 
 @pytest.mark.asyncio
-async def test_graph_enforces_evaluation_gate_even_if_evaluator_claims_pass(
-    tmp_path: Path,
-):
-    weak_evaluation = EvaluationResult(
-        passed=True,
-        score=88,
-        criteria_scores={
-            "problem_coverage": 20,
-            "evidence_traceability": 10,
-            "reasoning_consistency": 20,
-            "verification_executability": 18,
-            "uncertainty_expression": 15,
-        },
+async def test_investigator_clarification_does_not_consume_attempt():
+    workflow, runner = graph(
+        [
+            analysis(),
+            investigation(interaction()),
+            investigation(),
+            evaluation(),
+            report(),
+        ]
     )
-    runner = FakeRunner([analysis(), investigation(), weak_evaluation, summary()])
-    graph = DiagnosisGraph(
-        runner, JsonStateStore(tmp_path), PromptRegistry(Path("missing.yml"))
+    result = await workflow.run(
+        "timeouts", {}, [], FakeClarifier([[answer()]]), max_attempts=1
     )
-    result = await graph.start(
-        DiagnosisState.create("timeouts", {}, [], max_attempts=1)
+    assert result.status == "completed" and result.attempt == 1
+    assert isinstance(runner.calls[2][1], ClarificationInput)
+
+
+@pytest.mark.asyncio
+async def test_evaluation_feedback_continues_investigator_session():
+    workflow, runner = graph(
+        [
+            analysis(),
+            investigation(),
+            evaluation(False),
+            investigation(),
+            evaluation(),
+            report(),
+        ]
+    )
+    result = await workflow.run("timeouts", {}, [], FakeClarifier())
+    assert result.status == "completed" and result.attempt == 2
+    assert isinstance(runner.calls[3][1], RetryInput)
+    assert runner.calls[1][2].graph_run_id == runner.calls[3][2].graph_run_id
+
+
+@pytest.mark.asyncio
+async def test_clarification_limit_produces_inconclusive_report():
+    workflow, _ = graph([analysis(interaction("analyze")), report()])
+    result = await workflow.run(
+        "timeouts", {}, [], FakeClarifier(), max_clarification_rounds=0
     )
     assert result.status == "inconclusive"
-    assert result.evaluation is not None and result.evaluation.passed is False
-
-
-def request(node="investigate"):
-    return UserInteractionRequest(
-        request_id="ask",
-        source_node=node,
-        resume_node=node,
-        reason="insufficient_evidence",
-        explanation="Need measurements",
-        questions=[
-            ClarificationQuestion(
-                id="q", question="Pool usage?", rationale="Distinguish saturation"
-            )
-        ],
-    )
-
-
-def answer(**changes):
-    return UserAnswer(
-        **({"request_id": "ask", "question_id": "q", "answer": "active=100"} | changes)
-    )
-
-
-def setup_graph(tmp_path, outputs):
-    runner = FakeRunner(outputs)
-    graph = DiagnosisGraph(
-        runner, JsonStateStore(tmp_path), PromptRegistry(Path("missing.yml"))
-    )
-    return graph, runner
+    assert result.report.primary_conclusion is None
+    assert "尚未确认根因" in result.report.status_explanation
 
 
 @pytest.mark.asyncio
-async def test_last_attempt_can_resume_after_persisted_pause(tmp_path):
-    graph, runner = setup_graph(
-        tmp_path,
-        [
-            analysis(),
-            investigation(request()),
-            investigation(),
-            evaluation(),
-            summary(),
-        ],
+async def test_sdk_runner_uses_same_session_per_node_and_separate_node_sessions(
+    monkeypatch, tmp_path
+):
+    sdk = AsyncMock(
+        side_effect=[
+            SimpleNamespace(final_output=analysis()),
+            SimpleNamespace(final_output=analysis()),
+            SimpleNamespace(final_output=evaluation()),
+        ]
     )
-    paused = await graph.start(DiagnosisState.create("timeout", {}, [], max_attempts=1))
-    loaded = graph.store.load(paused.run_id)
-    done = await graph.resume(loaded, [answer()])
-    assert done.status == "completed" and done.attempt == 1
-    assert len({id(call[2]) for call in runner.calls}) == len(runner.calls)
+    monkeypatch.setattr("app.agents.Runner.run", sdk)
+    runner = OpenAINodeRunner(
+        PromptRegistry(Path("missing.yml")), tmp_path / "sessions.db"
+    )
+    analyze_context = NodeRuntimeContext("run", "analyze", "v1")
+    evaluate_context = NodeRuntimeContext("run", "evaluate", "v1")
+    try:
+        await runner.run(
+            "analyze", AnalyzeInput(question="a", evidence=[]), analyze_context
+        )
+        await runner.run(
+            "analyze", AnalyzeInput(question="b", evidence=[]), analyze_context
+        )
+        await runner.run(
+            "evaluate",
+            SimpleNamespace(model_dump_json=lambda: "{}"),
+            evaluate_context,
+        )
+    finally:
+        runner.close()
+    sessions = [call.kwargs["session"] for call in sdk.call_args_list]
+    assert sessions[0] is sessions[1]
+    assert sessions[0] is not sessions[2]
+    assert sessions[0].session_id == "run:analyze"
+    assert sessions[2].session_id == "run:evaluate"
 
 
 @pytest.mark.asyncio
-async def test_retry_feedback_and_attempt_limit(tmp_path):
-    graph, runner = setup_graph(
-        tmp_path,
-        [
-            analysis(),
-            investigation(),
-            evaluation(False),
-            investigation(),
-            evaluation(False),
-            summary(),
-        ],
+async def test_sdk_invalid_output_retries_once(monkeypatch, tmp_path):
+    sdk = AsyncMock(return_value=SimpleNamespace(final_output={}))
+    monkeypatch.setattr("app.agents.Runner.run", sdk)
+    runner = OpenAINodeRunner(
+        PromptRegistry(Path("missing.yml")), tmp_path / "sessions.db"
     )
-    done = await graph.start(DiagnosisState.create("timeout", {}, []))
-    assert done.status == "inconclusive" and done.attempt == 2
-    assert runner.calls[3][1].previous_evaluation.retry_guidance
-    assert done.report.primary_conclusion is None
-    assert "尚未确认根因" in done.report.status_explanation
-
-
-@pytest.mark.asyncio
-async def test_analyzer_resumes_without_prior_history(tmp_path):
-    graph, runner = setup_graph(
-        tmp_path,
-        [
-            analysis(request("analyze")),
-            analysis(),
-            investigation(),
-            evaluation(),
-            summary(),
-        ],
-    )
-    paused = await graph.start(DiagnosisState.create("timeout", {}, []))
-    done = await graph.resume(paused, [answer()])
-    assert done.status == "completed"
-    assert [call[0] for call in runner.calls][:2] == ["analyze", "analyze"]
-    assert runner.calls[1][1].clarification_answers[0].answer == "active=100"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "answers",
-    [
-        [answer(request_id="wrong")],
-        [answer(question_id="wrong")],
-        [answer(answer=" ")],
-        [answer(), answer()],
-        [],
-    ],
-)
-async def test_invalid_answers_do_not_mutate_state(tmp_path, answers):
-    graph, _ = setup_graph(tmp_path, [analysis(request("analyze"))])
-    paused = await graph.start(DiagnosisState.create("timeout", {}, []))
-    before = paused.model_dump_json()
-    with pytest.raises(GraphContractError):
-        await graph.resume(paused, answers)
-    assert paused.model_dump_json() == before
-    assert graph.store.load(paused.run_id).model_dump_json() == before
-
-
-@pytest.mark.asyncio
-async def test_clarification_limit(tmp_path):
-    graph, _ = setup_graph(tmp_path, [analysis(request("analyze")), summary()])
-    done = await graph.start(
-        DiagnosisState.create("timeout", {}, [], max_clarification_rounds=0)
-    )
-    assert done.status == "inconclusive" and done.pending_interaction is None
-
-
-@pytest.mark.asyncio
-async def test_direct_resume_redacts_answers_and_evidence(tmp_path):
-    graph, runner = setup_graph(
-        tmp_path,
-        [
-            analysis(),
-            investigation(request()),
-            investigation(),
-            evaluation(),
-            summary(),
-        ],
-    )
-    paused = await graph.start(DiagnosisState.create("timeout", {}, []))
-    await graph.resume(
-        paused,
-        [
-            answer(
-                answer="token=private person@example.com 13812345678",
-                attachments=[
-                    Evidence(
-                        source="log",
-                        content="password=private",
-                        reference="token=private",
-                    )
-                ],
-            )
-        ],
-    )
-    serialized = runner.calls[2][1].model_dump_json()
-    assert (
-        "private" not in serialized
-        and "person@example.com" not in serialized
-        and "13812345678" not in serialized
-    )
+    with pytest.raises(NodeExecutionError):
+        await runner.run(
+            "analyze",
+            AnalyzeInput(question="timeout", evidence=[]),
+            NodeRuntimeContext("run", "analyze", "v1"),
+        )
+    runner.close()
+    assert sdk.await_count == 2
 
 
 @pytest.mark.parametrize(
@@ -352,167 +267,49 @@ def test_sdk_accepts_strict_output_schema(output_type):
     assert AgentOutputSchema(output_type).is_strict_json_schema()
 
 
-@pytest.mark.asyncio
-async def test_sdk_retry_is_fresh_and_validated(monkeypatch):
-    import agents
-
-    sdk = AsyncMock(
-        side_effect=[
-            SimpleNamespace(final_output={}),
-            SimpleNamespace(final_output=analysis()),
-        ]
-    )
-    monkeypatch.setattr(agents.Runner, "run", sdk)
-    runner = OpenAINodeRunner(PromptRegistry(Path("missing.yml")))
-    result = await runner.run(
-        "analyze",
-        AnalyzeInput(question="timeout", evidence=[]),
-        NodeRuntimeContext("run", "analyze", "v1"),
-    )
-    assert result.category == analysis().category
-    assert sdk.await_count == 2
-    first, second = sdk.call_args_list
-    assert first.kwargs["context"] is not second.kwargs["context"]
-    assert set(first.kwargs) == {"input", "context", "max_turns"}
-    assert first.args[0].tools == []
-
-
-@pytest.mark.asyncio
-async def test_sdk_invalid_output_stops_after_one_retry(monkeypatch):
-    import agents
-
-    sdk = AsyncMock(return_value=SimpleNamespace(final_output={}))
-    monkeypatch.setattr(agents.Runner, "run", sdk)
-    with pytest.raises(NodeExecutionError):
-        await OpenAINodeRunner(PromptRegistry(Path("missing.yml"))).run(
-            "analyze",
-            AnalyzeInput(question="timeout", evidence=[]),
-            NodeRuntimeContext("run", "analyze", "v1"),
-        )
-    assert sdk.await_count == 2
-
-
-def test_api_pause_get_resume_and_replay(tmp_path):
-    graph, _ = setup_graph(
-        tmp_path,
-        [
-            analysis(request("analyze")),
-            analysis(),
-            investigation(),
-            evaluation(),
-            summary(),
-        ],
-    )
-    with TestClient(api.create_app(DiagnosisService(graph))) as client:
-        created = client.post("/diagnoses", json={"question": "timeout"})
-        assert created.status_code == 201
-        path = "/diagnoses/" + created.json()["run_id"]
-        assert "executive_summary" not in created.json()
-        assert client.get(path).json() == created.json()
-        body = {
-            "request_id": "ask",
-            "answers": [{"question_id": "q", "answer": "pool full"}],
-        }
-        result = client.post(path + "/answers", json=body)
-        assert result.status_code == 200 and result.json()["status"] == "completed"
-        assert result.json()["primary_conclusion"] is None
-        assert len(result.json()["alternative_hypotheses"]) == 1
-        assert client.post(path + "/answers", json=body).status_code == 422
-        assert client.get("/diagnoses/invalid!").status_code == 404
-        assert (
-            client.post(
-                "/diagnoses", json={"question": "timeout", "max_attempts": 3}
-            ).status_code
-            == 422
-        )
-
-
-def test_api_cancel(tmp_path):
-    graph, _ = setup_graph(tmp_path, [analysis(request("analyze")), summary()])
-    with TestClient(api.create_app(DiagnosisService(graph))) as client:
-        run = client.post("/diagnoses", json={"question": "timeout"}).json()["run_id"]
-        result = client.post(f"/diagnoses/{run}/cancel")
-        assert result.status_code == 200 and result.json()["status"] == "inconclusive"
-
-
-def test_health_endpoint(tmp_path):
-    graph, _ = setup_graph(tmp_path, [])
-    with TestClient(api.create_app(DiagnosisService(graph))) as client:
-        assert client.get("/health").json() == {"status": "ok"}
-
-
-def test_settings_from_environment(monkeypatch, tmp_path):
-    monkeypatch.setenv("BUGLENS_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("BUGLENS_PROMPT_CONFIG", "config/prompts.yaml")
-    monkeypatch.setenv("BUGLENS_HOST", "0.0.0.0")
-    monkeypatch.setenv("BUGLENS_PORT", "9000")
-    monkeypatch.setenv("BUGLENS_LOG_LEVEL", "DEBUG")
-    settings = Settings.from_env()
-    assert settings.state_dir == tmp_path
-    assert settings.prompt_config == Path("config/prompts.yaml")
-    assert (settings.host, settings.port, settings.log_level) == (
-        "0.0.0.0",
-        9000,
-        "debug",
-    )
-
-
-@pytest.mark.parametrize("port", ["invalid", "0", "65536"])
-def test_settings_reject_invalid_port(monkeypatch, port):
-    monkeypatch.setenv("BUGLENS_PORT", port)
-    with pytest.raises(ValueError):
-        Settings.from_env()
-
-
-def test_api_provider_failure_is_persisted_without_details(tmp_path):
-    graph, runner = setup_graph(tmp_path, [])
-    runner.run = AsyncMock(side_effect=NodeExecutionError("secret provider details"))
-    with TestClient(api.create_app(DiagnosisService(graph))) as client:
-        response = client.post("/diagnoses", json={"question": "timeout"})
-        assert response.status_code == 502 and "secret" not in response.text
-        run = response.json()["detail"]["run_id"]
-        assert client.get(f"/diagnoses/{run}").json()["status"] == "inconclusive"
-
-
-def test_score_ranges_and_total_are_enforced():
+def test_evaluation_score_is_recomputed_and_thresholds_enforced():
+    result = evaluation().model_copy(update={"score": 100}).enforce_rubric()
+    assert result.score == 85 and result.passed
     data = evaluation().model_dump()
     data["criteria_scores"]["problem_coverage"] = 100
     with pytest.raises(ValidationError):
         EvaluationResult.model_validate(data)
-    result = evaluation().model_copy(update={"score": 100}).enforce_rubric()
-    assert result.score == 85
 
 
-def test_app_instances_use_independent_services(tmp_path):
-    first, _ = setup_graph(tmp_path / "first", [analysis(request("analyze"))])
-    second, _ = setup_graph(tmp_path / "second", [])
-    with (
-        TestClient(api.create_app(DiagnosisService(first))) as client_a,
-        TestClient(api.create_app(DiagnosisService(second))) as client_b,
-    ):
-        created = client_a.post("/diagnoses", json={"question": "timeout"}).json()
-        path = "/diagnoses/" + created["run_id"]
-        assert client_a.get(path).status_code == 200
-        assert client_b.get(path).status_code == 404
+def test_cli_parser_and_key_values():
+    args = build_parser().parse_args(
+        [
+            "timeout",
+            "--context",
+            "environment=prod",
+            "--json",
+            "--output",
+            "result.json",
+        ]
+    )
+    assert args.question == "timeout" and args.json
+    assert args.output == Path("result.json")
+    assert _key_values(args.context, "--context") == {"environment": "prod"}
+    with pytest.raises(ValueError):
+        _key_values(["invalid"], "--context")
 
 
-@pytest.mark.parametrize(
-    "kind,value,valid",
-    [
-        ("single_select", "a", True),
-        ("single_select", "c", False),
-        ("multi_select", '["a", "b"]', True),
-        ("multi_select", '["c"]', False),
-        ("multi_select", '"a"', False),
-        ("multi_select", "invalid JSON", False),
-    ],
-)
-def test_clarification_model_validates_selections(kind, value, valid):
-    interaction = request()
-    interaction.questions[0].answer_type = kind
-    interaction.questions[0].options = ["a", "b"]
-    if valid:
-        interaction.validate_answers([answer(answer=value)])
-    else:
-        with pytest.raises(GraphContractError):
-            interaction.validate_answers([answer(answer=value)])
+def test_settings_use_sdk_session_database(monkeypatch, tmp_path):
+    monkeypatch.setenv("BUGLENS_SESSION_DB", str(tmp_path / "sessions.db"))
+    monkeypatch.setenv("BUGLENS_TRACING", "false")
+    settings = Settings.from_env()
+    assert settings.session_db == tmp_path / "sessions.db"
+    assert not settings.tracing_enabled
+
+
+def test_invalid_tracing_setting_is_rejected(monkeypatch):
+    monkeypatch.setenv("BUGLENS_TRACING", "sometimes")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_clarification_contract_rejects_wrong_answer():
+    with pytest.raises(GraphContractError):
+        interaction().validate_answers(
+            [UserAnswer(request_id="wrong", question_id="pool", answer="100/100")]
+        )
