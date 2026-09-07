@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from pathlib import Path
 from uuid import uuid4
 
+from .application import ModelCredentialsError
 from .bootstrap import build_local_client
 from .client import AgentClient, RemoteAgentClient
 from .config import Settings
@@ -15,8 +17,24 @@ from .protocol.commands import CancelDiagnosis, StartDiagnosis, SubmitUserAnswer
 from .protocol.events import InputRequired, RunWaiting
 
 
+class NonInteractiveClarifierError(RuntimeError):
+    """Raised when clarification is required but stdin is not interactive."""
+
+    code = "non_interactive_clarifier"
+
+
 class ConsoleClarifier:
+    def __init__(self, *, stream=None) -> None:
+        # Default to stdin; allow injection for tests.
+        self._stream = stream if stream is not None else sys.stdin
+
     async def ask(self, request: UserInteractionRequest) -> list[UserAnswer]:
+        if not self._stream.isatty():
+            raise NonInteractiveClarifierError(
+                "diagnosis requires clarification but stdin is not a TTY; "
+                "re-run in an interactive terminal, or use --resume RUN_ID (or the "
+                "Web adapter) to supply answers separately"
+            )
         print(f"\n需要补充信息：{request.explanation}")
         answers: list[UserAnswer] = []
         for question in request.questions:
@@ -221,6 +239,14 @@ def main() -> None:
     except (KeyboardInterrupt, EOFError):
         print("\n已取消。")
         code = 130
+    except NonInteractiveClarifierError as exc:
+        # Keep the run in waiting_user so it can be resumed with answers via --resume
+        # or the Web adapter; do not treat it as a generic cancellation.
+        print(f"\n需要补充信息但当前环境不支持交互输入：{exc}")
+        code = 64
+    except ModelCredentialsError as exc:
+        print(f"\n模型凭据未就绪：{exc}")
+        code = 66
     except ValueError as exc:
         print(f"输入错误：{exc}")
         code = 2

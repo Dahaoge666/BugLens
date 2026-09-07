@@ -256,6 +256,9 @@ class Settings(StrictModel):
     remote: str | None = None
     cors_origin: str | None = None
     admin_token: str | None = None
+    openai_base_url: str | None = None
+    openai_api_key: str | None = None
+    openai_timeout: float = Field(default=60.0, gt=0, le=600)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -273,4 +276,7 @@ class Settings(StrictModel):
             remote=os.getenv("BUGLENS_REMOTE"),
             cors_origin=os.getenv("BUGLENS_CORS_ORIGIN"),
             admin_token=os.getenv("BUGLENS_ADMIN_TOKEN"),
+            openai_base_url=os.getenv("OPENAI_BASE_URL"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_timeout=float(os.getenv("BUGLENS_OPENAI_TIMEOUT", "60")),
         )

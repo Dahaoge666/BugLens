@@ -398,6 +398,7 @@ class DiagnosisGraph:
             config_snapshot_id=config.snapshot_id,
             prompt_config_version=config.prompt_config_version,
             max_turns=node_policy.max_turns,
+            model=node_policy.model,
         )
 
     @staticmethod
