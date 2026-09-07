@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -91,14 +93,23 @@ DEFAULT_PROFILE: dict[str, Any] = {
 }
 
 
+class ConfigRevisionConflictError(ValueError):
+    code = "config_revision_conflict"
+
+
+class ConfigNotWritableError(ValueError):
+    code = "config_not_writable"
+
+
 class ConfigRepository:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path
+        self._write_lock = threading.Lock()
         self._profiles = self._load()
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if self.path is None or not self.path.exists():
-            return {"default": DEFAULT_PROFILE}
+            return {"default": copy.deepcopy(DEFAULT_PROFILE)}
         loaded = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
             raise ValueError("configuration root must be a mapping")
@@ -109,9 +120,9 @@ class ConfigRepository:
         for name, value in profiles.items():
             if not isinstance(name, str) or not isinstance(value, dict):
                 raise ValueError("each profile must be a mapping")
-            result[name] = value
+            result[name] = copy.deepcopy(value)
         if "default" not in result:
-            result["default"] = DEFAULT_PROFILE
+            result["default"] = copy.deepcopy(DEFAULT_PROFILE)
         versions = [
             str(value.get("config_version", value.get("version", f"{name}-v1")))
             for name, value in result.items()
@@ -120,10 +131,81 @@ class ConfigRepository:
             raise ValueError("profile config_version values must be unique")
         return result
 
+    @property
+    def revision(self) -> str:
+        """Return a stable revision for the currently loaded public config."""
+        canonical = json.dumps(self._profiles, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()[:24]
+
+    @property
+    def writable(self) -> bool:
+        return self.path is not None
+
+    def profiles(self) -> dict[str, dict[str, Any]]:
+        """Return a deep copy suitable for an admin read model."""
+        return copy.deepcopy(self._profiles)
+
     def resolve(self, profile: str) -> ResolvedRunConfig:
         if profile not in self._profiles:
             raise ValueError(f"unknown profile: {profile}")
-        raw = dict(self._profiles[profile])
+        return self._resolve_raw(profile, self._profiles[profile])
+
+    def validate_profile(
+        self, profile: str, value: dict[str, Any]
+    ) -> ResolvedRunConfig:
+        """Validate an untrusted profile without changing active configuration."""
+        if not isinstance(value, dict):
+            raise ValueError("profile configuration must be an object")
+        return self._resolve_raw(profile, value)
+
+    def apply_profile(
+        self,
+        profile: str,
+        value: dict[str, Any],
+        expected_revision: str,
+    ) -> ResolvedRunConfig:
+        """Validate and atomically persist one profile configuration."""
+        with self._write_lock:
+            return self._apply_profile(profile, value, expected_revision)
+
+    def _apply_profile(
+        self,
+        profile: str,
+        value: dict[str, Any],
+        expected_revision: str,
+    ) -> ResolvedRunConfig:
+        if expected_revision != self.revision:
+            raise ConfigRevisionConflictError("configuration revision changed")
+        if self.path is None:
+            raise ConfigNotWritableError(
+                "configuration is using the built-in default and is not writable"
+            )
+        self.validate_profile(profile, value)
+        profiles = self.profiles()
+        profiles[profile] = copy.deepcopy(value)
+        if "default" not in profiles:
+            profiles["default"] = copy.deepcopy(DEFAULT_PROFILE)
+        # Validate every profile before writing so one invalid profile cannot leave
+        # the repository in a state that the next process cannot load.
+        versions: list[str] = []
+        for name, raw in profiles.items():
+            resolved = self._resolve_raw(name, raw)
+            versions.append(resolved.config_version)
+        if len(versions) != len(set(versions)):
+            raise ValueError("profile config_version values must be unique")
+        payload = yaml.safe_dump(
+            {"profiles": profiles}, sort_keys=False, allow_unicode=True
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, self.path)
+        self._profiles = profiles
+        return self.resolve(profile)
+
+    @staticmethod
+    def _resolve_raw(profile: str, raw_value: dict[str, Any]) -> ResolvedRunConfig:
+        raw = copy.deepcopy(raw_value)
         config_version = str(
             raw.pop("config_version", raw.pop("version", f"{profile}-v1"))
         )
@@ -172,6 +254,8 @@ class Settings(StrictModel):
     tracing_enabled: bool = True
     default_profile: str = "default"
     remote: str | None = None
+    cors_origin: str | None = None
+    admin_token: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -187,4 +271,6 @@ class Settings(StrictModel):
             tracing_enabled=tracing == "true",
             default_profile=os.getenv("BUGLENS_PROFILE", "default"),
             remote=os.getenv("BUGLENS_REMOTE"),
+            cors_origin=os.getenv("BUGLENS_CORS_ORIGIN"),
+            admin_token=os.getenv("BUGLENS_ADMIN_TOKEN"),
         )

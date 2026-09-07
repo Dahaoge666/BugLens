@@ -4,9 +4,16 @@
 
 本文只定义诊断运行的生命周期、检查点和恢复语义。相关边界见 [Runtime/Adapter 规范](agent-runtime-adapter-spec.md)、[Command/Event 协议](agent-protocol-spec.md)和[运行配置规范](runtime-config-spec.md)。固定 Graph 保持 `Analyze → Investigate → Evaluate → Summarize`；总定位尝试最多两次，因此评测失败后最多重试 Investigate 一次。
 
-## 当前差距
+## 当前实现
 
-当前 `DiagnosisGraph.run()` 每次创建新状态，`Clarifier.ask()` 在进程内等待，`DiagnosisState` 没有持久化检查点、等待态和游标。SDK `SQLiteSession` 保存节点消息，但不能决定业务 Graph 从哪里恢复。
+`DiagnosisRuntime` 已将每次短执行拆成可提交的 checkpoint：Runtime 在等待用户、完成、失败或取消
+前保存 `DiagnosisState` 和对应 Event，然后结束本次调用；不会在 CLI 进程或 HTTP 请求中长期阻塞。
+`SQLiteCheckpointStore` 持久化运行状态、Command 幂等记录、Event、租约和配置快照。SDK
+`SQLiteSession` 仍只保存节点模型消息，不能决定业务 Graph 从哪里恢复。
+
+`GET /v1/runs/{id}/events?after=N` 是有界历史读取：按 sequence 返回已提交 Event 后关闭；不存在的
+run 返回 `run_not_found`，合法但没有新事件的追赶请求返回空 SSE 流。客户端断线应先读取 Run 快照，再
+从最大 sequence 追赶，不把断流误判为 failed。
 
 ## 状态模型
 

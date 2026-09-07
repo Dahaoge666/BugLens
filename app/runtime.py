@@ -330,5 +330,9 @@ class DiagnosisRuntime:
         return RunView.model_validate(self.store.get_state(run_id).model_dump())
 
     async def events(self, run_id: str, after: int = 0) -> AsyncIterator[AgentEvent]:
+        # Validate the run before yielding an empty history. Otherwise a typo in
+        # the run id would look identical to a valid request past the latest
+        # sequence number.
+        self.store.get_state(run_id)
         for event in self.store.events_after(run_id, after):
             yield event

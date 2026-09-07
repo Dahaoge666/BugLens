@@ -14,6 +14,16 @@ python -m venv .venv
 $env:OPENAI_API_KEY = "你的密钥"
 ```
 
+启动 HTTP/SSE 后端（前端可独立部署）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[web]"
+.\.venv\Scripts\buglens-web.exe --host 127.0.0.1 --port 8000
+```
+
+需要前后端一键安装时，使用独立的 [`distribution/`](distribution/README.md) 安装层；它通过 Docker
+Compose 选择 backend-only 或 full 模式，不会把前端依赖写入 Python 工程。
+
 ## 使用
 
 直接提交问题：
@@ -51,6 +61,7 @@ $env:OPENAI_API_KEY = "你的密钥"
 - 当前不使用 handoff：评测失败后的确定性循环仍由 Graph 控制。
 - 当前没有证据查询工具；`tools=[]` 保证第一阶段无外部副作用。
 - `ApplicationService`、`DiagnosisRuntime` 和 `SQLiteCheckpointStore` 负责统一 Command/Event、生命周期、revision、幂等和配置快照。
+- `AdminApplicationService` 只负责控制面健康、版本、配置校验/原子更新和运行/Session 元数据查询，不进入 Graph。
 
 当前与目标架构见[架构文档](docs/architecture.md)，SDK 边界见
 [SDK 能力采用规范](docs/sdk-capability-spec.md)。目标设计拆分为：
@@ -59,6 +70,7 @@ $env:OPENAI_API_KEY = "你的密钥"
 - [Command/Event 协议](docs/agent-protocol-spec.md)
 - [生命周期恢复](docs/lifecycle-resume-spec.md)
 - [运行配置与快照](docs/runtime-config-spec.md)
+- [Admin 控制面](docs/admin-control-plane-spec.md)
 
 ## 配置
 
@@ -70,6 +82,8 @@ $env:OPENAI_API_KEY = "你的密钥"
 | `BUGLENS_PROFILE` | `default` | 默认运行 profile |
 | `BUGLENS_TRACING` | `true` | 是否启用 SDK tracing |
 | `BUGLENS_PROMPT_CONFIG` | 无 | 可选租户提示词 YAML |
+| `BUGLENS_CORS_ORIGIN` | 无 | 可选前端来源；独立域名部署时设置为精确 origin |
+| `BUGLENS_ADMIN_TOKEN` | 无 | 可选管理 API Bearer Token；公网部署建议设置 |
 
 租户配置模板位于 `config/tenant_prompts.example.yaml`。
 
@@ -121,7 +135,7 @@ $env:BUGLENS_TRACING = "true"
 
 最大定位次数、澄清轮数、评测门槛和节点 max turns 均来自 profile，并在创建 run 时保存为不可变运行配置快照。
 
-当前版本如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。当前退出码 `0` 表示评测通过，`2` 表示证据不足或评测未通过。目标 Runtime 实现后将使用独立 lifecycle/outcome 字段，等待态和诊断未决不再混用同一状态：
+如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。当前退出码 `0` 表示评测通过，`2` 表示证据不足或评测未通过。Runtime 使用独立的 lifecycle/outcome 字段，等待态和诊断未决不会混用同一状态：
 
 ```powershell
 $LASTEXITCODE

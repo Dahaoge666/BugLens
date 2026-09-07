@@ -4,6 +4,10 @@
 
 本文只定义 Adapter、Application Service 与 Runtime 的稳定协议。Command 是请求，Event 是已提交事实，二者不得混用。HTTP DTO 和 CLI 参数必须先转为协议对象，Runtime 返回 `AsyncIterator[AgentEvent]`。
 
+管理控制面 `/v1/admin/*` 使用独立的 JSON 查询/变更 DTO，不属于 AgentCommand/Event 流；它只能访问
+确定性的配置和运维元数据，不能绕过 Application Service 调用 Graph。具体字段见
+[Admin 控制面规范](admin-control-plane-spec.md)。
+
 ## 信封与类型
 
 ```python

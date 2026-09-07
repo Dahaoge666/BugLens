@@ -15,6 +15,15 @@ from .runtime import DiagnosisRuntime
 def build_local_client(
     settings: Settings,
 ) -> tuple[LocalAgentClient, SQLiteCheckpointStore, OpenAINodeRunner]:
+    service, store, runner = build_local_service(settings)
+    return LocalAgentClient(service), store, runner
+
+
+def build_local_service(
+    settings: Settings,
+) -> tuple[ApplicationService, SQLiteCheckpointStore, OpenAINodeRunner]:
+    """Build the shared application service for CLI, HTTP and admin adapters."""
+
     configs = ConfigRepository(settings.config_path)
     prompts = PromptRegistry(settings.prompt_config)
     runner = OpenAINodeRunner(prompts, settings.session_db)
@@ -24,4 +33,4 @@ def build_local_client(
         graph, store, configs, tracing_enabled=settings.tracing_enabled
     )
     service = ApplicationService(runtime, configs)
-    return LocalAgentClient(service), store, runner
+    return service, store, runner

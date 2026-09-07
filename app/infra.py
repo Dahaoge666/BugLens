@@ -205,6 +205,128 @@ class SQLiteCheckpointStore:
         ).fetchall()
         return [event_from_json(row["event_json"]) for row in rows]
 
+    def list_states(
+        self,
+        *,
+        lifecycle_status: str | None = None,
+        outcome: str | None = None,
+        current_node: str | None = None,
+        profile: str | None = None,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[DiagnosisState], int]:
+        """Return a bounded, read-only view of persisted runs for admin surfaces.
+
+        Filtering is deliberately performed after deserialisation. ``DiagnosisState``
+        remains the source of truth for lifecycle fields, keeping the admin adapter
+        independent from the rest of the checkpoint schema.
+        """
+
+        rows = self.db.execute(
+            "SELECT state_json FROM diagnosis_runs ORDER BY updated_at DESC, run_id DESC"
+        ).fetchall()
+        normalized_query = query.strip().lower() if query else None
+        matches: list[DiagnosisState] = []
+        for row in rows:
+            state = DiagnosisState.model_validate_json(row["state_json"])
+            if lifecycle_status and state.lifecycle_status.value != lifecycle_status:
+                continue
+            if outcome and (state.outcome is None or state.outcome.value != outcome):
+                continue
+            if current_node and (
+                state.current_node is None or state.current_node.value != current_node
+            ):
+                continue
+            if profile and state.config_profile != profile:
+                continue
+            if normalized_query:
+                haystack = f"{state.run_id} {state.user_question}".lower()
+                if normalized_query not in haystack:
+                    continue
+            matches.append(state)
+        start = max(0, offset)
+        end = start + max(1, min(limit, 100))
+        return matches[start:end], len(matches)
+
+    def list_sessions(
+        self,
+        *,
+        run_id: str | None = None,
+        node: str | None = None,
+        status: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, object]], int]:
+        """Return SDK-managed session metadata without exposing model messages."""
+
+        try:
+            rows = self.db.execute(
+                "SELECT session_id, created_at, updated_at FROM agent_sessions "
+                "ORDER BY updated_at DESC, session_id DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A fresh installation has no SDK session tables until the first node
+            # runs. The admin API should still be healthy in that state.
+            return [], 0
+
+        message_counts: dict[str, int] = {}
+        try:
+            count_rows = self.db.execute(
+                "SELECT session_id, COUNT(*) AS count FROM agent_messages GROUP BY session_id"
+            ).fetchall()
+            message_counts = {
+                str(row["session_id"]): int(row["count"]) for row in count_rows
+            }
+        except sqlite3.OperationalError:
+            pass
+
+        states: dict[str, DiagnosisState] = {}
+        state_rows = self.db.execute("SELECT state_json FROM diagnosis_runs").fetchall()
+        for row in state_rows:
+            state = DiagnosisState.model_validate_json(row["state_json"])
+            states[state.run_id] = state
+
+        records: list[dict[str, object]] = []
+        for row in rows:
+            session_id = str(row["session_id"])
+            if ":" in session_id:
+                session_run_id, session_node = session_id.rsplit(":", 1)
+            else:
+                session_run_id, session_node = session_id, None
+            if run_id and session_run_id != run_id:
+                continue
+            if node and session_node != node:
+                continue
+            state = states.get(session_run_id)
+            if state is None:
+                session_status = "unknown"
+            elif state.lifecycle_status.value == "waiting_user":
+                session_status = "waiting"
+            elif state.lifecycle_status.value in {"completed", "failed"}:
+                session_status = "completed"
+            else:
+                session_status = "active"
+            if status and session_status != status:
+                continue
+            records.append(
+                {
+                    "session_id": session_id,
+                    "run_id": session_run_id,
+                    "node": session_node,
+                    "status": session_status,
+                    "created_at": str(row["created_at"]),
+                    "updated_at": str(row["updated_at"]),
+                    "message_count": message_counts.get(session_id, 0),
+                    "config_snapshot_id": (
+                        state.config_snapshot_id if state is not None else None
+                    ),
+                }
+            )
+        start = max(0, offset)
+        end = start + max(1, min(limit, 100))
+        return records[start:end], len(records)
+
     def acquire_lease(self, run_id: str, owner: str, seconds: int = 60) -> None:
         now = time.time()
         self.db.execute("BEGIN IMMEDIATE")
