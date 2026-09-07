@@ -23,13 +23,13 @@
 | `trace()` | 用 `run_id` 把四个节点归入同一次诊断 | 保留 |
 | `max_turns` | 限制单个节点的运行轮数 | 保留 |
 
-SDK Session 是本地 CLI 的合适默认项：历史由应用控制并持久化，后续还可用于可恢复的审批流程。一个会话只能选择一种连续性策略；本项目不同时混用 Session、`previous_response_id` 和 Conversations API，避免上下文重复。
+SDK Session 是共享 Agent Runtime 的模型会话层：无论入口来自本地 CLI、远程 CLI 还是 Web，都由 Runtime 使用相同 Session 规则。一个会话只选择一种连续性策略；本项目不同时混用 Session、`previous_response_id` 和 Conversations API。
 
 ## 可继续替换的能力
 
 ### 流式运行
 
-可用 `Runner.run_streamed()` 替代普通运行，并消费 SDK 事件展示当前节点、工具调用和输出进度。最终状态仍只在结构化输出完成后提交。该能力只改善 CLI 反馈，不改变 Graph 路由，列为下一阶段优先项。
+可用 `Runner.run_streamed()` 消费 SDK 运行事件，并由 Runtime 映射成协议层瞬时 Event。SDK 事件不得直接暴露给 Adapter，也不得替代与检查点同事务提交的持久化领域 Event。
 
 ### 生命周期 hooks
 
@@ -51,9 +51,9 @@ Pydantic 字段长度、枚举、评测阈值和节点路由仍由普通代码�
 
 ### 工具审批与 `RunState`
 
-如果未来加入需要人工确认的敏感工具，应使用 `needs_approval`、`interruptions` 和可序列化 `RunState`。CLI 审批后以同一个 state 恢复运行，不自行重建待执行工具调用。
+如果未来加入需要人工确认的敏感工具，应使用 `needs_approval`、`interruptions` 和可序列化 `RunState`。任一 Adapter 提交审批 Command 后，由 Runtime 使用同一 state 恢复，不自行重建待执行工具调用。
 
-这项能力不替代当前的语义澄清。BugLens 的澄清要求用户提供时间范围、日志或指标，是新的业务输入；工具审批只表达批准或拒绝一项已经生成的工具调用。语义澄清继续由 `UserInteractionRequest`、CLI 输入和 Graph 次数上限管理。
+这项能力不替代语义澄清。语义澄清由 `UserInteractionRequest`、回答 Command 和 Graph 次数上限管理；工具审批只表示批准或拒绝已经生成的工具调用。
 
 ### 长会话压缩
 
@@ -69,15 +69,16 @@ Pydantic 字段长度、枚举、评测阈值和节点路由仍由普通代码�
 | `previous_response_id` / Conversations API | 与本地 SQLite Session 属于不同的会话连续性策略，不应混用。 |
 | SDK HITL 作为问题澄清 | 它恢复被工具审批暂停的同一次运行，不能表达用户对结构化诊断问题的答案。 |
 
-Graph 仍负责创建 `DiagnosisState`、按类别选择定位提示词、执行评测阈值、控制最多两次定位和两轮澄清、决定 `completed` 或 `inconclusive`。这是产品业务规则，不是 SDK 通用运行时职责。
+Application Service/Runtime 负责创建和持久化 `DiagnosisState`。Graph 负责按类别选择定位提示词、执行评测阈值、控制最多两次定位和两轮澄清，并计算诊断 outcome。生命周期由 Runtime 提交：评测通过为 `completed/confirmed`，未通过为 `completed/inconclusive`。
 
 ## 目标能力顺序
 
 1. 保持现有四节点、结构化输出、SQLite Session 和 tracing。
-2. 使用流式运行和 hooks 改善 CLI 进度与观测。
-3. 为日志、指标和 Trace 增加只读 function tools 或 MCP。
-4. 在工具边界加入 guardrails；出现敏感工具时启用 SDK 审批和 `RunState`。
-5. 用离线故障集接入 Agent 工作流评测，按分类、提示词版本和模型版本比较结果。
+2. 引入共享 Runtime、业务检查点和 Command/Event 协议，CLI 迁移到 LocalAgentClient。
+3. 增加 HTTP/SSE Adapter 和 RemoteAgentClient。
+4. 使用流式运行和 hooks 改善所有 Adapter 的进度与观测。
+5. 为日志、指标和 Trace 增加只读工具，并按需启用审批与 `RunState`。
+6. 用离线故障集评测不同配置快照。
 
 ## 验收条件
 
@@ -86,4 +87,4 @@ Graph 仍负责创建 `DiagnosisState`、按类别选择定位提示词、执行
 - 节点输出必须通过 Pydantic Schema；评测总分和门槛由代码重新计算。
 - Graph 的路由在相同结构化输出下完全确定。
 - 工具保持只读，参数和返回值通过 SDK tool guardrail 后才进入模型上下文。
-- 未通过评测或超过澄清次数时只输出 `inconclusive`，报告不保留已确认主结论。
+- 未通过评测或超过澄清次数时生命周期为 `completed`、outcome 为 `inconclusive`，报告不保留已确认主结论。

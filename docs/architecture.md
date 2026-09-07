@@ -1,4 +1,6 @@
-# 架构与 SDK 能力
+# 当前架构与目标架构
+
+## 当前实现
 
 ```mermaid
 flowchart TD
@@ -24,6 +26,31 @@ flowchart TD
 | `trace()` | 将一次诊断的多个节点运行归为同一工作流 |
 | `max_turns` | 限制单次节点运行的模型循环 |
 
-没有使用 handoff，因为当前流程需要确定性的评测门禁和重试上限。没有使用 function tools 或 MCP，因为 Phase 1 只处理用户输入证据；后续接入日志、指标和 Trace 时优先使用 SDK 工具能力。
+没有使用 handoff，因为当前流程需要确定性的评测门禁和重试上限。当前实现只处理用户输入证据，尚未使用 function tools 或 MCP；后续接入日志、指标和 Trace 时优先使用 SDK 工具能力。
 
 CLI 退出后，SDK 会话保存在 `BUGLENS_SESSION_DB` 指定的 SQLite 文件中。目前业务 Graph 不支持中断恢复；数据库用于 SDK 对话管理和审计基础，不替代未来的业务检查点。
+
+## 目标架构
+
+当前 CLI 直接调用 Graph 是待重构现状，不是长期边界。目标为：
+
+```mermaid
+flowchart TD
+    CLI[CLI Adapter] --> C[Local / Remote AgentClient]
+    WEB[Web Adapter: HTTP + SSE] --> APP[Application Service]
+    C --> APP
+    APP --> R[Agent Runtime]
+    R --> G[Deterministic Agent Graph]
+    R --> CP[Checkpoint / Command / Event Store]
+    R --> SS[SDK SQLiteSession]
+    G --> N[Analyze / Investigate / Evaluate / Summarize]
+```
+
+Runtime 接受统一 Command、恢复检查点、推进 Graph，并产生统一 Event Stream。CLI 和 Web 只负责 transport 映射和渲染，不直接构造 Graph。等待用户、工具或审批时，Runtime 先持久化再结束短执行。
+
+详细目标规范：
+
+- [Runtime 与 Adapter](agent-runtime-adapter-spec.md)
+- [Command/Event 协议](agent-protocol-spec.md)
+- [生命周期恢复](lifecycle-resume-spec.md)
+- [运行配置与快照](runtime-config-spec.md)

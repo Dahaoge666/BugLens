@@ -1,6 +1,8 @@
 # BugLens
 
-BugLens 是一个基于 OpenAI Agents SDK 的交互式故障定位 CLI。它依次使用分析、定位、评测和总结四个 Agent，并在终端中完成必要的澄清。
+BugLens 是一个基于 OpenAI Agents SDK 的故障定位项目。当前版本提供交互式 CLI，依次使用分析、定位、评测和总结四个 Agent，并在当前终端进程中完成必要澄清。
+
+目标架构将增加共享 Agent Runtime、可恢复检查点和 Web/API Adapter；CLI 与 Web 将作为同一 Runtime 的薄入口。下文“使用”和“手工测试”描述当前已实现版本，不代表目标能力已经完成。
 
 ## 安装
 
@@ -41,8 +43,13 @@ $env:OPENAI_API_KEY = "你的密钥"
 - 当前不使用 handoff：评测失败后的确定性循环仍由 Graph 控制。
 - 当前没有证据查询工具；`tools=[]` 保证第一阶段无外部副作用。
 
-详细说明见[架构文档](docs/architecture.md)和
-[SDK 能力采用规范](docs/sdk-capability-spec.md)。
+当前与目标架构见[架构文档](docs/architecture.md)，SDK 边界见
+[SDK 能力采用规范](docs/sdk-capability-spec.md)。目标设计拆分为：
+
+- [Runtime 与 Adapter](docs/agent-runtime-adapter-spec.md)
+- [Command/Event 协议](docs/agent-protocol-spec.md)
+- [生命周期恢复](docs/lifecycle-resume-spec.md)
+- [运行配置与快照](docs/runtime-config-spec.md)
 
 ## 配置
 
@@ -64,7 +71,7 @@ $env:OPENAI_API_KEY = "你的密钥"
 .\.venv\Scripts\python.exe -m build
 ```
 
-构建产物位于 `dist/`。项目仍处于 Phase 1：支持用户输入的文本证据，尚未接入日志、指标或 Trace 等只读工具。
+构建产物位于 `dist/`。当前实现支持用户输入的文本证据，尚未实现共享 Runtime、Web Adapter、业务检查点，也未接入日志、指标或 Trace 等只读工具。
 
 ## 端到端手工测试
 
@@ -98,12 +105,12 @@ $env:BUGLENS_TRACING = "true"
   --evidence log="10:31:08 timeout waiting for database connection; trace_id=tr_1001" `
   --evidence metric="db_pool_active=100, db_pool_max=100, http_p99=8s at 10:31" `
   --evidence change="order-api 2.4.1 deployed at 10:15; database pool max unchanged" `
-  --max-attempts 2 `
-  --max-clarifications 2 `
   --output .\data\manual-result.json
 ```
 
-如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。命令退出码为 `0` 表示评测通过，`2` 表示证据不足或评测未通过：
+当前 CLI 仍兼容 `--max-attempts` 和 `--max-clarifications`，但它们属于待废弃参数；默认值已经是两次定位和两轮澄清。目标版本由配置 profile 决定固定策略，并把解析结果保存为运行配置快照。
+
+当前版本如果 CLI 提问，直接在 `>` 后输入对应信息并回车。每个问题会同时显示提问原因；最多进行两轮澄清。当前退出码 `0` 表示评测通过，`2` 表示证据不足或评测未通过。目标 Runtime 实现后将使用独立 lifecycle/outcome 字段，等待态和诊断未决不再混用同一状态：
 
 ```powershell
 $LASTEXITCODE
