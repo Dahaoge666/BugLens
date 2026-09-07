@@ -88,6 +88,7 @@ function App() {
   const [adminConfig, setAdminConfig] = useState<AdminConfig | null>(null)
   const [adminHealth, setAdminHealth] = useState<AdminHealth | null>(null)
   const [adminVersion, setAdminVersion] = useState('0.1.0')
+  const [fetchError, setFetchError] = useState<string | null>(null)
   const [page, setPage] = useState<WorkspacePage>(() => {
     const value = window.location.hash.replace(/^#\/?/, '') as WorkspacePage
     return ['dashboard', 'tasks', 'sessions', 'settings', 'system', 'run'].includes(value)
@@ -115,14 +116,18 @@ function App() {
 
   useEffect(() => {
     let active = true
-    const sync = () => Promise.all([getAdminRuns(), getAdminSessions(), getAdminConfig()]).then(([runs, sessions, config]) => {
+    const safe = <T,>(p: Promise<T>, fallback: T): Promise<T> => p.catch(() => fallback)
+    const sync = () => Promise.all([
+      safe(getAdminConfig(), null as AdminConfig | null),
+      safe(getAdminRuns(), { items: [] as AdminRun[], total: 0 }),
+      safe(getAdminSessions(), { items: [] as AdminSession[], total: 0 }),
+    ]).then(([config, runs, sessions]) => {
       if (!active) return
       setAdminRuns(runs.items)
       setAdminSessions(sessions.items)
-      setAdminConfig(config)
-      setNotice('已连接 BugLens API · 数据实时同步')
-    }).catch(() => {
-      if (active) setNotice('演示数据 · API 尚未连接')
+      if (config) setAdminConfig(config)
+      setFetchError(config ? null : 'config 请求失败')
+      setNotice(config ? '已连接 BugLens API · 数据实时同步' : '演示数据 · config 请求失败')
     })
     sync()
     const timer = window.setInterval(() => {
@@ -231,7 +236,7 @@ function App() {
     <div className="app-body">
      <Sidebar page={page} health={adminHealth} version={adminVersion} runCount={adminRuns.length} navigate={navigate} />
     <main className={`workspace ${page === 'run' ? '' : 'management-workspace'}`}>
-      {page !== 'run' ? <ManagementPage page={page} runs={adminRuns} sessions={adminSessions} config={adminConfig} health={adminHealth} version={adminVersion} onConfigChange={setAdminConfig} onNew={() => setShowNew(true)} onOpenRun={openRun} /> : <>
+      {page !== 'run' ? <ManagementPage page={page} runs={adminRuns} sessions={adminSessions} config={adminConfig} health={adminHealth} version={adminVersion} onConfigChange={setAdminConfig} fetchError={fetchError} onNew={() => setShowNew(true)} onOpenRun={openRun} /> : <>
       <section className="run-heading">
         <div><div className="eyebrow">诊断运行 <span className="mono">/ {run.run_id}</span></div><h1>{run.user_question}</h1></div>
         <div className="run-meta"><StatusPill status={run.lifecycle_status} label={statusText} /><span>更新于 {run.updated_at.includes('T') ? run.updated_at.slice(11, 16) : run.updated_at}</span>{(run.lifecycle_status === 'running' || run.lifecycle_status === 'waiting_user') && <button className="danger-button" onClick={cancelDiagnosis}>取消运行</button>}</div>
@@ -268,11 +273,11 @@ function Sidebar({ page, health, version, runCount, navigate }: { page: Workspac
   </aside>
 }
 
-function ManagementPage({ page, runs, sessions, config, health, version, onConfigChange, onNew, onOpenRun }: { page: Exclude<WorkspacePage, 'run'>; runs: AdminRun[]; sessions: AdminSession[]; config: AdminConfig | null; health: AdminHealth | null; version: string; onConfigChange: (config: AdminConfig) => void; onNew: () => void; onOpenRun: (runId: string) => void }) {
+function ManagementPage({ page, runs, sessions, config, health, version, onConfigChange, fetchError, onNew, onOpenRun }: { page: Exclude<WorkspacePage, 'run'>; runs: AdminRun[]; sessions: AdminSession[]; config: AdminConfig | null; health: AdminHealth | null; version: string; onConfigChange: (config: AdminConfig) => void; fetchError: string | null; onNew: () => void; onOpenRun: (runId: string) => void }) {
   if (page === 'dashboard') return <DashboardPage runs={runs} sessions={sessions} health={health} onNew={onNew} onOpenRun={onOpenRun} />
   if (page === 'tasks') return <TasksPage runs={runs} onNew={onNew} onOpenRun={onOpenRun} />
   if (page === 'sessions') return <SessionsPage sessions={sessions} onOpenRun={onOpenRun} />
-  if (page === 'settings') return <SettingsPage config={config} onConfigChange={onConfigChange} />
+  if (page === 'settings') return <SettingsPage config={config} onConfigChange={onConfigChange} fetchError={fetchError} />
   return <SystemPage health={health} version={version} />
 }
 
@@ -317,7 +322,7 @@ function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpe
 }
 
 type ModelEntry = { model: string; base_url: string; api_key: string; timeout: number; streaming: boolean | null }
-function SettingsPage({ config, onConfigChange }: { config: AdminConfig | null; onConfigChange: (config: AdminConfig) => void }) {
+function SettingsPage({ config, onConfigChange, fetchError }: { config: AdminConfig | null; onConfigChange: (config: AdminConfig) => void; fetchError: string | null }) {
   const [profile, setProfile] = useState(config?.active_profile ?? 'default')
   const [configVersion, setConfigVersion] = useState(String(config?.profiles[config?.active_profile ?? 'default']?.config_version ?? 'default-v1'))
   const [maxAttempts, setMaxAttempts] = useState(2)
