@@ -1,9 +1,0 @@
-FROM python:3.12-slim
-WORKDIR /opt/buglens
-COPY pyproject.toml README.md LICENSE ./
-COPY app ./app
-COPY config ./config
-RUN python -m pip install --no-cache-dir ".[web]"
-RUN mkdir -p /var/lib/buglens
-EXPOSE 8000
-ENTRYPOINT ["buglens-web"]

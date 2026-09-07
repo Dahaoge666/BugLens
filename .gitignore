@@ -10,5 +10,6 @@ build/
 .env
 .env.*
 !.env.example
+!backend/.env.example
 .idea/
-config/buglens.maas.yaml
+backend/config/buglens.maas.yaml

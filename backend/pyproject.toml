@@ -5,7 +5,7 @@ description = "A deterministic, evidence-bound diagnosis agent graph"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = []
 authors = [{ name = "Dahaoge666" }]
 keywords = ["diagnosis", "agents", "openai", "cli"]
 classifiers = [

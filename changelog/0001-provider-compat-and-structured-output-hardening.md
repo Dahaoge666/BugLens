@@ -1,9 +1,9 @@
 # 0001 — OpenAI 兼容端点支持、结构化输出加固与配套健壮性修复
 
 - 日期：2026-09-07（初稿），2026-09-08（#4–#8 落地）
-- 来源：真实模型端到端测试（见 [`../TESTING_REPORT.md`](../TESTING_REPORT.md) 第 3、6 节）
+- 来源：2026-09-07 的真实模型端到端测试记录（历史临时报告已移除）
 - 变更类型：`Added` / `Changed` / `Docs`
-- 关联文件：`app/bootstrap.py`、`app/agents.py`、`app/application.py`、`app/config.py`、`app/cli.py`、`app/graph.py`
+- 关联文件：`backend/app/bootstrap.py`、`backend/app/agents.py`、`backend/app/application.py`、`backend/app/config.py`、`backend/app/cli.py`、`backend/app/graph.py`
 - 测试：29 个单测全绿（新增 9 个回归测试），`ruff` 通过；真实端到端诊断 `completed/confirmed` 与 `completed/inconclusive` 均已验证
 
 ## 背景
@@ -18,19 +18,19 @@
 
 ## 已落地
 
-### 1. 无自定义 OpenAI 兼容端点配置入口 — `Added`（`app/bootstrap.py`、`app/config.py`）
+### 1. 无自定义 OpenAI 兼容端点配置入口 — `Added`（`backend/app/bootstrap.py`、`backend/app/config.py`）
 
 - 问题：SDK 默认连接 OpenAI 官方端点，自建网关（vLLM / litellm / Azure 兼容等）无法开箱使用。
 - 修复：`configure_openai_provider(*, base_url, api_key, timeout) -> bool` 接收显式参数（不再读裸环境变量），检测到自定义端点时调用 `set_default_openai_client`（`use_for_tracing=False`）+ `set_default_openai_api("chat_completions")`，返回"是否自定义端点"标志供 runner 决定是否启用流式。端点凭据正式纳入 `Settings.openai_base_url` / `openai_api_key` / `openai_timeout`（对应环境变量 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `BUGLENS_OPENAI_TIMEOUT`），由 `build_local_service` 传入。
 - 测试：`test_settings_read_openai_provider_options`、`test_configure_openai_provider_returns_custom_flag`。
 
-### 2. 仅支持流式的网关无法运行 — `Changed`（`app/agents.py`）
+### 2. 仅支持流式的网关无法运行 — `Changed`（`backend/app/agents.py`）
 
 - 问题：`Runner.run`（非流式，`stream=False`）在只支持流式的网关上挂起或返回错误。
 - 修复：`OpenAINodeRunner.__init__` 增加 `streaming: bool = False`；`run()` 在 `streaming=True` 时改用 `Runner.run_streamed` 并消费 `stream_events()`，否则维持 `Runner.run`（OpenAI 官方端点与既有单测不受影响）。`build_local_service` 用 `configure_openai_provider()` 的返回值决定 `streaming`。
 - 测试：真实端到端诊断（流式路径）+ 既有 `test_sdk_runner_uses_same_session_*`（非流式路径回归）。
 
-### 3. 结构化输出强依赖 `response_format` — `Added`（`app/agents.py`）
+### 3. 结构化输出强依赖 `response_format` — `Added`（`backend/app/agents.py`）
 
 - 问题：很多网关不强制 `response_format`，模型输出纯文本或带 Markdown 包裹，SDK 的 `validate_json` 解析失败。
 - 修复：
@@ -38,7 +38,7 @@
   - `_install_json_coercion()`：在导入时对 `agents.util._json.validate_json` 做一次性、幂等包装，解析前剥离 ` ```json ` 包裹与首尾多余文本（取首个 `{` 到末个 `}`），合法 JSON 不被破坏。
 - 测试：真实端到端诊断（4 节点结构化输出全部解析成功）。
 
-### 4. `NodePolicy.model` 是死代码 — `Changed`（`app/graph.py`、`app/agents.py`）
+### 4. `NodePolicy.model` 是死代码 — `Changed`（`backend/app/graph.py`、`backend/app/agents.py`）
 
 - 问题：`config.py` 定义了 `NodePolicy.model`（默认 `gpt-4.1-mini`），但 `agents.py` 的 `_agent` 从未把它传给 `Agent`，模型名实际由 SDK 默认值（`OPENAI_DEFAULT_MODEL` 环境变量）决定。配置文件改 `model` 不生效，违反 AGENTS.md "固定工作流参数来自版本化配置 profile 并持久化快照"的承诺。
 - 修复：
@@ -49,7 +49,7 @@
 - 测试：`test_node_runtime_context_carries_model_field`、`test_node_policy_model_is_passed_to_agent`。
 - 注意：使用自定义网关时，必须通过配置文件（`BUGLENS_CONFIG`）显式指定各节点 `model`，否则 `NodePolicy.model` 默认 `gpt-4.1-mini` 会被传给网关而报错——这是修复"死代码"后的预期行为（配置现在真正生效）。
 
-### 5. `OPENAI_API_KEY` 缺失报错不清晰 — `Changed`（`app/application.py`、`app/cli.py`）
+### 5. `OPENAI_API_KEY` 缺失报错不清晰 — `Changed`（`backend/app/application.py`、`backend/app/cli.py`）
 
 - 问题：health 将 `model_credentials` 标为 `degraded`，但真正运行到 `Runner` 才失败，且错误被 `NodeExecutionError` 包成 `"execution failed"`，丢失"未配置 API Key"这一根因，排障困难。
 - 修复：
@@ -60,7 +60,7 @@
 - 验证：真实环境下 `OPENAI_API_KEY` 未设时，CLI 直接报"模型凭据未就绪：OPENAI_API_KEY is not configured..."并退出 66（修复前是被包成 `node_execution_failed` 在 analyze 节点失败，退出 2）。
 - 测试：`test_application_service_requires_model_credentials`、`test_application_service_custom_endpoint_needs_no_api_key`。
 
-### 6. CLI 澄清交互在非 TTY 环境直接退出 130 — `Changed`（`app/cli.py`）
+### 6. CLI 澄清交互在非 TTY 环境直接退出 130 — `Changed`（`backend/app/cli.py`）
 
 - 问题：`ConsoleClarifier.ask` 遇 `EOFError` 抛出后被 `main` 捕获成"已取消"并退出 130。远程 CLI / CI / 管道等非交互场景体验差，用户无法区分"被取消"与"环境不支持交互"。
 - 修复：
@@ -70,13 +70,13 @@
 - 验证：真实环境下管道输入（`</dev/null`）触发澄清时，输出"需要补充信息但当前环境不支持交互输入..."并退出 64（修复前是退出 130 "已取消"）。
 - 测试：`test_console_clarifier_rejects_non_tty`。
 
-### 7. tracing 与自定义端点冲突 — `Changed`（`app/bootstrap.py`）
+### 7. tracing 与自定义端点冲突 — `Changed`（`backend/app/bootstrap.py`）
 
 - 问题：`BUGLENS_TRACING=true`（默认）时 SDK tracing 可能向自定义 `base_url` 上报失败。此前 `configure_openai_provider` 已设 `use_for_tracing=False` 规避，但运行时 `tracing_enabled` 仍为 True，业务 tracing 路径仍可能误用自定义端点。
 - 修复：`build_local_service` 计算 `tracing_enabled = settings.tracing_enabled and not custom_endpoint`，自定义端点时**默认禁用**全部 tracing（LLM tracing 与业务 tracing 一并），操作者若需对自定义端点开 tracing 须显式设置并理解风险。该值同时传给 `DiagnosisGraph` 与 `DiagnosisRuntime`。
 - 测试：`test_build_local_service_disables_tracing_for_custom_endpoint`（断言 `BUGLENS_TRACING=true` + 自定义端点下 `service.runtime.tracing_enabled is False`）。
 
-### 8. 硬编码超时 — `Changed`（`app/config.py`、`app/bootstrap.py`）
+### 8. 硬编码超时 — `Changed`（`backend/app/config.py`、`backend/app/bootstrap.py`）
 
 - 问题：`AsyncOpenAI(timeout=60.0)` 不可配；reasoning 模型或慢节点可能超时。
 - 修复：`Settings.openai_timeout: float = Field(default=60.0, gt=0, le=600)`，对应环境变量 `BUGLENS_OPENAI_TIMEOUT`。`configure_openai_provider` 接收 `timeout` 参数构造 `AsyncOpenAI(timeout=timeout)`。范围约束 `0 < t ≤ 600` 秒防止误配过大。

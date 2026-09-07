@@ -27,18 +27,18 @@ Decouple **what models exist** from **which node uses which model**.
 
 ## Changes
 
-- `app/config.py`: `ModelConfig`; `NodePolicy.model` is now a reference name;
+- `backend/app/config.py`: `ModelConfig`; `NodePolicy.model` is now a reference name;
   `RuntimePolicy.models` + `RuntimePolicy.model()`; `DEFAULT_PROFILE` ships a
   `default` model; `snapshot_id` excludes `api_key`.
-- `app/agents.py`: `NodeRuntimeContext.model_config`; `OpenAINodeRunner._model_instance`
+- `backend/app/agents.py`: `NodeRuntimeContext.model_config`; `OpenAINodeRunner._model_instance`
   / `_model_arg`; `default_streaming` with `streaming` back-compat alias; per-model
   streaming override in `run`.
-- `app/graph.py`: `_runtime_for_config` resolves and passes `model_config`.
-- `app/bootstrap.py`: runner constructed with `default_streaming` (global client
+- `backend/app/graph.py`: `_runtime_for_config` resolves and passes `model_config`.
+- `backend/app/bootstrap.py`: runner constructed with `default_streaming` (global client
   still configured for the bare-name fallback path).
-- `app/application.py`: `_check_model_credentials` accepts env vars **or** a model
+- `backend/app/application.py`: `_check_model_credentials` accepts env vars **or** a model
   with credentials in the default profile's registry.
-- `app/admin.py`: `config()` masks `api_key`; `apply_config` preserves existing
+- `backend/app/admin.py`: `config()` masks `api_key`; `apply_config` preserves existing
   keys on blank/masked submission; `health()`/`bootstrap_status()` credential
   check covers the models registry; `logging.exception` on runtime failure.
 - `frontend/src/App.tsx`: SettingsPage split into a **模型管理** panel

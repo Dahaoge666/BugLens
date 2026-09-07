@@ -203,7 +203,7 @@ GET /events?after=N ──────┘                       │
 
 ```text
 frontend source ── pnpm install --frozen-lockfile && pnpm build ── static dist/
-backend source  ── python -m build / container ── BugLens API + CLI
+backend source  ── python -m build ────────────── BugLens API + CLI
 ```
 
 生产入口可采用以下任一方式：
@@ -224,12 +224,13 @@ HttpOnly Secure Cookie；当前实现提供可选 `BUGLENS_ADMIN_TOKEN` Bearer �
 
 ```text
 BugLens/
-├── app/                   # 现有 Python 后端，不放前端文件
-├── config/
+├── backend/               # Python 后端、测试、配置和后端文档
+│   ├── app/
+│   ├── config/
+│   ├── tests/
+│   └── pyproject.toml
 ├── data/
-├── docs/                  # 现有后端/协议文档
-├── tests/                 # 现有 Python 测试
-├── pyproject.toml
+├── backend/docs/          # 后端实现、架构与协议文档
 ├── distribution/          # 只引用已发布制品的安装层
 └── frontend/              # 前端唯一根目录
     ├── docs/

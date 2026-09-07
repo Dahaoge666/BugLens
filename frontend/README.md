@@ -1,7 +1,7 @@
 # BugLens Frontend
 
 本目录用于 BugLens 的独立 Web 前端。前端源码、测试、构建配置和前端文档都只放在
-`frontend/` 下，不向仓库根目录或 Python 后端目录写入前端依赖与生成文件。
+`frontend/` 下，不向仓库根目录或 `backend/` 写入前端依赖与生成文件。
 
 当前目录包含可执行的 React/Vite 前端 MVP，以及与后端隔离的前端设计文档：
 
@@ -18,8 +18,8 @@ pnpm typecheck
 pnpm build
 ```
 
-生产静态构建可直接部署 `dist/`；使用 `frontend/Dockerfile` 时，Nginx 会把 `/v1/` 反向代理到
-`buglens-backend:8000`，前端镜像不包含 Python 代码。
+生产静态构建可直接部署 `dist/`。原生 full 安装由 `distribution/spa_server.py` 托管静态文件，
+并将同源 `/v1/` 请求转发到独立后端；正式服务器也可使用已有 Nginx/Caddy 完成相同职责。
 
 当前实现遵守以下边界：
 
@@ -28,6 +28,8 @@ pnpm build
 - 前端可独立构建为静态资源，后端无需 Node.js；
 - 后端继续支持 CLI 和其他 API 客户端独立使用；
 - 前端本地开发、测试、构建和文档命令均从本目录执行。
+
+前后端 HTTP/SSE 与 Admin JSON 的稳定边界见根目录的[前后端对接契约](../frontend-backend-contract.md)。
 
 后续拆分组件时保持以下目录边界：
 

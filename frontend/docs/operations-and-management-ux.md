@@ -1,6 +1,6 @@
 # BugLens 安装、配置与任务管理交互设计
 
-> 实现状态（MVP）：前端已落地总览、任务、Session、配置与系统页；后端新增独立 `AdminApplicationService` 和 `/v1/admin/*` 适配端点；`distribution/` 提供 backend/full Compose 清单及跨平台安装/更新脚本。
+> 实现状态（MVP）：前端已落地总览、任务、Session、配置与系统页；后端新增独立 `AdminApplicationService` 和 `/v1/admin/*` 适配端点；`distribution/` 提供不依赖 Docker 的 backend/full 原生安装和进程管理。
 
 ## 1. 设计结论
 
@@ -49,12 +49,12 @@ Bearer Token。一次性 Setup Token、角色和多租户授权属于后续认�
 
 ### 3.1 交付形态
 
-推荐同时提供两个可独立发布的镜像和一个很小的安装管理器：
+推荐同时提供两个可独立发布的制品和一个很小的安装管理器：
 
 ```text
-buglens-backend:<version>    Python API + CLI，不依赖前端
-buglens-frontend:<version>   静态页面 + 反向代理，不包含 Agent 代码
-buglensctl                   安装、初始化、更新、备份、回滚
+buglens-<version>.whl             Python API + CLI，不依赖前端
+buglens-frontend-<version>.tar.gz 静态页面，不包含 Agent 代码
+buglensctl                        安装、启动、更新、备份、诊断
 ```
 
 用户只需要选择安装模式，不选择底层组件：
@@ -70,31 +70,32 @@ buglensctl install --mode full
 buglensctl update
 ```
 
-首期推荐以 Docker Compose 作为跨平台运行底座。`buglensctl` 负责选择 backend-only 或 full manifest、
-生成本地配置目录、拉取固定版本镜像、检查健康状态并打印访问地址。开发环境继续使用 Python 和 pnpm 的
-独立命令，不要求后端构建前端。
+首期使用 uv 作为跨平台环境管理底座。`buglensctl` 由 uv 使用 Python 3.11 运行，并在安装目录创建隔离虚拟环境、配置、数据、日志
+和 PID 文件，负责选择 backend/full 模式、安装固定版本制品、检查健康状态并打印访问地址。full 模式的
+轻量同源服务器托管静态资源并代理 `/v1/*`；正式服务器可替换为现有 systemd 与 Nginx/Caddy。
 
 目录保持三个独立工程面：
 
 ```text
 BugLens/
-├── app/ + tests/ + pyproject.toml      # 后端
+├── backend/                            # 后端源码、测试、配置与后端文档
 ├── frontend/                           # 前端源码、测试与前端文档
-└── distribution/                       # 安装器、Compose 与升级清单
+└── distribution/                       # 原生安装器、进程管理与升级入口
 ```
 
-`distribution/` 只依赖已发布制品，不导入后端或前端源码。后端包、前端静态包、安装器分别构建和发布。
+正式发行的 `distribution/` 只依赖已发布制品。仓库内安装器允许从本地源码安装后端，并在缺少预构建
+前端时调用 pnpm；后端包、前端静态包、安装器仍分别构建和发布。
 
 ### 3.2 首次安装流程
 
 命令行安装保持一条主路径：
 
 ```text
-选择模式 → 检查前置条件 → 创建数据目录 → 拉取制品
+选择模式 → 检查 Python → 创建隔离环境与数据目录 → 安装制品
         → 启动后端 → 健康检查 → 输出 Setup Token/访问地址
 ```
 
-终端只显示当前步骤和可恢复错误，不滚动输出完整容器日志。失败时保留已下载制品和配置草稿，重复执行
+终端只显示当前步骤和可恢复错误，完整服务日志写入 `.runtime/logs/`。失败时保留已下载制品和配置草稿，重复执行
 同一命令从安全检查点继续。
 
 full 模式启动后，浏览器进入 `/setup`。backend 模式则输出等价的：
@@ -118,9 +119,8 @@ buglensctl doctor
         └── 失败：自动回滚并恢复旧版本
 ```
 
-默认采用 drain 模式：停止接收新任务，允许已运行任务完成或进入持久化等待态，然后切换版本。用户可以
-取消更新，但不能在数据库迁移开始后强制中断。更新界面始终显示当前版本、目标版本、数据迁移要求、
-预计影响以及回滚是否可用。
+当前单机安装器在停止服务后备份配置和 SQLite，再更新隔离环境与静态制品并执行健康检查。未来增加
+长任务或数据库迁移后，应扩展为 drain 状态机，并展示目标版本、迁移要求、预计影响和回滚能力。
 
 管理界面可以触发同一更新编排，但不在浏览器中执行 shell 命令。前端调用本机受保护的 Control API，
 Control API 再驱动 `buglensctl`。多节点或托管环境默认隐藏“网页更新”按钮，只显示运维命令。
@@ -154,7 +154,7 @@ Control API 再驱动 `buglensctl`。多节点或托管环境默认隐藏“网�
 #### 数据存储
 
 - 展示数据库类型与位置，首期固定 SQLite；
-- 容器模式只选择已挂载的数据卷，不允许输入任意宿主机绝对路径；
+- 原生安装默认使用安装器管理的 `.runtime/data/`，生产部署使用权限受限的固定持久目录；
 - 展示可写性、可用空间、备份目录和最近一次备份；
 - 修改数据库位置需要重启时，在提交前明确标识。
 
@@ -429,5 +429,5 @@ POST /v1/control/operations/{operation_id}/cancel
 - 配置变更只影响新任务，恢复任务继续使用原快照；
 - 任务列表的 lifecycle 与 outcome 分开展示；
 - Session 状态不参与 Graph 路由，前端不保存或回放模型消息；
-- 更新前自动备份并 drain，健康验证失败自动回滚；
+- 更新前自动停止服务并备份，更新后执行健康验证；
 - 前端、后端、distribution 的构建与发布相互独立。
