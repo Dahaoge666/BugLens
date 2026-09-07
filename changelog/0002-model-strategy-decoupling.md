@@ -44,6 +44,12 @@ Decouple **what models exist** from **which node uses which model**.
 - `frontend/src/App.tsx`: SettingsPage split into a **模型管理** panel
   (per-model CRUD: name / model / base_url / api_key / timeout / streaming) and a
   **节点策略** panel where each node selects its model via a dropdown of registry keys.
+  The 模型管理 panel spans full width (`.settings-full { grid-column: 1 / -1 }`)
+  so the two-column layout no longer misplaces the third section; 运行配置 (left)
+  and 节点策略 (right) align on the second row. An editable `default` model entry
+  is pre-seeded when a profile has no models registry so the panel is never empty.
+- `frontend/src/management.css`: unified `.model-card input/select` styling and
+  `.settings-full` grid-span rule so model fields match the settings-form inputs.
 
 ## Verification
 
@@ -54,6 +60,8 @@ Decouple **what models exist** from **which node uses which model**.
 - `GET /v1/admin/config` returns `api_key: "****"` and the node `model` is the
   registry reference (`glm-52`); `GET /v1/admin/health` reports
   `model_credentials: ok` from the registry credentials.
+- Frontend verified in-browser: 模型管理 panel shows the `glm-52` card with masked
+  key and editable fields; node strategy dropdowns list `glm-52`.
 
 ## Known follow-up (tracked in TODO.md)
 

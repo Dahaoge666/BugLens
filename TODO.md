@@ -13,6 +13,10 @@
 - [ ] **多模型解耦路径单测**：`NodeRuntimeContext.model_config` 携带 `ModelConfig` 时，`_model_instance` 构造的 `OpenAIChatCompletionsModel` 绑定了对应的 `base_url/api_key/timeout`，且按 `(model, base_url, timeout, api_key)` 缓存复用；`model_config=None` 时退回裸名 + 全局客户端；per-model `streaming` 覆盖 `default_streaming`。
 - [ ] **admin API key 脱敏 / 回填单测**：`AdminApplicationService.config()` 对 `models.*.api_key` 做脱敏；`apply_config` 收到空或含 `****` 的 api_key 时回填原值，收到新值时覆盖。
 
+## 后端健壮性
+
+- [ ] **列表端点不应因单个损坏 run 而 400**：当 `GET /v1/admin/runs` 或 `/sessions` 序列化列表时，若某条 `DiagnosisState` 违反校验（如 “running and terminal states cannot have pending work”），当前会抛 `validation_failed` 导致整个列表返回 400，进而连累前端的 `config` 请求（旧版 `Promise.all`）。应改为跳过/标记不可序列化的行并在响应中降级，而非让单个坏行 fail 整个列表。根因是一次测试写入了损坏的 run；更长期的修复是状态机本身不应允许持久化这种非法状态。
+
 ## 可观测性
 
 - [ ] **`reasoning_content` 纳入可追溯性**：网关返回的思维链被 SDK 放入 `ResponseReasoningItem`，但 `DiagnosisState` 未保留推理过程，"为何得出此根因"无法回溯。评估在节点结果或 trace 中保留（脱敏后的）推理摘要，增强诊断可解释性，同时不违背"业务状态不保存 SDK 消息"的边界（推理摘要是结构化派生数据，非原始消息回放）。
