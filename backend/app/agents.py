@@ -10,30 +10,48 @@ from uuid import uuid4
 
 from agents import (
     Agent,
+    GuardrailFunctionOutput,
+    InputGuardrail,
     ModelRetryBackoffSettings,
     ModelRetrySettings,
     ModelSettings,
     OpenAIChatCompletionsModel,
+    OutputGuardrail,
     RetryPolicy,
     RunConfig,
     Runner,
     RunState,
     SessionSettings,
     SQLiteSession,
+    ToolExecutionConfig,
     retry_policies,
 )
-from agents.exceptions import ModelBehaviorError, ModelTimeoutError, ToolTimeoutError
+from agents.exceptions import (
+    InputGuardrailTripwireTriggered,
+    ModelBehaviorError,
+    ModelTimeoutError,
+    OutputGuardrailTripwireTriggered,
+    ToolInputGuardrailTripwireTriggered,
+    ToolOutputGuardrailTripwireTriggered,
+    ToolTimeoutError,
+)
 from agents.items import ReasoningItem
 from openai import APIConnectionError, AsyncOpenAI
 from pydantic import BaseModel
 
 from .config import ModelConfig
 from .models import (
+    AnalyzeInput,
+    ClarificationInput,
     DiagnosisReport,
+    EvaluationInput,
     EvaluationResult,
+    InvestigationInput,
     InvestigationResult,
     ProblemAnalysis,
     ProblemCategory,
+    RetryInput,
+    SummaryInput,
 )
 from .prompts import ANALYSIS_PROMPT, EVALUATION_PROMPT, SUMMARY_PROMPT, PromptRegistry
 from .security import sanitize_data
@@ -255,6 +273,148 @@ def _reasoning_summary(result: Any) -> list[str]:
     return summaries[:20]
 
 
+_NODE_INPUT_TYPES: dict[str, tuple[type[BaseModel], ...]] = {
+    "analyze": (AnalyzeInput, ClarificationInput),
+    "investigate": (InvestigationInput, RetryInput, ClarificationInput),
+    "evaluate": (EvaluationInput,),
+    "summarize": (SummaryInput,),
+}
+_MAX_NODE_INPUT_BYTES = 4_000_000
+_MAX_NODE_OUTPUT_BYTES = 4_000_000
+
+
+def _node_input_text_candidates(input_value: Any) -> list[str]:
+    """Extract JSON text from the SDK's string or message-list input shape."""
+    if isinstance(input_value, str):
+        return [input_value]
+    if not isinstance(input_value, list):
+        return []
+
+    candidates: list[str] = []
+    for item in reversed(input_value):
+        content = (
+            item.get("content")
+            if isinstance(item, dict)
+            else getattr(item, "content", None)
+        )
+        if isinstance(content, str):
+            candidates.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts: list[str] = []
+        for part in content:
+            text = (
+                part.get("text")
+                if isinstance(part, dict)
+                else getattr(part, "text", None)
+            )
+            if isinstance(text, str):
+                text_parts.append(text)
+        if text_parts:
+            candidates.append("".join(text_parts))
+    return candidates
+
+
+def _node_input_guardrail(node_name: str) -> InputGuardrail[Any]:
+    """Validate the serialized node input before the model is called."""
+    accepted_types = _NODE_INPUT_TYPES[node_name]
+
+    def validate(_context, _agent, input_value) -> GuardrailFunctionOutput:
+        candidates = _node_input_text_candidates(input_value)
+        if not candidates:
+            return GuardrailFunctionOutput(
+                output_info={"node": node_name, "reason": "input_not_json"},
+                tripwire_triggered=True,
+            )
+        oversized = next(
+            (
+                value
+                for value in candidates
+                if len(value.encode("utf-8")) > _MAX_NODE_INPUT_BYTES
+            ),
+            None,
+        )
+        if oversized is not None:
+            input_bytes = len(oversized.encode("utf-8"))
+            return GuardrailFunctionOutput(
+                output_info={
+                    "node": node_name,
+                    "reason": "input_too_large",
+                    "bytes": input_bytes,
+                },
+                tripwire_triggered=True,
+            )
+        for candidate in candidates:
+            input_bytes = len(candidate.encode("utf-8"))
+            for input_type in accepted_types:
+                try:
+                    input_type.model_validate_json(candidate)
+                except (TypeError, ValueError):
+                    continue
+                return GuardrailFunctionOutput(
+                    output_info={
+                        "node": node_name,
+                        "input_type": input_type.__name__,
+                        "bytes": input_bytes,
+                    },
+                    tripwire_triggered=False,
+                )
+        return GuardrailFunctionOutput(
+            output_info={"node": node_name, "reason": "input_schema_invalid"},
+            tripwire_triggered=True,
+        )
+
+    return InputGuardrail(
+        validate,
+        name=f"buglens_{node_name}_input_contract",
+        run_in_parallel=False,
+    )
+
+
+def _node_output_guardrail(
+    node_name: str, output_type: type[BaseModel]
+) -> OutputGuardrail[Any]:
+    """Validate the final typed node output and its bounded serialized size."""
+
+    def validate(_context, _agent, output) -> GuardrailFunctionOutput:
+        try:
+            normalized = output_type.model_validate(output)
+            serialized = json.dumps(
+                normalized.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return GuardrailFunctionOutput(
+                output_info={"node": node_name, "reason": "output_schema_invalid"},
+                tripwire_triggered=True,
+            )
+        output_bytes = len(serialized.encode("utf-8"))
+        if output_bytes > _MAX_NODE_OUTPUT_BYTES:
+            return GuardrailFunctionOutput(
+                output_info={
+                    "node": node_name,
+                    "reason": "output_too_large",
+                    "bytes": output_bytes,
+                },
+                tripwire_triggered=True,
+            )
+        return GuardrailFunctionOutput(
+            output_info={
+                "node": node_name,
+                "output_type": output_type.__name__,
+                "bytes": output_bytes,
+            },
+            tripwire_triggered=False,
+        )
+
+    return OutputGuardrail(
+        validate,
+        name=f"buglens_{node_name}_output_contract",
+    )
+
+
 class OpenAINodeRunner:
     """Run typed agents and let SDK SQLiteSession manage each node's history."""
 
@@ -411,6 +571,10 @@ class OpenAINodeRunner:
             instructions=instructions[node_name]
             + _schema_hint(self.OUTPUT_TYPES[node_name]),
             output_type=self.OUTPUT_TYPES[node_name],
+            input_guardrails=[_node_input_guardrail(node_name)],
+            output_guardrails=[
+                _node_output_guardrail(node_name, self.OUTPUT_TYPES[node_name])
+            ],
             tools=tools or [],
             model=self._model_arg(model_name, model_config),
             model_settings=self._model_settings(
@@ -524,6 +688,12 @@ class OpenAINodeRunner:
                 OpenAINodeRunner._session_input_callback(
                     history, new_items, runtime.session_history_limit
                 )
+            ),
+            tool_execution=ToolExecutionConfig(
+                # Validate a proposed call before an approval interruption is
+                # emitted, then let the SDK run the same guardrail again after
+                # approval immediately before invoking the connector.
+                pre_approval_tool_input_guardrails=True,
             ),
             trace_include_sensitive_data=False,
         )
@@ -685,6 +855,34 @@ class OpenAINodeRunner:
                     ) from exc
             except NodeApprovalRequired:
                 raise
+            except InputGuardrailTripwireTriggered as exc:
+                raise NodeExecutionError(
+                    "node input was blocked by an SDK guardrail",
+                    code="input_guardrail_blocked",
+                    retryable=False,
+                    auto_retry=False,
+                ) from exc
+            except OutputGuardrailTripwireTriggered as exc:
+                raise NodeExecutionError(
+                    "node output was blocked by an SDK guardrail",
+                    code="output_guardrail_blocked",
+                    retryable=True,
+                    auto_retry=True,
+                ) from exc
+            except ToolInputGuardrailTripwireTriggered as exc:
+                raise NodeExecutionError(
+                    "tool input was blocked by an SDK guardrail",
+                    code="tool_input_guardrail_blocked",
+                    retryable=False,
+                    auto_retry=False,
+                ) from exc
+            except ToolOutputGuardrailTripwireTriggered as exc:
+                raise NodeExecutionError(
+                    "tool output was blocked by an SDK guardrail",
+                    code="tool_output_guardrail_blocked",
+                    retryable=False,
+                    auto_retry=False,
+                ) from exc
             except Exception as exc:
                 # ModelSettings owns provider/network retries.  Once Runner has
                 # exhausted that budget, surface a resumable failure to the
@@ -823,6 +1021,34 @@ class OpenAINodeRunner:
             return output
         except NodeApprovalRequired:
             raise
+        except InputGuardrailTripwireTriggered as exc:
+            raise NodeExecutionError(
+                "node input was blocked by an SDK guardrail",
+                code="input_guardrail_blocked",
+                retryable=False,
+                auto_retry=False,
+            ) from exc
+        except OutputGuardrailTripwireTriggered as exc:
+            raise NodeExecutionError(
+                "node output was blocked by an SDK guardrail",
+                code="output_guardrail_blocked",
+                retryable=True,
+                auto_retry=True,
+            ) from exc
+        except ToolInputGuardrailTripwireTriggered as exc:
+            raise NodeExecutionError(
+                "tool input was blocked by an SDK guardrail",
+                code="tool_input_guardrail_blocked",
+                retryable=False,
+                auto_retry=False,
+            ) from exc
+        except ToolOutputGuardrailTripwireTriggered as exc:
+            raise NodeExecutionError(
+                "tool output was blocked by an SDK guardrail",
+                code="tool_output_guardrail_blocked",
+                retryable=False,
+                auto_retry=False,
+            ) from exc
         except ModelBehaviorError as exc:
             raise NodeExecutionError(
                 f"{node_name}: invalid structured output",

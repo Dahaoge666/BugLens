@@ -11,7 +11,15 @@ from hashlib import sha256
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from agents import RunHooks, function_tool
+from agents import (
+    RunHooks,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrail,
+    ToolInputGuardrailData,
+    ToolOutputGuardrail,
+    ToolOutputGuardrailData,
+    function_tool,
+)
 from agents.exceptions import ToolTimeoutError
 
 from .models import EvidenceRecord
@@ -44,6 +52,120 @@ class ToolExecutionError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+
+
+_TOOL_ARGUMENT_MAX_BYTES = 16_384
+
+
+def _tool_input_guardrail(
+    data: ToolInputGuardrailData,
+) -> ToolGuardrailFunctionOutput:
+    """Fail closed before a model-supplied tool call reaches a connector.
+
+    FunctionTool already performs strict schema validation.  This guardrail is a
+    second boundary for the values that arrive at the actual tool invocation:
+    it bounds the raw JSON and verifies that a tool exposed through the
+    BugLens registry is still allowed for this run.
+    """
+    context = data.context
+    raw_arguments = getattr(context, "tool_arguments", None)
+    if not isinstance(raw_arguments, str):
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_arguments_invalid"}
+        )
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, ValueError):
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_arguments_invalid"}
+        )
+    if not isinstance(arguments, dict):
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_arguments_invalid"}
+        )
+    encoded = json.dumps(
+        sanitize_data(arguments),
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > _TOOL_ARGUMENT_MAX_BYTES:
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_arguments_too_large"}
+        )
+
+    runtime = getattr(context, "context", None)
+    registry = getattr(runtime, "tool_registry", None)
+    if isinstance(registry, ToolRegistry):
+        registration = registry.registration(getattr(context, "tool_name", ""))
+        if registration is None or not registry.is_enabled(
+            registration,
+            node_name=getattr(runtime, "node_name", ""),
+            profile=getattr(runtime, "profile", "default"),
+            tenant_id=getattr(runtime, "tenant_id", None),
+            capabilities=set(getattr(runtime, "capabilities", ())),
+            enabled=getattr(runtime, "tools_enabled", False),
+            allowed_nodes=set(getattr(runtime, "tool_allowed_nodes", ())),
+            allowed_profiles=set(getattr(runtime, "tool_allowed_profiles", ())),
+        ):
+            return ToolGuardrailFunctionOutput.raise_exception(
+                {"code": "tool_not_allowed"}
+            )
+
+    return ToolGuardrailFunctionOutput.allow(
+        {
+            "tool_name": getattr(context, "tool_name", "unknown"),
+            "arguments_bytes": len(encoded.encode("utf-8")),
+        }
+    )
+
+
+def _tool_output_guardrail(
+    data: ToolOutputGuardrailData,
+) -> ToolGuardrailFunctionOutput:
+    """Ensure only bounded, JSON-safe tool results continue to the model."""
+    runtime = getattr(data.context, "context", None)
+    max_bytes = int(getattr(runtime, "tool_result_bytes", 65_536))
+    try:
+        encoded = json.dumps(
+            sanitize_data(_jsonable(data.output)),
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_output_invalid"}
+        )
+    output_bytes = len(encoded.encode("utf-8"))
+    if output_bytes > max_bytes:
+        return ToolGuardrailFunctionOutput.raise_exception(
+            {"code": "tool_output_too_large", "max_bytes": max_bytes}
+        )
+    return ToolGuardrailFunctionOutput.allow(
+        {
+            "tool_name": getattr(data.context, "tool_name", "unknown"),
+            "output_bytes": output_bytes,
+        }
+    )
+
+
+def _sdk_tool_input_guardrails() -> list[ToolInputGuardrail[Any]]:
+    return [
+        ToolInputGuardrail(
+            _tool_input_guardrail,
+            name="buglens_tool_input_boundary",
+        )
+    ]
+
+
+def _sdk_tool_output_guardrails() -> list[ToolOutputGuardrail[Any]]:
+    return [
+        ToolOutputGuardrail(
+            _tool_output_guardrail,
+            name="buglens_tool_output_boundary",
+        )
+    ]
 
 
 @dataclass(frozen=True)
@@ -100,6 +222,8 @@ class ToolRegistry:
                 "name_override": name,
                 "failure_error_function": None,
                 "strict_mode": True,
+                "tool_input_guardrails": _sdk_tool_input_guardrails(),
+                "tool_output_guardrails": _sdk_tool_output_guardrails(),
             }
             # SDK 0.22 applies timeout_seconds to async handlers.  A sync fake
             # connector remains useful in unit tests, so it is wrapped without
@@ -111,6 +235,7 @@ class ToolRegistry:
                 )
             options["needs_approval"] = bool(needs_approval)
             tool = function_tool(tool, **options)
+            tool._buglens_guardrails_installed = True
         else:
             # FunctionTool's default failure formatter turns exceptions into a
             # model-visible string. The runtime must observe connector failures
@@ -121,6 +246,16 @@ class ToolRegistry:
                 tool._failure_error_function = None
             if needs_approval is not None and hasattr(tool, "needs_approval"):
                 tool.needs_approval = needs_approval
+            if not getattr(tool, "_buglens_guardrails_installed", False):
+                tool.tool_input_guardrails = [
+                    *(getattr(tool, "tool_input_guardrails", None) or []),
+                    *_sdk_tool_input_guardrails(),
+                ]
+                tool.tool_output_guardrails = [
+                    *(getattr(tool, "tool_output_guardrails", None) or []),
+                    *_sdk_tool_output_guardrails(),
+                ]
+                tool._buglens_guardrails_installed = True
         tool_name = name or getattr(tool, "name", None)
         if not tool_name:
             raise ValueError("registered tool must have a name")

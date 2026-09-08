@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 import httpx2 as httpx
 import pytest
-from agents import OpenAIChatCompletionsModel
+from agents import (
+    OpenAIChatCompletionsModel,
+    RunContextWrapper,
+    ToolInputGuardrailData,
+    ToolOutputGuardrailData,
+)
+from agents.tool_context import ToolContext
 from openai import AsyncOpenAI
 from pydantic import TypeAdapter
 
@@ -30,6 +36,7 @@ from app.prompts import PromptRegistry
 from app.protocol.commands import ApproveTool, StartDiagnosis
 from app.runtime import DiagnosisRuntime
 from app.security import SDKRunStateCipher
+from app.tools import ToolRegistry
 
 
 def analysis() -> ProblemAnalysis:
@@ -85,6 +92,104 @@ def report() -> DiagnosisReport:
 def test_schema_hint_contains_a_strict_json_schema(output_type):
     hint = _schema_hint(output_type)
     assert hint and '"properties"' in hint
+
+
+def test_native_node_guardrails_validate_input_and_output_contracts(tmp_path):
+    runner = OpenAINodeRunner(
+        PromptRegistry(Path("missing.yml")),
+        tmp_path / "sessions.db",
+    )
+    runtime = NodeRuntimeContext(
+        graph_run_id="run-guardrail",
+        node_name="analyze",
+        config_version="v1",
+    )
+    agent = runner._agent("analyze", None, None, "gpt-test")
+    context = RunContextWrapper(runtime)
+
+    assert len(agent.input_guardrails) == 1
+    assert len(agent.output_guardrails) == 1
+    valid_input = json.dumps(
+        {"question": "为什么慢？", "context": {}, "evidence": []},
+        ensure_ascii=False,
+    )
+    valid = agent.input_guardrails[0].guardrail_function(context, agent, valid_input)
+    valid_message_list = agent.input_guardrails[0].guardrail_function(
+        context,
+        agent,
+        [{"role": "user", "content": valid_input}],
+    )
+    blocked_input = agent.input_guardrails[0].guardrail_function(
+        context, agent, json.dumps({"unexpected": True})
+    )
+    assert valid.tripwire_triggered is False
+    assert valid_message_list.tripwire_triggered is False
+    assert blocked_input.tripwire_triggered is True
+
+    blocked_output = agent.output_guardrails[0].guardrail_function(
+        context, agent, {"not": "a ProblemAnalysis"}
+    )
+    assert blocked_output.tripwire_triggered is True
+
+    run_config = runner._run_config(runtime)
+    assert run_config.tool_execution is not None
+    assert run_config.tool_execution.pre_approval_tool_input_guardrails is True
+
+
+def test_native_tool_guardrails_fail_closed_at_input_and_output_boundaries():
+    async def lookup(query: str) -> str:
+        return query
+
+    registry = ToolRegistry(enabled=True, allowed_nodes={"analyze"})
+    tool = registry.register(lookup, name="lookup", nodes={"analyze"})
+    assert len(tool.tool_input_guardrails) == 1
+    assert len(tool.tool_output_guardrails) == 1
+
+    runtime = NodeRuntimeContext(
+        graph_run_id="run-tool-guardrail",
+        node_name="analyze",
+        config_version="v1",
+        tool_registry=registry,
+        tools_enabled=True,
+        tool_allowed_nodes=frozenset({"analyze"}),
+        tool_result_bytes=32,
+    )
+    context = ToolContext(
+        runtime,
+        tool_name="lookup",
+        tool_call_id="call-1",
+        tool_arguments='{"query":"pool"}',
+    )
+    accepted_input = tool.tool_input_guardrails[0].guardrail_function(
+        ToolInputGuardrailData(context=context, agent=None)
+    )
+    rejected_output = tool.tool_output_guardrails[0].guardrail_function(
+        ToolOutputGuardrailData(
+            context=context,
+            agent=None,
+            output={"value": "x" * 64},
+        )
+    )
+    blocked_context = ToolContext(
+        NodeRuntimeContext(
+            graph_run_id="run-tool-guardrail",
+            node_name="analyze",
+            config_version="v1",
+            tool_registry=registry,
+            tools_enabled=False,
+            tool_allowed_nodes=frozenset({"analyze"}),
+        ),
+        tool_name="lookup",
+        tool_call_id="call-2",
+        tool_arguments='{"query":"pool"}',
+    )
+    rejected_input = tool.tool_input_guardrails[0].guardrail_function(
+        ToolInputGuardrailData(context=blocked_context, agent=None)
+    )
+
+    assert accepted_input.behavior["type"] == "allow"
+    assert rejected_output.behavior["type"] == "raise_exception"
+    assert rejected_input.behavior["type"] == "raise_exception"
 
 
 def test_legacy_user_context_is_promoted_when_loading_a_v1_state():

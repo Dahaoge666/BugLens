@@ -65,6 +65,8 @@ Analyze、Investigate 或 Evaluate 可以返回 `UserInteractionRequest`。Runti
 | `ModelSettings.retry` | 单次模型请求的 runner-managed retry policy；底层 OpenAI client 关闭重复重试 |
 | `SessionSettings` / `session_input_callback` | 限制同节点历史并控制本轮合并 |
 | `function_tool` / `RunHooks` | 只读工具 Schema、超时、调用 ID 和工具审计桥接 |
+| `InputGuardrail` / `OutputGuardrail` | 在节点模型调用前后校验 BugLens 的输入/输出契约，并以 tripwire fail closed |
+| `ToolInputGuardrail` / `ToolOutputGuardrail` | 在工具参数进入 connector 前、工具结果回到模型前做二次边界校验；审批前校验由 `ToolExecutionConfig` 开启 |
 | `needs_approval` / `RunState` | 将工具 interruption 映射为加密 checkpoint、`waiting_approval` 和批准/拒绝恢复 |
 | `RunContextWrapper` | 传递 run ID、节点名和配置版本等本地上下文 |
 | `trace()` | 以 `run_id` 聚合一次诊断的节点运行 |
@@ -72,7 +74,7 @@ Analyze、Investigate 或 Evaluate 可以返回 `UserInteractionRequest`。Runti
 
 每个 `{run_id}:{node_name}` 使用独立 Session。同一节点的澄清和评测重试复用 Session；不同节点不共享完整对话。项目不同时使用 Session、`previous_response_id`、Conversations API 或手工消息回放。
 
-handoff 和 `Agent.as_tool()` 不用于主流程，因为节点顺序、评测门禁和重试上限必须由确定性 Graph 控制。SDK 的工具、guardrail、hooks、streaming 和 `RunState` 已按需映射到项目协议和生命周期；SDK RunState 只在后端加密保存，不能直接暴露给 Adapter。
+handoff 和 `Agent.as_tool()` 不用于主流程，因为节点顺序、评测门禁和重试上限必须由确定性 Graph 控制。SDK 的工具、节点/工具 guardrail、hooks、streaming 和 `RunState` 已按需映射到项目协议和生命周期；SDK RunState 只在后端加密保存，不能直接暴露给 Adapter。Guardrail 只负责 SDK 执行边界，脱敏、证据注册、审计、业务澄清和生命周期状态仍由 BugLens 自己控制。
 
 ## 源码布局
 

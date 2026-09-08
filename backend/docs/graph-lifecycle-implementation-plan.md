@@ -71,7 +71,8 @@
 - `ModelSettings.timeout` 与 `ModelRetrySettings` 的模型调用重试；
 - `SQLiteSession` 的模型消息历史；
 - `@function_tool` 的参数 Schema、校验、上下文注入和工具超时；
-- tool input/output guardrails；
+- `InputGuardrail` / `OutputGuardrail` 对节点输入输出契约做 fail-closed 校验；
+- `ToolInputGuardrail` / `ToolOutputGuardrail` 对工具参数和结果做二次边界校验，并在审批前通过 `ToolExecutionConfig` 运行输入校验；
 - `RunHooks`、`ToolContext.tool_call_id`、token usage 和 tracing；
 - 工具审批产生的 `interruptions`，以及 `RunState` 序列化、批准/拒绝和恢复。
 
@@ -356,7 +357,7 @@ Resume 前检查 agent definition version、SDK major/minor compatibility和 Ses
 - 只读连接器；
 - 配置快照和大小限制。
 
-使用 `is_enabled` 隐藏当前 run 无权使用的工具；这只控制暴露范围，工具实现和 input guardrail 仍必须再次校验资源范围。
+使用 `is_enabled` 隐藏当前 run 无权使用的工具；这只控制暴露范围，工具实现和 SDK input guardrail 仍必须再次校验资源范围。节点 guardrail 只验证模型边界，不能替代 Graph 的业务状态校验。
 
 ### 11.2 工具契约
 
@@ -371,7 +372,7 @@ Resume 前检查 agent definition version、SDK major/minor compatibility和 Ses
 - 不把 secret、内部异常堆栈或无限日志返回模型；
 - 支持 fake connector 单元测试，不访问真实外部系统。
 
-SDK tool input/output guardrails 用于资源范围、参数和输出边界。工具超时默认作为可恢复错误返回模型；需要终止节点时使用 `timeout_behavior="raise_exception"` 并交给统一错误分类。
+SDK tool input/output guardrails 用于资源范围、参数和输出边界。BugLens 保留自己的脱敏、证据注册、审计和 `bounded_tool_result`，因为 SDK guardrail 不承担业务 checkpoint 或公开协议。工具超时默认作为可恢复错误返回模型；需要终止节点时使用 `timeout_behavior="raise_exception"` 并交给统一错误分类。
 
 ### 11.3 工具审批与异步工具
 
