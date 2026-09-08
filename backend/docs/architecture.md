@@ -11,14 +11,17 @@ flowchart LR
     CLIENT --> APP
     ADMIN[Admin HTTP Adapter] --> ADMINAPP[AdminApplicationService]
     APP --> RUNTIME[DiagnosisRuntime]
-    RUNTIME --> GRAPH[DiagnosisGraph]
+    RUNTIME --> GRAPH[NativeDiagnosisGraph / compatibility Graph]
     RUNTIME --> STORE[Checkpoint / Command / Event Store]
     RUNTIME --> SESSION[SDK SQLiteSession]
     ADMINAPP --> CONFIG[ConfigRepository]
     ADMINAPP --> STORE
     GRAPH --> CONTEXT[ContextAssembler]
     GRAPH --> TOOLS[ToolRegistry]
-    GRAPH --> NODES[Analyze / Investigate / Evaluate / Summarize]
+    GRAPH --> NODES[Native SDK loop]
+    NODES --> TRIAGE[Triage / Analyze]
+    TRIAGE -->|handoff| INVESTIGATE[Category Investigator]
+    INVESTIGATE -->|as_tool| EVALUATE[Independent Evaluator]
 ```
 
 依赖方向为 Adapter → Application Service → Runtime → Graph/Domain。Infra 实现 Runtime 需要的持久化、Session 和配置端口。`bootstrap.py` 是依赖组装入口。任何下层模块都不能反向导入 Adapter。
@@ -30,38 +33,46 @@ flowchart LR
 | Adapter | CLI 参数、HTTP DTO、SSE 编码、输出渲染 | Graph 路由、检查点、模型消息拼接 |
 | AgentClient | 用统一 Command/Event 接口屏蔽本地与远程执行 | 业务状态判断 |
 | Application Service | run 创建、身份上下文、profile 选择、服务入口和查询 | 节点路由、模型推理 |
-| Runtime | 幂等、revision、加载检查点、推进 Graph、调用 NodeRunner、提交状态与 Event | 自主改变 Graph 流程 |
-| Graph | 基于结构化状态做确定性节点转换、澄清和评测重试；通过 `prepare_step/apply_result` 与外部调用隔离 | stdin、HTTP、数据库、SDK Session |
-| NodeRunner | 把结构化输入交给指定 Agent，并返回严格输出 | 生命周期提交和跨节点路由 |
+| Runtime | 幂等、revision、加载检查点、推进一次应用层 turn、调用 NodeRunner、提交状态与 Event | 自主改变业务流程 |
+| Graph | `NativeDiagnosisGraph` 只组装结构化 turn 输入并校验确定性状态转换；保留 `DiagnosisGraph` 兼容旧 profile/测试 | stdin、HTTP、数据库、SDK Session |
+| NodeRunner | 用 Agents SDK loop 执行分诊、handoff、只读工具和独立评测，并返回严格输出 | 生命周期提交和持久化状态 |
 | ContextAssembler | 按节点显式组装上下文、证据 ID、回答、历史结果和版本 | 读取 SDK 消息或执行外部查询 |
 | ToolRegistry | 用 SDK `function_tool` 注册只读工具，按 node/profile/tenant/capability 过滤并交给审计 observer；显式工具可声明 `needs_approval` | 业务路由、写操作和权限越权 |
 | Store | 原子保存业务状态、state history、Command、Event、节点/工具审计、证据、租约和配置快照 | 保存或解释模型对话 |
-| SDK Session | 保存单节点模型消息历史 | 业务状态、恢复游标和前端会话 |
+| SDK Session | 保存一次原生 loop（或兼容 Graph 节点）的模型消息历史 | 业务状态、恢复游标和前端会话 |
 | Admin Service | 健康、能力、配置和只读运维查询 | 调用 Graph 或触发诊断节点 |
 
 ## Agent Graph
 
 ```text
-analyze → investigate → evaluate ──通过/达到上限──→ summarize → done
-              ↑            │
-              └──可重试────┘
+NativeDiagnosisGraph.prepare_step
+  → Triage / Analyze Agent
+      ├─ needs_input → checkpoint / new Command
+      └─ handoff → Category Investigator
+                       ├─ read-only tools
+                       ├─ review_diagnosis (Evaluator as tool)
+                       ├─ needs_input → checkpoint / new Command
+                       └─ completed → evidence gate → done
 ```
 
-- `analyze`：提取症状、影响、时间和环境并分类，不输出根因。
-- `investigate`：生成 1–3 条有证据支持、可验证的原因假设。
-- `evaluate`：独立检查覆盖度、证据可追溯性、推理、验证步骤和不确定性。
-- `summarize`：转写已评测的结构化结果，不重新推理或改变结论。
+- Triage/Analyze 只判断问题完整性、提取 `ProblemAnalysis` 并选择问题类别；它不做根因定位，也不调用问题定位工具。
+- Category Investigator 负责加载类别提示和上下文、形成 1–3 条有证据支持且可验证的假设。
+- Evaluator 是独立 Agent，通过 `Agent.as_tool()` 被 Investigator 调用；它只检查完整性、可信度、证据可追溯性和验证可执行性，不修改候选定位。
+- 代码强制至少一次独立评测、最多两轮评测；评测未通过时结果只能是 `completed/inconclusive`，不能把推测写成确认结论。
+- 旧的四节点 `DiagnosisGraph` 仍保留给迁移和兼容测试，生产 `bootstrap.py` 默认使用原生 loop。
 
-Analyze、Investigate 或 Evaluate 可以返回 `UserInteractionRequest`。Runtime 提交等待状态后结束本次短执行；答案通过新 Command 回到请求来源节点，Evaluate 的回答回到 Investigate。Skip、Resume 和协作式 Cancel 均由快照的 `available_actions` 驱动。Evaluate 未通过时，只能在代码规定的次数内回到原 Investigate Session。
+任一原生 Agent 都可以返回 `UserInteractionRequest`。Runtime 提交等待状态后结束本次短执行；答案通过新 Command 写入同一 run 的 `NativeDiagnosisInput`，再次调用同一个 `SQLiteSession`。Evaluate 来源的回答回到 Investigator。Skip、Resume、审批和 Cancel 均由快照的 `available_actions` 驱动。
 
 ## Agents SDK 边界
 
 | SDK 能力 | 用途 |
 | --- | --- |
-| `Agent` | 定义四个职责独立的节点 |
+| `Agent` | 定义 Triage、类别 Investigator 和独立 Evaluator |
 | Pydantic `output_type` | 约束节点结构化输出 |
 | `Runner.run()` | 执行模型调用和 SDK 内部循环 |
-| `SQLiteSession` | 保存同一节点的多轮模型消息 |
+| `handoff()` | 将规范化 `InvestigationBrief` 交给类别 Investigator |
+| `Agent.as_tool()` | 以只读 `review_diagnosis` 工具调用独立 Evaluator，保留 Investigator 的最终控制权 |
+| `SQLiteSession` | 保存一次 run 的原生 loop 消息历史；澄清后复用同一 Session |
 | `ModelSettings.retry` | 单次模型请求的 runner-managed retry policy；底层 OpenAI client 关闭重复重试 |
 | `SessionSettings` / `session_input_callback` | 限制同节点历史并控制本轮合并 |
 | `function_tool` / `RunHooks` | 只读工具 Schema、超时、调用 ID 和工具审计桥接 |
@@ -70,11 +81,11 @@ Analyze、Investigate 或 Evaluate 可以返回 `UserInteractionRequest`。Runti
 | `needs_approval` / `RunState` | 将工具 interruption 映射为加密 checkpoint、`waiting_approval` 和批准/拒绝恢复 |
 | `RunContextWrapper` | 传递 run ID、节点名和配置版本等本地上下文 |
 | `trace()` | 以 `run_id` 聚合一次诊断的节点运行 |
-| `max_turns` | 限制单节点模型循环 |
+| `max_turns` | 限制一次原生应用层 turn 的 SDK 循环 |
 
-每个 `{run_id}:{node_name}` 使用独立 Session。同一节点的澄清和评测重试复用 Session；不同节点不共享完整对话。项目不同时使用 Session、`previous_response_id`、Conversations API 或手工消息回放。
+原生生产路径使用 `{run_id}:diagnosis` 单一 Session，Session 只保存模型消息；`DiagnosisState`、Command、Event、revision 和配置快照仍由 CheckpointStore 保存。兼容旧 Graph 时继续使用 `{run_id}:{node_name}` 的隔离 Session。项目不同时使用 Session、`previous_response_id`、Conversations API 或手工消息回放。
 
-handoff 和 `Agent.as_tool()` 不用于主流程，因为节点顺序、评测门禁和重试上限必须由确定性 Graph 控制。SDK 的工具、节点/工具 guardrail、hooks、streaming 和 `RunState` 已按需映射到项目协议和生命周期；SDK RunState 只在后端加密保存，不能直接暴露给 Adapter。Guardrail 只负责 SDK 执行边界，脱敏、证据注册、审计、业务澄清和生命周期状态仍由 BugLens 自己控制。
+SDK 的 handoff、`Agent.as_tool()`、工具、节点/工具 guardrail、hooks、streaming 和 `RunState` 已按需映射到项目协议和生命周期；SDK RunState 只在后端加密保存，不能直接暴露给 Adapter。Guardrail 只负责 SDK 执行边界，脱敏、证据注册、审计、业务澄清和生命周期状态仍由 BugLens 自己控制。Evaluator 的模型消息不与 Investigator 共享完整 Session，由 `as_tool()` 创建独立调用边界。
 
 ## 源码布局
 

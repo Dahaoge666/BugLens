@@ -7,7 +7,7 @@
 | 类型 | 示例 | 生效时机 |
 | --- | --- | --- |
 | 启动配置 | 数据库、监听地址、日志、默认 profile、CORS、Admin token | 进程启动 |
-| 运行策略 | Graph 上限、评测阈值、节点 model/max turns/prompt、工具限制 | 创建 run 时快照 |
+| 运行策略 | loop/兼容 Graph 上限、评测阈值、Agent model/max turns/prompt、工具限制 | 创建 run 时快照 |
 | 请求输入 | 问题、上下文、证据、允许的 profile | 每个 Command |
 | 展示选项 | JSON、输出文件、颜色、远程地址 | Adapter 本地 |
 
@@ -37,7 +37,7 @@ profiles:
       investigate: {model: default, max_turns: 6, prompt_version: investigator-v1}
       evaluate: {model: default, max_turns: 6, prompt_version: rubric-v1}
       summarize: {model: default, max_turns: 6, prompt_version: summary-v1}
-    tools: {enabled: false, allowed_nodes: [analyze], max_results: 20, timeout_seconds: 30, max_result_bytes: 65536}
+    tools: {enabled: false, allowed_nodes: [investigate], max_results: 20, timeout_seconds: 30, max_result_bytes: 65536}
     retry: {max_retries: 5, initial_delay_seconds: 1, max_delay_seconds: 16, multiplier: 2, jitter: true}
     sessions: {history_item_limit: 100}
     lease_seconds: 60

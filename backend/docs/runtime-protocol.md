@@ -54,18 +54,18 @@ created → running ─┬→ waiting_user ─→ running
 - 达到定位上限仍未通过：`completed/inconclusive`；
 - 基础设施或节点执行失败：`failed`，没有诊断 outcome。
 
-执行游标为 `analyze | investigate | evaluate | summarize | done`。任意时刻最多有一个 `pending_*`；等待态必须有对应 pending，running 和终态不得有 pending；`completed` 必须有 outcome；`done` 只用于终态。
+执行游标仍为 `analyze | investigate | evaluate | summarize | done`，用于兼容事件和恢复；生产原生 loop 通常在一个 `analyze` 或 `investigate` 游标内完成分诊、handoff 和评测。任意时刻最多有一个 `pending_*`；等待态必须有对应 pending，running 和终态不得有 pending；`completed` 必须有 outcome；`done` 只用于终态。
 
-## 单步推进
+## 应用层 turn
 
-Graph 每次只计算一个确定性转换：
+生产路径每个短 Command 至多推进一次原生 Agents SDK loop：
 
-1. Analyze 需要澄清则等待用户，否则进入 Investigate。
-2. Investigate 开始新定位时增加 attempt；澄清恢复不增加 attempt。
-3. Evaluate 通过后设置 confirmed；未通过且有剩余次数则回到 Investigate；达到上限后设置 inconclusive。
-4. Summarize 只转写结构化结果，随后进入 `done/completed`。
+1. `NativeDiagnosisGraph.prepare_step` 从快照组装一个 `NativeDiagnosisInput`，并固定本次 run 的配置、Session ID 和评测 rubric。
+2. `NativeDiagnosisRunner` 由 Triage/Analyze 开始；信息不足时返回 `needs_input`，否则用 `handoff` 把 `InvestigationBrief` 交给类别 Investigator。
+3. Investigator 可调用只读工具，并以 `Agent.as_tool()` 调用独立 Evaluator；最多两轮评测，代码检查至少一次评测和证据引用。
+4. 结构化结果交回 `NativeDiagnosisGraph.apply_result`。通过门禁才是 `confirmed`；评测不通过、未执行或信息耗尽均为 `completed/inconclusive`。
 
-Runtime 在每一步前加载检查点和不可变配置快照，在每一步后原子提交新状态与 Event。Graph 不执行 I/O，不直接提交数据。
+旧 `DiagnosisGraph` 仍按四节点规则推进，供迁移期间的旧 profile 和兼容测试使用。Runtime 在每个应用层 turn 前加载检查点和不可变配置快照，在 turn 后原子提交状态与 Event；Graph 不执行 I/O，不直接提交数据。
 
 ## 暂停与恢复
 
@@ -76,7 +76,7 @@ Runtime 在每一步前加载检查点和不可变配置快照，在每一步后
 3. 提交 `InputRequired` 和 `RunWaiting`；
 4. 结束当前短执行。
 
-回答或 Skip Command 必须匹配 run revision、request ID 和问题 ID。答案经严格校验与脱敏后，Runtime 清除 pending、增加来源节点澄清轮数，并把 `ClarificationInput` 交回同一来源节点和同一 SDK Session；Evaluate 来源的回答交回 Investigate。Skip 不伪造答案，而是以 `information_unavailable=true` 继续，并在总结限制中保留记录。
+回答或 Skip Command 必须匹配 run revision、request ID 和问题 ID。答案经严格校验与脱敏后，Runtime 清除 pending、增加来源节点澄清轮数，并把 `ClarificationInput` 写入下一次 `NativeDiagnosisInput`，再次调用同一个 `{run_id}:diagnosis` SDK Session；Evaluate 来源的回答交回 Investigator。旧 Graph 仍把它交回对应节点 Session。Skip 不伪造答案，而是以 `information_unavailable=true` 继续，并在总结限制中保留记录。
 
 工具审批 Command 必须匹配 run revision 和 pending approval request ID。Runtime 使用 SDK `RunState.from_string()` 恢复加密检查点，批准或拒绝全部待处理 interruption 后，复用原 Agent、节点 Session 和 active execution。决定提交与 `ToolApprovalResolved` Event 原子落库；节点完成后才标记 SDK 检查点 resolved。若进程在决定提交后退出，重复同一 `command_id` 会继续未完成的 SDK 状态，不重复创建节点执行记录。
 
@@ -104,6 +104,6 @@ Runtime 在每一步前加载检查点和不可变配置快照，在每一步后
 - Command 重放不重复执行；错误 revision/request ID 被拒绝；
 - 暂停后可由新进程恢复，且不重做已提交节点；
 - 两个执行者不能并发推进同一 run；
-- Evaluate 重试复用原 Investigate Session；
+- 原生 loop 的 Evaluator 通过 `as_tool()` 保持独立调用边界；澄清后 Investigator 复用 `{run_id}:diagnosis` Session；
 - 评测不足进入 `completed/inconclusive` 而非 `failed`；
 - Graph 测试不启动 HTTP，也不调用真实模型。

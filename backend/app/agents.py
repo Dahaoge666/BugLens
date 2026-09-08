@@ -1,8 +1,9 @@
-"""OpenAI Agents SDK adapter with isolated persistent node sessions."""
+"""OpenAI Agents SDK adapters and the native diagnosis orchestration loop."""
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -24,6 +25,7 @@ from agents import (
     SessionSettings,
     SQLiteSession,
     ToolExecutionConfig,
+    handoff,
     retry_policies,
 )
 from agents.exceptions import (
@@ -44,16 +46,26 @@ from .models import (
     AnalyzeInput,
     ClarificationInput,
     DiagnosisReport,
+    DiagnosisTurnResult,
     EvaluationInput,
     EvaluationResult,
+    InvestigationBrief,
     InvestigationInput,
     InvestigationResult,
+    NativeDiagnosisInput,
     ProblemAnalysis,
     ProblemCategory,
     RetryInput,
     SummaryInput,
 )
-from .prompts import ANALYSIS_PROMPT, EVALUATION_PROMPT, SUMMARY_PROMPT, PromptRegistry
+from .prompts import (
+    ANALYSIS_PROMPT,
+    EVALUATION_PROMPT,
+    NATIVE_INVESTIGATION_SUFFIX,
+    NATIVE_TRIAGE_PROMPT,
+    SUMMARY_PROMPT,
+    PromptRegistry,
+)
 from .security import sanitize_data
 from .tools import (
     AuditingRunHooks,
@@ -88,13 +100,20 @@ class NodeRuntimeContext:
     profile: str = "default"
     tool_result_bytes: int = 65_536
     tools_enabled: bool = False
-    tool_allowed_nodes: frozenset[str] = frozenset({"analyze"})
+    tool_allowed_nodes: frozenset[str] = frozenset({"investigate"})
     tool_allowed_profiles: frozenset[str] = frozenset()
     tool_max_results: int = 20
     tool_timeout_seconds: float = 30.0
     execution_id: str | None = None
     tool_registry: object | None = None
     execution_observer: object | None = None
+    # Native orchestration fields.  ``resolved_config`` and ``native_tracker``
+    # are live process objects and are deliberately excluded from RunState
+    # serialization below.
+    session_id: str | None = None
+    active_agent: str | None = None
+    resolved_config: object | None = None
+    native_tracker: object | None = None
 
 
 class NodeRunner(Protocol):
@@ -242,7 +261,12 @@ def _serialize_runtime_context(value: Any) -> dict[str, Any]:
     }
     payload: dict[str, Any] = {}
     for field_name in NodeRuntimeContext.__dataclass_fields__:
-        if field_name in {"tool_registry", "execution_observer"}:
+        if field_name in {
+            "tool_registry",
+            "execution_observer",
+            "resolved_config",
+            "native_tracker",
+        }:
             continue
         field_value = getattr(value, field_name)
         if field_name in set_fields:
@@ -284,9 +308,25 @@ _MAX_NODE_OUTPUT_BYTES = 4_000_000
 
 
 def _node_input_text_candidates(input_value: Any) -> list[str]:
-    """Extract JSON text from the SDK's string or message-list input shape."""
+    """Extract raw JSON and structured-tool JSON from SDK input items.
+
+    ``Agent.as_tool(include_input_schema=True)`` wraps parameters in a human
+    readable message with fenced JSON.  Native evaluator guardrails still need
+    to validate the data block rather than the wrapper text.
+    """
+
+    def add_text(candidates: list[str], text: str) -> None:
+        candidates.append(text)
+        if "```" not in text:
+            return
+        for block in re.findall(r"```(?:jsonc?|JSONC?)?\s*(.*?)```", text, re.S):
+            if block.strip():
+                candidates.append(block.strip())
+
     if isinstance(input_value, str):
-        return [input_value]
+        candidates: list[str] = []
+        add_text(candidates, input_value)
+        return candidates
     if not isinstance(input_value, list):
         return []
 
@@ -298,7 +338,7 @@ def _node_input_text_candidates(input_value: Any) -> list[str]:
             else getattr(item, "content", None)
         )
         if isinstance(content, str):
-            candidates.append(content)
+            add_text(candidates, content)
             continue
         if not isinstance(content, list):
             continue
@@ -312,7 +352,7 @@ def _node_input_text_candidates(input_value: Any) -> list[str]:
             if isinstance(text, str):
                 text_parts.append(text)
         if text_parts:
-            candidates.append("".join(text_parts))
+            add_text(candidates, "".join(text_parts))
     return candidates
 
 
@@ -454,7 +494,7 @@ class OpenAINodeRunner:
         self._model_cache: dict[tuple, OpenAIChatCompletionsModel] = {}
 
     def _session(self, runtime: NodeRuntimeContext) -> SQLiteSession:
-        session_id = f"{runtime.graph_run_id}:{runtime.node_name}"
+        session_id = runtime.session_id or f"{runtime.graph_run_id}:{runtime.node_name}"
         if session_id not in self._sessions:
             self._sessions[session_id] = SQLiteSession(
                 session_id,
@@ -1083,3 +1123,470 @@ class OpenAINodeRunner:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+
+
+def _native_input_guardrail() -> InputGuardrail[Any]:
+    """Accept the application turn or the typed handoff brief."""
+
+    accepted_types: tuple[type[BaseModel], ...] = (
+        NativeDiagnosisInput,
+        InvestigationBrief,
+    )
+
+    def validate(_context, _agent, input_value) -> GuardrailFunctionOutput:
+        candidates = _node_input_text_candidates(input_value)
+        if not candidates:
+            return GuardrailFunctionOutput(
+                output_info={"reason": "input_not_json"},
+                tripwire_triggered=True,
+            )
+        for candidate in candidates:
+            if len(candidate.encode("utf-8")) > _MAX_NODE_INPUT_BYTES:
+                return GuardrailFunctionOutput(
+                    output_info={"reason": "input_too_large"},
+                    tripwire_triggered=True,
+                )
+            for input_type in accepted_types:
+                try:
+                    input_type.model_validate_json(candidate)
+                except (TypeError, ValueError):
+                    continue
+                return GuardrailFunctionOutput(
+                    output_info={"input_type": input_type.__name__},
+                    tripwire_triggered=False,
+                )
+        return GuardrailFunctionOutput(
+            output_info={"reason": "input_schema_invalid"},
+            tripwire_triggered=True,
+        )
+
+    return InputGuardrail(
+        validate,
+        name="buglens_native_input_contract",
+        run_in_parallel=False,
+    )
+
+
+def _native_output_guardrail() -> OutputGuardrail[Any]:
+    """Validate the common final output of triage and investigators."""
+
+    def validate(_context, _agent, output) -> GuardrailFunctionOutput:
+        try:
+            normalized = DiagnosisTurnResult.model_validate(output)
+            serialized = json.dumps(
+                normalized.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return GuardrailFunctionOutput(
+                output_info={"reason": "output_schema_invalid"},
+                tripwire_triggered=True,
+            )
+        output_bytes = len(serialized.encode("utf-8"))
+        if output_bytes > _MAX_NODE_OUTPUT_BYTES:
+            return GuardrailFunctionOutput(
+                output_info={"reason": "output_too_large", "bytes": output_bytes},
+                tripwire_triggered=True,
+            )
+        return GuardrailFunctionOutput(
+            output_info={
+                "output_type": DiagnosisTurnResult.__name__,
+                "bytes": output_bytes,
+            },
+            tripwire_triggered=False,
+        )
+
+    return OutputGuardrail(
+        validate,
+        name="buglens_native_output_contract",
+    )
+
+
+class NativeDiagnosisRunner(OpenAINodeRunner):
+    """Run triage, category handoffs and independent review in one SDK loop.
+
+    The application still calls this runner once per short Command execution.
+    Inside that call the Agents SDK owns tool calls and handoffs.  A fresh
+    hierarchy of Agent objects is built per turn so the evaluator tool can keep
+    a per-turn review counter without leaking mutable state between runs.
+    """
+
+    NATIVE_VERSION = "native-agents-0.22"
+
+    @staticmethod
+    def _phase_config(runtime: NodeRuntimeContext, phase: str):
+        resolved = runtime.resolved_config
+        if resolved is not None:
+            policy = resolved.policy.node(phase)
+            return policy, resolved.policy.model(policy.model), resolved.policy.retry
+        return (
+            type(
+                "Policy",
+                (),
+                {
+                    "model": runtime.model or "gpt-4.1-mini",
+                    "max_turns": runtime.max_turns,
+                },
+            )(),
+            runtime.model_config,
+            type(
+                "Retry",
+                (),
+                {
+                    "max_retries": runtime.max_retries,
+                    "initial_delay_seconds": runtime.retry_initial_delay,
+                    "max_delay_seconds": runtime.retry_max_delay,
+                    "multiplier": runtime.retry_multiplier,
+                    "jitter": runtime.retry_jitter,
+                },
+            )(),
+        )
+
+    def _agent_kwargs(self, runtime: NodeRuntimeContext, phase: str) -> dict[str, Any]:
+        policy, model_config, retry = self._phase_config(runtime, phase)
+        return {
+            "model": self._model_arg(policy.model, model_config),
+            "model_settings": self._model_settings(
+                max_retries=retry.max_retries,
+                timeout=(
+                    model_config.timeout if model_config else runtime.node_timeout
+                ),
+                retry_initial_delay=retry.initial_delay_seconds,
+                retry_max_delay=retry.max_delay_seconds,
+                retry_multiplier=retry.multiplier,
+                retry_jitter=retry.jitter,
+            ),
+        }
+
+    @staticmethod
+    async def _extract_evaluation(result) -> str:
+        output = result.final_output
+        if isinstance(output, EvaluationResult):
+            return output.model_dump_json()
+        return json.dumps(output, ensure_ascii=False)
+
+    def _evaluator(self, runtime: NodeRuntimeContext) -> Agent:
+        return Agent(
+            name="BugLens Evaluator",
+            instructions=(EVALUATION_PROMPT + _schema_hint(EvaluationResult)),
+            output_type=EvaluationResult,
+            input_guardrails=[_node_input_guardrail("evaluate")],
+            output_guardrails=[_node_output_guardrail("evaluate", EvaluationResult)],
+            **self._agent_kwargs(runtime, "evaluate"),
+        )
+
+    def _investigator(
+        self,
+        runtime: NodeRuntimeContext,
+        category: ProblemCategory,
+    ) -> Agent:
+        evaluator = self._evaluator(runtime)
+        tracker = runtime.native_tracker
+
+        async def extract_with_count(result) -> str:
+            if tracker is not None:
+                tracker.review_calls = getattr(tracker, "review_calls", 0) + 1
+            return await self._extract_evaluation(result)
+
+        def review_enabled(_context, _agent) -> bool:
+            return tracker is None or tracker.review_calls < getattr(
+                tracker, "max_review_calls", 2
+            )
+
+        review_tool = evaluator.as_tool(
+            tool_name="review_diagnosis",
+            tool_description=(
+                "独立评测当前候选定位。必须传入完整 analysis、investigation、"
+                "证据目录和 rubric；不要重新定位或修改候选结果。"
+            ),
+            parameters=EvaluationInput,
+            include_input_schema=True,
+            custom_output_extractor=extract_with_count,
+            is_enabled=review_enabled,
+            max_turns=self._phase_config(runtime, "evaluate")[0].max_turns,
+        )
+        tools = [*self._tools_for(runtime, "investigate"), review_tool]
+        instructions = (
+            self.prompts.build_investigation_instructions(category, runtime.tenant_id)
+            + NATIVE_INVESTIGATION_SUFFIX
+            + _schema_hint(DiagnosisTurnResult)
+        )
+        return Agent(
+            name=f"BugLens Investigator {category.value}",
+            handoff_description=f"负责 {category.value} 类问题的证据约束定位。",
+            instructions=instructions,
+            output_type=DiagnosisTurnResult,
+            input_guardrails=[_native_input_guardrail()],
+            output_guardrails=[_native_output_guardrail()],
+            tools=tools,
+            **self._agent_kwargs(runtime, "investigate"),
+        )
+
+    def _triage(self, runtime: NodeRuntimeContext) -> Agent:
+        handoffs = []
+        for category in ProblemCategory:
+            investigator = self._investigator(runtime, category)
+            tracker = runtime.native_tracker
+
+            def record_handoff(_context, brief):
+                if tracker is not None:
+                    tracker.handoff_brief = brief
+
+            handoffs.append(
+                handoff(
+                    investigator,
+                    tool_name_override=f"transfer_to_{category.value}_investigator",
+                    tool_description_override=(
+                        f"将已规范化的 {category.value} 问题交给对应定位专家。"
+                    ),
+                    on_handoff=record_handoff,
+                    input_type=InvestigationBrief,
+                )
+            )
+        return Agent(
+            name="BugLens Triage",
+            instructions=(NATIVE_TRIAGE_PROMPT + _schema_hint(DiagnosisTurnResult)),
+            output_type=DiagnosisTurnResult,
+            input_guardrails=[_native_input_guardrail()],
+            output_guardrails=[_native_output_guardrail()],
+            handoffs=handoffs,
+            **self._agent_kwargs(runtime, "analyze"),
+        )
+
+    def _starting_agent(self, runtime: NodeRuntimeContext) -> Agent:
+        active = runtime.active_agent or "triage"
+        if active.startswith("investigator:"):
+            raw_category = active.split(":", 1)[1]
+            try:
+                category = ProblemCategory(raw_category)
+            except ValueError:
+                category = ProblemCategory.UNKNOWN
+            return self._investigator(runtime, category)
+        return self._triage(runtime)
+
+    @staticmethod
+    def _active_agent_key(agent: Any, fallback: str = "triage") -> str:
+        name = str(getattr(agent, "name", ""))
+        prefix = "BugLens Investigator "
+        if name.startswith(prefix):
+            category = name.removeprefix(prefix).strip()
+            try:
+                return f"investigator:{ProblemCategory(category).value}"
+            except ValueError:
+                return "investigator:unknown"
+        if name == "BugLens Triage":
+            return "triage"
+        return fallback
+
+    async def _run_native_once(
+        self,
+        agent: Agent,
+        payload: NativeDiagnosisInput,
+        runtime: NodeRuntimeContext,
+        *,
+        sdk_input: Any | None = None,
+    ) -> DiagnosisTurnResult:
+        run_config = self._run_config(runtime)
+        hooks = AuditingRunHooks(runtime.execution_observer)
+        input_value = sdk_input if sdk_input is not None else payload.model_dump_json()
+        if self._streaming_for(runtime):
+            streamed = Runner.run_streamed(
+                agent,
+                input=input_value,
+                context=runtime,
+                session=self._session(runtime),
+                max_turns=runtime.max_turns,
+                run_config=run_config,
+                hooks=hooks,
+            )
+            async for _event in streamed.stream_events():
+                pass
+            if getattr(streamed, "run_loop_exception", None) is not None:
+                raise streamed.run_loop_exception
+            result = streamed
+        else:
+            result = await Runner.run(
+                agent,
+                input=input_value,
+                context=runtime,
+                session=self._session(runtime),
+                max_turns=runtime.max_turns,
+                run_config=run_config,
+                hooks=hooks,
+            )
+        self._record_reasoning(result, runtime)
+        if getattr(result, "interruptions", None):
+            raise self._approval_required(result, runtime)
+        output = result.final_output
+        if not isinstance(output, DiagnosisTurnResult):
+            raise ModelBehaviorError(
+                "native diagnosis returned an unexpected output type"
+            )
+        tracker = runtime.native_tracker
+        brief = getattr(tracker, "handoff_brief", None) if tracker else None
+        if output.analysis is None and isinstance(brief, InvestigationBrief):
+            # A handoff brief is a bounded deterministic fallback, not model
+            # memory.  It keeps the final application contract complete if a
+            # specialist returns only the investigation fields.
+            output = output.model_copy(
+                update={
+                    "analysis": ProblemAnalysis(
+                        category=brief.category,
+                        category_confidence=brief.category_confidence,
+                        summary=brief.normalized_summary,
+                        symptoms=brief.symptoms,
+                        impact=brief.impact,
+                        environment=brief.environment,
+                        missing_information=brief.missing_information,
+                    )
+                }
+            )
+        active = self._active_agent_key(
+            getattr(result, "last_agent", None), runtime.active_agent or "triage"
+        )
+        review_count = getattr(tracker, "review_calls", 0) if tracker else 0
+        return output.model_copy(
+            update={"active_agent": active, "review_count": review_count}
+        )
+
+    async def run(
+        self,
+        node_name: str,
+        payload: BaseModel,
+        runtime: NodeRuntimeContext,
+        category: ProblemCategory | None = None,
+    ) -> BaseModel:
+        if not isinstance(payload, NativeDiagnosisInput):
+            raise NodeExecutionError(
+                "native runner received an invalid application input",
+                code="invalid_native_input",
+                retryable=False,
+                auto_retry=False,
+            )
+        agent = self._starting_agent(runtime)
+        for attempt in range(runtime.max_retries + 1):
+            try:
+                return await self._run_native_once(agent, payload, runtime)
+            except NodeApprovalRequired:
+                raise
+            except InputGuardrailTripwireTriggered as exc:
+                raise NodeExecutionError(
+                    "native input was blocked by an SDK guardrail",
+                    code="input_guardrail_blocked",
+                    retryable=False,
+                    auto_retry=False,
+                ) from exc
+            except OutputGuardrailTripwireTriggered as exc:
+                if attempt == runtime.max_retries:
+                    raise NodeExecutionError(
+                        "native output was blocked by an SDK guardrail",
+                        code="output_guardrail_blocked",
+                        retryable=True,
+                        auto_retry=False,
+                    ) from exc
+            except (
+                ToolInputGuardrailTripwireTriggered,
+                ToolOutputGuardrailTripwireTriggered,
+            ) as exc:
+                raise NodeExecutionError(
+                    "native tool call was blocked by an SDK guardrail",
+                    code="tool_guardrail_blocked",
+                    retryable=False,
+                    auto_retry=False,
+                ) from exc
+            except ModelBehaviorError as exc:
+                if attempt == runtime.max_retries:
+                    raise NodeExecutionError(
+                        "native output did not match its structured schema",
+                        code="invalid_structured_output",
+                        retryable=True,
+                        auto_retry=False,
+                    ) from exc
+            except ToolExecutionError as exc:
+                raise NodeExecutionError(
+                    "read-only tool execution failed",
+                    code=exc.code,
+                    retryable=exc.retryable,
+                    auto_retry=True,
+                ) from exc
+            except ToolTimeoutError as exc:
+                raise NodeExecutionError(
+                    "read-only tool execution timed out",
+                    code="tool_timeout",
+                    retryable=True,
+                    auto_retry=True,
+                ) from exc
+            except Exception as exc:
+                retryable = self._retryable_exception(exc)
+                if attempt == runtime.max_retries:
+                    raise NodeExecutionError(
+                        "native agent execution failed",
+                        code="sdk_retry_exhausted"
+                        if retryable
+                        else "node_execution_failed",
+                        retryable=retryable,
+                        auto_retry=False,
+                    ) from exc
+        raise AssertionError("unreachable")
+
+    async def resume_approval(
+        self,
+        node_name: str,
+        payload: BaseModel,
+        runtime: NodeRuntimeContext,
+        *,
+        state_string: str,
+        decision: Literal["approved", "rejected"],
+        expected_tool_call_ids: list[str] | None = None,
+        category: ProblemCategory | None = None,
+    ) -> BaseModel:
+        if not isinstance(payload, NativeDiagnosisInput):
+            raise NodeExecutionError(
+                "native approval resume received an invalid input",
+                code="invalid_native_input",
+                retryable=False,
+                auto_retry=False,
+            )
+        agent = self._starting_agent(runtime)
+        try:
+            state = await RunState.from_string(
+                agent,
+                state_string,
+                context_override=runtime,
+            )
+        except Exception as exc:
+            raise NodeExecutionError(
+                "native approval state could not be restored",
+                code="sdk_run_state_unavailable",
+                retryable=False,
+                auto_retry=False,
+            ) from exc
+        interruptions = state.get_interruptions()
+        if not interruptions:
+            raise NodeExecutionError(
+                "native approval state has no pending interruption",
+                code="sdk_run_state_unavailable",
+                retryable=False,
+                auto_retry=False,
+            )
+        expected = {str(item) for item in (expected_tool_call_ids or []) if item}
+        actual = {str(item.call_id) for item in interruptions if item.call_id}
+        if expected and expected != actual:
+            raise NodeExecutionError(
+                "native approval state does not match the pending request",
+                code="sdk_run_state_unavailable",
+                retryable=False,
+                auto_retry=False,
+            )
+        for item in interruptions:
+            if decision == "approved":
+                state.approve(item)
+            else:
+                state.reject(item, rejection_message="用户拒绝执行该只读工具调用")
+        return await self._run_native_once(
+            agent,
+            payload,
+            runtime,
+            sdk_input=state,
+        )

@@ -59,7 +59,9 @@ class EvaluationPolicy(StrictModel):
 class ToolPolicy(StrictModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
-    allowed_nodes: list[str] = Field(default_factory=lambda: ["analyze"])
+    # Native orchestration keeps triage tool-free and exposes read-only
+    # connectors only to the category investigator.
+    allowed_nodes: list[str] = Field(default_factory=lambda: ["investigate"])
     allowed_profiles: list[str] = Field(default_factory=list)
     max_results: int = Field(default=20, ge=0, le=100)
     timeout_seconds: int = Field(default=30, ge=1, le=120)
@@ -166,7 +168,12 @@ DEFAULT_PROFILE: dict[str, Any] = {
             "prompt_version": "summary-v1",
         },
     },
-    "tools": {"enabled": False, "max_results": 20, "timeout_seconds": 30},
+    "tools": {
+        "enabled": False,
+        "allowed_nodes": ["investigate"],
+        "max_results": 20,
+        "timeout_seconds": 30,
+    },
     "retry": {
         "max_retries": 5,
         "initial_delay_seconds": 1,

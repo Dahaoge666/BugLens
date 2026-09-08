@@ -47,13 +47,13 @@ CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。
 - `config/tenant_prompts.example.yaml`：租户提示词示例；
 - `.env.example`：环境变量示例。
 
-固定的 Graph 路由、节点上限、评测阈值和节点 `max_turns` 来自版本化 profile，并在创建 run 时保存不可变配置快照。
+原生 Agents SDK loop 的评测上限、rubric 阈值和各 Agent `max_turns` 来自版本化 profile，并在创建 run 时保存不可变配置快照。生产路径由 Triage/Analyze 通过 handoff 选择类别 Investigator，再以 `Agent.as_tool()` 调用独立 Evaluator；旧确定性 Graph 仍保留兼容测试。
 
 默认工具关闭且不需要审批。接入显式 `needs_approval=True` 的只读工具时，请设置 `BUGLENS_RUN_STATE_KEY`；它用于加密 SDK 恢复状态，必须在跨进程恢复审批的服务实例间一致。
 
 ## 文档
 
-- [架构与 SDK 边界](docs/architecture.md)：组件职责、确定性 Graph、SDK 能力采用边界；
+- [架构与 SDK 边界](docs/architecture.md)：组件职责、原生 loop、handoff/as_tool 与 SDK 能力边界；
 - [Runtime、协议与恢复](docs/runtime-protocol.md)：Command/Event、状态机、检查点、幂等与并发；
 - [配置、Admin 与运维](docs/configuration-and-operations.md)：配置分层、快照、控制面和部署安全；
 - [前后端对接契约](../frontend-backend-contract.md)：前端可依赖的 HTTP/SSE 与 Admin 公共接口。

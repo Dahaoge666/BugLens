@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from openai import AsyncOpenAI
 
-from .agents import OpenAINodeRunner
+from .agents import NativeDiagnosisRunner, OpenAINodeRunner
 from .application import ApplicationService
 from .client import LocalAgentClient
 from .config import ConfigRepository, Settings
-from .graph import DiagnosisGraph
+from .graph import NativeDiagnosisGraph
 from .infra import SQLiteCheckpointStore
 from .prompts import PromptRegistry
 from .runtime import DiagnosisRuntime
@@ -66,7 +66,7 @@ def build_local_service(
     )
     configs = ConfigRepository(settings.config_path)
     prompts = PromptRegistry(settings.prompt_config)
-    runner = OpenAINodeRunner(
+    runner = NativeDiagnosisRunner(
         prompts,
         settings.session_db,
         default_streaming=custom_endpoint,
@@ -77,7 +77,7 @@ def build_local_service(
     # A custom gateway's tracing endpoint usually differs from OpenAI's; default
     # to disabling tracing there unless the operator explicitly enables it.
     tracing_enabled = settings.tracing_enabled and not custom_endpoint
-    graph = DiagnosisGraph(runner, prompts, tracing_enabled=tracing_enabled)
+    graph = NativeDiagnosisGraph(runner, prompts, tracing_enabled=tracing_enabled)
     store = SQLiteCheckpointStore(settings.session_db)
     runtime = DiagnosisRuntime(
         graph,

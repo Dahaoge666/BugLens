@@ -83,7 +83,12 @@ class DiagnosisContext(StrictModel):
     actual_behavior: str | None = Field(default=None, max_length=4_000)
     impact_scope: str | None = Field(default=None, max_length=2_000)
     constraints: list[str] = Field(default_factory=list, max_length=20)
-    attributes: dict[str, ContextValue] = Field(default_factory=dict)
+    # SDK tool schemas must be closed objects.  The runtime still validates
+    # arbitrary bounded attributes in Python; native evaluator calls receive
+    # the declared fields and do not invent new context keys.
+    attributes: dict[str, ContextValue] = Field(
+        default_factory=dict, json_schema_extra={"additionalProperties": False}
+    )
 
     @model_validator(mode="after")
     def validate_bounds(self) -> DiagnosisContext:
@@ -472,6 +477,12 @@ class DiagnosisState(StrictModel):
     cancel_requested_at: datetime | None = None
     # Serialized typed input for resuming a deterministic graph step; never SDK messages.
     next_node_input: dict[str, Any] | None = None
+    # Native Agents SDK orchestration state.  These fields identify the active
+    # specialist between short application-level turns; they are not SDK
+    # messages and remain safe to persist in the business checkpoint.
+    active_agent: str | None = Field(default=None, max_length=128)
+    review_count: int = Field(default=0, ge=0, le=10)
+    reviewed_candidate_hash: str | None = Field(default=None, max_length=128)
     available_actions: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
@@ -688,6 +699,68 @@ class ClarificationInput(StrictModel):
 class RetryInput(StrictModel):
     evaluation: EvaluationResult
     previous_investigation: InvestigationResult | None = None
+
+
+class InvestigationBrief(StrictModel):
+    """Bounded handoff payload from triage to a category specialist."""
+
+    category: ProblemCategory
+    category_confidence: float = Field(ge=0, le=1)
+    normalized_summary: str = Field(min_length=1, max_length=8_000)
+    symptoms: list[str] = Field(default_factory=list, max_length=50)
+    impact: str | None = Field(default=None, max_length=4_000)
+    environment: str | None = Field(default=None, max_length=256)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    missing_information: list[str] = Field(default_factory=list, max_length=50)
+
+
+class NativeDiagnosisInput(StrictModel):
+    """The application-owned input for one native SDK turn.
+
+    The SDK Session stores the conversational transcript.  This model carries
+    the current business snapshot explicitly so a new process can resume a
+    turn without relying on Graph messages or an implicit model memory.
+    """
+
+    question: str = Field(min_length=1, max_length=12_000)
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    answers: list[UserAnswer] = Field(default_factory=list, max_length=100)
+    analysis: ProblemAnalysis | None = None
+    investigation: InvestigationResult | None = None
+    evaluation: EvaluationResult | None = None
+    clarification: ClarificationInput | None = None
+    active_agent: str | None = Field(default=None, max_length=128)
+    review_count: int = Field(default=0, ge=0, le=10)
+    max_review_count: int = Field(default=2, ge=1, le=10)
+    rubric_version: str = Field(default="rubric-v1", max_length=128)
+    passing_score: int = Field(default=75, ge=0, le=100)
+    min_evidence_traceability: int = Field(default=15, ge=0, le=25)
+    min_verification_executability: int = Field(default=15, ge=0, le=20)
+
+
+class DiagnosisTurnResult(StrictModel):
+    """Common structured output shared by triage and investigators."""
+
+    kind: Literal["completed", "needs_input"]
+    analysis: ProblemAnalysis | None = None
+    investigation: InvestigationResult | None = None
+    evaluation: EvaluationResult | None = None
+    report: DiagnosisReport | None = None
+    interaction_request: UserInteractionRequest | None = None
+    active_agent: str | None = Field(default=None, max_length=128)
+    review_count: int = Field(default=0, ge=0, le=10)
+
+    @model_validator(mode="after")
+    def validate_kind(self) -> DiagnosisTurnResult:
+        if self.kind == "needs_input":
+            if self.interaction_request is None:
+                raise ValueError("needs_input result requires interaction_request")
+            if self.report is not None:
+                raise ValueError("needs_input result cannot include a report")
+        elif self.report is None:
+            raise ValueError("completed result requires report")
+        return self
 
 
 class NodeExecutionPlan(StrictModel):

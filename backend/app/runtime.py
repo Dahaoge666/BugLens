@@ -1253,7 +1253,12 @@ class DiagnosisRuntime:
         )
 
     def _check_resume_compatibility(self, state: DiagnosisState) -> None:
-        session_id = f"{state.run_id}:{state.current_node.value}"
+        session_id_for_state = getattr(self.graph, "session_id_for_state", None)
+        session_id = (
+            session_id_for_state(state)
+            if callable(session_id_for_state)
+            else f"{state.run_id}:{state.current_node.value}"
+        )
         checker = getattr(self.graph.runner, "session_available", None)
         if callable(checker) and not checker(session_id):
             raise ValidationFailedError("SDK session is unavailable for Resume")
@@ -1263,10 +1268,18 @@ class DiagnosisRuntime:
             limit=1_000,
         )
         if executions:
-            node_policy = self._config_snapshot(state.config_snapshot_id).policy.node(
-                state.current_node.value
+            snapshot = self._config_snapshot(state.config_snapshot_id)
+            expected_version = getattr(
+                self.graph, "agent_definition_version_for_state", None
             )
-            expected = f"{node_policy.prompt_version}:agents-0.22"
+            expected = (
+                expected_version(state, snapshot)
+                if callable(expected_version)
+                else (
+                    f"{snapshot.policy.node(state.current_node.value).prompt_version}"
+                    ":agents-0.22"
+                )
+            )
             recorded = executions[-1].get("agent_definition_version")
             if recorded not in {None, "unknown", expected}:
                 raise ValidationFailedError(

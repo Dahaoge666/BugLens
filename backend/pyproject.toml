@@ -1,7 +1,7 @@
 [project]
 name = "buglens"
 version = "0.1.0"
-description = "A deterministic, evidence-bound diagnosis agent graph"
+description = "An evidence-bound diagnosis service using the OpenAI Agents SDK loop"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

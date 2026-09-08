@@ -1,6 +1,6 @@
 # BugLens
 
-BugLens 是一个基于 OpenAI Agents SDK 的可恢复故障定位项目。`backend/` 提供 CLI、HTTP/SSE API、Application Service、Runtime 和确定性 Agent Graph；`frontend/` 是独立的 React/Vite Web 客户端。两者只通过公开的 Command/Event 与 Admin JSON 契约通信。
+BugLens 是一个基于 OpenAI Agents SDK 的可恢复故障定位项目。`backend/` 提供 CLI、HTTP/SSE API、Application Service、Runtime 和原生 Agents SDK loop（保留兼容 Graph）；`frontend/` 是独立的 React/Vite Web 客户端。两者只通过公开的 Command/Event 与 Admin JSON 契约通信。
 
 ## 目录
 
