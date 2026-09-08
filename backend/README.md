@@ -4,11 +4,23 @@
 
 ## 安装
 
-uv 会按 `uv.lock` 创建和同步 Python 3.11+ 隔离环境：
+uv 会按 `uv.lock` 选择可用的 Python 3.11+ 解释器并创建、同步隔离环境：
 
 ```powershell
 uv sync --locked --extra dev --extra web
 ```
+
+只安装给原生运行管理器使用的生产后端环境时，执行：
+
+```powershell
+.\install.ps1
+```
+
+```bash
+bash ./install.sh
+```
+
+也可以传入自定义 runtime 目录。该脚本只同步后端，不安装 Node.js、不构建前端，也不启动进程；根目录的 `install.ps1`/`install.sh` 会负责按顺序调用后端和前端安装，再启动完整服务。
 
 安装 Web 依赖并启动 HTTP/SSE API：
 
@@ -36,6 +48,8 @@ CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。
 - `.env.example`：环境变量示例。
 
 固定的 Graph 路由、节点上限、评测阈值和节点 `max_turns` 来自版本化 profile，并在创建 run 时保存不可变配置快照。
+
+默认工具关闭且不需要审批。接入显式 `needs_approval=True` 的只读工具时，请设置 `BUGLENS_RUN_STATE_KEY`；它用于加密 SDK 恢复状态，必须在跨进程恢复审批的服务实例间一致。
 
 ## 文档
 

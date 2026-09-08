@@ -19,7 +19,7 @@ frontend/ ── HTTP JSON / HTTP Command + SSE Event ──> backend/
 
 ```json
 {
-  "protocol_version": "1",
+  "protocol_version": "2",
   "command_id": "cmd_123",
   "run_id": "diag_123",
   "expected_revision": 3,
@@ -34,7 +34,7 @@ frontend/ ── HTTP JSON / HTTP Command + SSE Event ──> backend/
 
 ```json
 {
-  "protocol_version": "1",
+  "protocol_version": "2",
   "command_id": "cmd_start_123",
   "run_id": "client_run_123",
   "command_type": "start_diagnosis",
@@ -49,9 +49,12 @@ frontend/ ── HTTP JSON / HTTP Command + SSE Event ──> backend/
 
 `question` 长度为 1–12,000，`evidence` 最多 100 项，`profile` 由后端选择和校验。后端会在进入 Agent 前脱敏输入。
 
-### 继续或取消
+### 继续、跳过、恢复或取消
 
 - `POST /v1/runs/{run_id}/commands`：提交 `submit_user_answers`，请求体包含 `request_id` 和 1–3 个 `answers`；答案必须引用当前 `input_required` 事件中的问题 ID。
+- `POST /v1/runs/{run_id}/commands`：提交 `skip_user_interaction`，请求体包含当前 `request_id` 和 `reason`；不伪造答案，运行以信息不可用继续。
+- `POST /v1/runs/{run_id}/commands`：提交 `resume_diagnosis`，只允许快照 `available_actions` 包含 `resume` 的运行。
+- `POST /v1/runs/{run_id}/commands`：`approve_tool` / `reject_tool` 处理已注册只读工具的 SDK 审批中断；必须携带当前 `request_id` 和 `expected_revision`。默认 profile 不暴露需要审批的工具。
 - `POST /v1/runs/{run_id}/cancel`：提交 `cancel_diagnosis`，请求体包含非空 `reason`。
 
 Command 使用 `command_id` 实现幂等。`expected_revision` 不匹配时后端拒绝变更并返回冲突，前端应重新获取 Run 快照后再让用户确认。
@@ -62,7 +65,7 @@ Command 使用 `command_id` 实现幂等。`expected_revision` 不匹配时后�
 
 ```text
 id: 4
-data: {"protocol_version":"1","event_id":"evt_123","run_id":"diag_123","sequence":4,"revision":3,"occurred_at":"2026-09-07T12:00:01Z","event_type":"node_started","node":"investigate"}
+data: {"protocol_version":"2","event_id":"evt_123","run_id":"diag_123","sequence":4,"revision":3,"occurred_at":"2026-09-07T12:00:01Z","event_type":"node_attempt_started","specversion":"1.0","id":"evt_123","source":"buglens","subject":"runs/diag_123","type":"com.buglens.node_attempt_started","runid":"diag_123","data":{}}
 
 ```
 
@@ -70,7 +73,7 @@ data: {"protocol_version":"1","event_id":"evt_123","run_id":"diag_123","sequence
 
 | 字段 | 约束 |
 | --- | --- |
-| `protocol_version` | 当前为字符串 `"1"` |
+| `protocol_version` | 新客户端使用字符串 `"2"`；服务端迁移窗口可读取 `"1"` |
 | `event_id` | 事件唯一标识，前端按它去重 |
 | `run_id` | 所属诊断运行 |
 | `sequence` | 从 1 开始递增，前端按它排序和去重 |
@@ -78,7 +81,7 @@ data: {"protocol_version":"1","event_id":"evt_123","run_id":"diag_123","sequence
 | `occurred_at` | UTC 时间 |
 | `event_type` | 事件类型及其专属字段 |
 
-当前事件类型为 `run_started`、`node_started`、`node_completed`、`input_required`、`run_waiting`、`run_completed`、`run_failed` 和 `run_canceled`。Graph 固定经过 `analyze`、`investigate`、`evaluate`、`summarize`；前端只展示事件，不自行推进节点。
+当前事件类型包括 `run_started`、`node_attempt_started`、`node_retry_scheduled`、`node_attempt_failed`、`node_completed`、`tool_call_started`、`tool_call_completed`、`tool_call_failed`、`tool_approval_required`、`tool_approval_resolved`、`input_required`、`input_skipped`、`run_waiting`、`run_resume_available`、`run_resumed`、`run_cancel_requested`、`user_input_submitted`、`run_completed`、`run_failed` 和 `run_canceled`。Graph 固定经过 `analyze`、`investigate`、`evaluate`、`summarize`；前端只展示事件，不自行推进节点。
 
 `input_required` 携带结构化 `request`，前端展示 `explanation`、`questions`、`answer_type` 和 `options`，提交答案时保留 `request_id`。`run_completed` 的 `outcome` 可能是 `confirmed` 或 `inconclusive`；`run_failed` 只表示基础设施或执行失败，不应被渲染成已确认根因。
 
@@ -89,7 +92,7 @@ data: {"protocol_version":"1","event_id":"evt_123","run_id":"diag_123","sequence
 - SSE 断线后，前端先读取快照，再使用最后一个已确认的 `sequence` 追赶事件；
 - 合法但没有新事件的追赶请求返回空的 200 SSE 流；Run 不存在返回 404。
 
-Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`revision` 和 `available_actions` 由后端决定。前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
+Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
 
 ## Admin JSON API
 
@@ -104,11 +107,13 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/config` | 当前非敏感配置 |
 | POST | `/v1/admin/config/validate` | 校验配置但不落盘 |
 | PUT/PATCH | `/v1/admin/config` | 按 revision 原子更新配置 |
-| GET | `/v1/admin/runs` | 分页查询运行记录 |
+| GET | `/v1/admin/runs` | 分页查询运行记录；损坏行会被跳过并通过 `degraded_count` 标记 |
 | GET | `/v1/admin/sessions` | 查询 Session 元数据 |
 | GET | `/v1/admin/runs/{run_id}/sessions` | 查询指定 Run 的 Session |
+| GET | `/v1/admin/runs/{run_id}/executions` | 查询节点尝试审计 |
+| GET | `/v1/admin/runs/{run_id}/tools` | 查询脱敏工具调用审计 |
 
-配置更新必须发送 `expected_revision`。后端返回 409 时，前端重新读取配置并显示差异；API key 等 secret 只允许写入或清除，永远不会在响应中返回原值。
+配置更新必须发送 `expected_revision`。后端返回 409 时，前端重新读取配置并显示差异；API key 等 secret 只允许写入或清除，永远不会在响应中返回原值。SDK 审批检查点只在后端使用 `BUGLENS_RUN_STATE_KEY` 加密保存，HTTP/SSE 不返回序列化 RunState。
 
 当设置 `BUGLENS_ADMIN_TOKEN` 时，Admin 请求必须发送 `Authorization: Bearer <token>`；未设置时按部署环境决定是否允许可信内网访问。独立域名部署必须配置精确的 `BUGLENS_CORS_ORIGIN`。
 

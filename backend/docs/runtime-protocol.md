@@ -16,17 +16,22 @@ SDK Session 不能决定 Graph 从哪里恢复，`DiagnosisState` 也不能保�
 
 Command 是请求，Event 是已提交事实。CLI 参数和 HTTP DTO 必须先转换为同一组严格 Pydantic 模型；Runtime 返回统一的 `AsyncIterator[AgentEvent]`。
 
-Command 公共字段为 `protocol_version`、`command_id`、`run_id`、`expected_revision` 和 `submitted_at`。当前命令：
+Command 公共字段为 `protocol_version`、`command_id`、`run_id`、`expected_revision` 和 `submitted_at`。当前新命令使用协议 v2；服务端在迁移窗口仍可解析 v1：
 
 - `StartDiagnosis`：问题、上下文、证据和 profile；固定策略参数不属于请求。
 - `SubmitUserAnswers`：当前 pending request ID 和结构化答案。
-- `CancelDiagnosis`：取消原因。
+- `SkipUserInteraction`：当前 pending request ID、跳过原因和信息不可用标记。
+- `ResumeDiagnosis`：从可恢复的 failed 检查点开启新的 retry cycle。
+- `CancelDiagnosis`：取消原因；活动节点期间只写入 run control。
+- `ApproveTool` / `RejectTool`：处理已注册只读工具的 SDK tool interruption；审批检查点由后端加密保存，客户端只看到脱敏的 pending 展示数据。
 
-Event 公共字段为 `protocol_version`、`event_id`、`run_id`、`sequence`、`revision` 和 `occurred_at`。当前持久化事件：
+Event v2 在上述字段之外提供 CloudEvents 1.0 envelope（`specversion`、`id`、`source`、`subject`、`type`、`time`、`datacontenttype`、`data`、`runid`）。当前持久化事件：
 
-- `RunStarted`、`NodeStarted`、`NodeCompleted`；
-- `InputRequired`、`RunWaiting`；
-- `RunCompleted`、`RunFailed`、`RunCanceled`。
+- `RunStarted`、`NodeAttemptStarted`、`NodeRetryScheduled`、`NodeAttemptFailed`、`NodeCompleted`；
+- `ToolCallStarted` / `ToolCallCompleted` / `ToolCallFailed`；
+- `ToolApprovalRequired` / `ToolApprovalResolved`；
+- `InputRequired`、`InputSkipped`、`RunWaiting`、`RunResumeAvailable`、`RunResumed`；
+- `RunCancelRequested`、`UserInputSubmitted`、`RunCompleted`、`RunFailed`、`RunCanceled`。
 
 瞬时进度事件可以丢失，不能参与恢复判断。持久化 Event 必须与对应状态转换在同一事务提交，且不得包含 SDK 对象、完整模型消息或 secret。
 
@@ -71,7 +76,11 @@ Runtime 在每一步前加载检查点和不可变配置快照，在每一步后
 3. 提交 `InputRequired` 和 `RunWaiting`；
 4. 结束当前短执行。
 
-回答 Command 必须匹配 run revision、request ID 和问题 ID。答案经严格校验与脱敏后，Runtime 清除 pending、增加澄清轮数，并把 `ClarificationInput` 交回同一来源节点和同一 SDK Session。
+回答或 Skip Command 必须匹配 run revision、request ID 和问题 ID。答案经严格校验与脱敏后，Runtime 清除 pending、增加来源节点澄清轮数，并把 `ClarificationInput` 交回同一来源节点和同一 SDK Session；Evaluate 来源的回答交回 Investigate。Skip 不伪造答案，而是以 `information_unavailable=true` 继续，并在总结限制中保留记录。
+
+工具审批 Command 必须匹配 run revision 和 pending approval request ID。Runtime 使用 SDK `RunState.from_string()` 恢复加密检查点，批准或拒绝全部待处理 interruption 后，复用原 Agent、节点 Session 和 active execution。决定提交与 `ToolApprovalResolved` Event 原子落库；节点完成后才标记 SDK 检查点 resolved。若进程在决定提交后退出，重复同一 `command_id` 会继续未完成的 SDK 状态，不重复创建节点执行记录。
+
+可恢复的节点/模型/工具错误在单个 retry cycle 内最多自动重试五次（首次调用加五次重试）。耗尽后状态为 `failed` 并提供 `resume`；Resume 沿用原节点 Session 和配置快照。Cancel 不强制终止活动外部调用，只在调用完成后的安全边界提交 `canceled`。
 
 断线恢复先读取 Run 快照，再从最后确认的 sequence 追赶 Event。事件读取是有界历史查询，返回当前已有事件后关闭；空结果不是失败。
 

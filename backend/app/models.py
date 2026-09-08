@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -17,7 +18,12 @@ class GraphContractError(ValueError):
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """Base model for all data that crosses a BugLens boundary."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+ContextValue = str | int | float | bool | None | list[str]
 
 
 class ProblemCategory(StrEnum):
@@ -55,11 +61,136 @@ class GraphNode(StrEnum):
     DONE = "done"
 
 
+NODE_NAMES = {node.value for node in GraphNode if node != GraphNode.DONE}
+CLARIFICATION_NODES = ("analyze", "investigate", "evaluate")
+
+
+class DiagnosisContext(StrictModel):
+    """Bounded, extensible business context passed to every graph node."""
+
+    environment: str | None = Field(default=None, max_length=256)
+    system: str | None = Field(default=None, max_length=256)
+    service: str | None = Field(default=None, max_length=256)
+    component: str | None = Field(default=None, max_length=256)
+    version: str | None = Field(default=None, max_length=256)
+    deployment_id: str | None = Field(default=None, max_length=256)
+    region: str | None = Field(default=None, max_length=256)
+    host: str | None = Field(default=None, max_length=256)
+    runtime: str | None = Field(default=None, max_length=256)
+    incident_started_at: str | None = Field(default=None, max_length=128)
+    timezone: str | None = Field(default=None, max_length=128)
+    expected_behavior: str | None = Field(default=None, max_length=4_000)
+    actual_behavior: str | None = Field(default=None, max_length=4_000)
+    impact_scope: str | None = Field(default=None, max_length=2_000)
+    constraints: list[str] = Field(default_factory=list, max_length=20)
+    attributes: dict[str, ContextValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> DiagnosisContext:
+        if len(self.attributes) > 50:
+            raise ValueError("context attributes cannot exceed 50 entries")
+        for key, value in self.attributes.items():
+            if not key or len(key) > 128:
+                raise ValueError("context attribute keys must be 1-128 characters")
+            if isinstance(value, list) and len(value) > 20:
+                raise ValueError("context attribute lists cannot exceed 20 items")
+            if isinstance(value, str) and len(value) > 4_000:
+                raise ValueError(
+                    "context attribute strings cannot exceed 4000 characters"
+                )
+        return self
+
+    @classmethod
+    def from_legacy(cls, value: dict[str, ContextValue] | None) -> DiagnosisContext:
+        raw = dict(value or {})
+        known = {
+            key: raw.pop(key)
+            for key in (
+                "environment",
+                "system",
+                "service",
+                "component",
+                "version",
+                "deployment_id",
+                "region",
+                "host",
+                "runtime",
+                "incident_started_at",
+                "timezone",
+                "expected_behavior",
+                "actual_behavior",
+                "impact_scope",
+                "constraints",
+            )
+            if key in raw
+        }
+        constraints = known.get("constraints", [])
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        known["constraints"] = constraints
+        known["attributes"] = raw
+        return cls.model_validate(known)
+
+    def as_legacy(self) -> dict[str, ContextValue]:
+        data = self.model_dump(exclude_none=True, mode="python")
+        attributes = data.pop("attributes", {})
+        if data.get("constraints") == []:
+            data.pop("constraints", None)
+        data.update(attributes)
+        return data
+
+
+class EvidenceRecord(StrictModel):
+    """A stable, bounded and sanitized reference to an observed fact."""
+
+    evidence_id: str = Field(
+        default_factory=lambda: f"ev_{uuid4().hex}", min_length=1, max_length=128
+    )
+    source: str = Field(default="user", min_length=1, max_length=64)
+    source_type: str = Field(default="", max_length=64)
+    source_reference: str | None = Field(default=None, max_length=512)
+    content: str = Field(min_length=1, max_length=12_000)
+    reference: str | None = Field(default=None, max_length=512)
+    content_hash: str = Field(default="", min_length=0, max_length=128)
+    storage_reference: str | None = Field(default=None, max_length=512)
+    observed_at: str | None = Field(default=None, max_length=128)
+    collected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    tool_execution_id: str | None = Field(default=None, max_length=128)
+    classification: str = Field(default="operational", max_length=64)
+    retention_policy: str | None = Field(default=None, max_length=128)
+    # The runtime still accepts a bounded metadata map.  Mark it closed in the
+    # JSON Schema so Agents SDK strict structured-output validation does not
+    # mistake this deliberately bounded extension point for an unbounded object.
+    metadata: dict[str, ContextValue] = Field(
+        default_factory=dict, json_schema_extra={"additionalProperties": False}
+    )
+
+    @model_validator(mode="after")
+    def normalize_identity(self) -> EvidenceRecord:
+        source_type = self.source_type or self.source
+        source_reference = self.source_reference or self.reference
+        content_hash = (
+            self.content_hash
+            or hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        )
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "source_reference", source_reference)
+        object.__setattr__(self, "content_hash", content_hash)
+        return self
+
+
+# The short name remains part of the original public API.
+Evidence = EvidenceRecord
+
+
 class FailureRecord(StrictModel):
     code: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=1_000)
     node: GraphNode | None = None
     retryable: bool = False
+    retry_cycle: int = Field(default=0, ge=0)
+    retry_index: int = Field(default=0, ge=0)
+    resume_available: bool = False
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -73,13 +204,10 @@ class PendingApproval(StrictModel):
     request_id: str = Field(min_length=1, max_length=128)
     tool_name: str = Field(min_length=1, max_length=128)
     explanation: str = Field(min_length=1, max_length=2_000)
-
-
-class Evidence(StrictModel):
-    source: str = Field(min_length=1, max_length=64)
-    content: str = Field(min_length=1, max_length=12_000)
-    reference: str | None = Field(default=None, max_length=512)
-    observed_at: str | None = Field(default=None, max_length=128)
+    # The SDK RunState is the authoritative source for the exact interruption.
+    # These bounded fields are only the public display/command correlation data.
+    tool_call_ids: list[str] = Field(default_factory=list, max_length=20)
+    arguments: dict[str, ContextValue] = Field(default_factory=dict)
 
 
 class ClarificationQuestion(StrictModel):
@@ -93,24 +221,39 @@ class ClarificationQuestion(StrictModel):
     options: list[str] = Field(default_factory=list, max_length=20)
 
 
+class UserAnswer(StrictModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    question_id: str = Field(min_length=1, max_length=128)
+    answer: str = Field(default="", max_length=12_000)
+    attachments: list[EvidenceRecord] = Field(default_factory=list, max_length=10)
+    source_node: Literal["analyze", "investigate", "evaluate"] | None = None
+    information_unavailable: bool = False
+
+
 class UserInteractionRequest(StrictModel):
     request_id: str = Field(min_length=1, max_length=128)
-    source_node: Literal["analyze", "investigate"]
+    source_node: Literal["analyze", "investigate", "evaluate"]
     resume_node: Literal["analyze", "investigate"]
     reason: Literal[
         "missing_problem_context",
         "insufficient_evidence",
         "tool_unavailable",
         "tool_failed",
+        "user_explanation_required",
+        "no_progress",
         "ambiguous_investigation_direction",
     ]
     explanation: str = Field(min_length=1, max_length=4_000)
     questions: list[ClarificationQuestion] = Field(min_length=1, max_length=3)
 
     def validate_node(self, node: str) -> None:
-        if self.source_node != node or self.resume_node != node:
+        if self.source_node != node:
+            raise GraphContractError("Interaction request source node does not match")
+        if self.source_node == "evaluate" and self.resume_node != "investigate":
+            raise GraphContractError("Evaluate clarification must resume investigate")
+        if self.source_node != "evaluate" and self.resume_node != self.source_node:
             raise GraphContractError(
-                "Interaction request must be resumed by its source node"
+                "Analyze and Investigate clarification must resume their source node"
             )
         if len({q.id for q in self.questions}) != len(self.questions):
             raise GraphContractError("Clarification question IDs must be unique")
@@ -134,7 +277,7 @@ class UserInteractionRequest(StrictModel):
             if question and question.answer_type == "multi_select":
                 try:
                     selected = json.loads(answer.answer)
-                except ValueError as exc:
+                except (TypeError, ValueError) as exc:
                     raise GraphContractError(
                         "Multiple selections must be a JSON array"
                     ) from exc
@@ -157,44 +300,81 @@ class UserInteractionRequest(StrictModel):
             )
 
 
-class UserAnswer(StrictModel):
+class SkippedInteraction(StrictModel):
     request_id: str = Field(min_length=1, max_length=128)
-    question_id: str = Field(min_length=1, max_length=128)
-    answer: str = Field(default="", max_length=12_000)
-    attachments: list[Evidence] = Field(default_factory=list, max_length=10)
+    source_node: Literal["analyze", "investigate", "evaluate"]
+    question_ids: list[str] = Field(min_length=1, max_length=3)
+    reason: str = Field(default="user_skipped", min_length=1, max_length=512)
+    skipped_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ProblemAnalysis(StrictModel):
     category: ProblemCategory
     category_confidence: float = Field(ge=0, le=1)
-    summary: str
-    symptoms: list[str] = Field(default_factory=list)
-    impact: str | None = None
-    time_window: str | None = None
-    environment: str | None = None
-    extracted_evidence: list[Evidence] = Field(default_factory=list)
-    missing_information: list[str] = Field(default_factory=list)
+    summary: str = Field(min_length=1, max_length=8_000)
+    symptoms: list[str] = Field(default_factory=list, max_length=50)
+    impact: str | None = Field(default=None, max_length=4_000)
+    time_window: str | None = Field(default=None, max_length=512)
+    environment: str | None = Field(default=None, max_length=256)
+    extracted_evidence: list[EvidenceRecord] = Field(
+        default_factory=list, max_length=100
+    )
+    missing_information: list[str] = Field(default_factory=list, max_length=50)
     interaction_request: UserInteractionRequest | None = None
 
 
 class RootCauseHypothesis(StrictModel):
     rank: int = Field(ge=1, le=3)
-    cause: str
-    rationale: str
-    supporting_evidence: list[str] = Field(min_length=1)
-    contradicting_evidence: list[str] = Field(default_factory=list)
+    cause: str = Field(min_length=1, max_length=4_000)
+    rationale: str = Field(min_length=1, max_length=8_000)
+    supporting_evidence: list[str] = Field(min_length=1, max_length=20)
+    contradicting_evidence: list[str] = Field(default_factory=list, max_length=20)
     confidence: float = Field(ge=0, le=1)
-    verification_steps: list[str] = Field(min_length=1)
-    remediation_direction: str | None = None
+    verification_steps: list[str] = Field(min_length=1, max_length=20)
+    remediation_direction: str | None = Field(default=None, max_length=4_000)
+
+
+class ProgressDelta(StrictModel):
+    """Machine-checkable progress produced by an investigation cycle."""
+
+    new_evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    resolved_gap_ids: list[str] = Field(default_factory=list, max_length=50)
+    changed_hypothesis_ids: list[str] = Field(default_factory=list, max_length=50)
+    discarded_hypothesis_ids: list[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> ProgressDelta:
+        for field_name in (
+            "new_evidence_ids",
+            "resolved_gap_ids",
+            "changed_hypothesis_ids",
+            "discarded_hypothesis_ids",
+        ):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} cannot contain blank IDs")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} cannot contain duplicate IDs")
+        return self
+
+    @property
+    def has_ids(self) -> bool:
+        return bool(
+            self.new_evidence_ids
+            or self.resolved_gap_ids
+            or self.changed_hypothesis_ids
+            or self.discarded_hypothesis_ids
+        )
 
 
 class InvestigationResult(StrictModel):
-    investigation_summary: str
+    investigation_summary: str = Field(min_length=1, max_length=8_000)
     hypotheses: list[RootCauseHypothesis] = Field(default_factory=list, max_length=3)
-    primary_conclusion: str | None = None
-    evidence_gaps: list[str] = Field(default_factory=list)
-    next_data_to_collect: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
+    primary_conclusion: str | None = Field(default=None, max_length=4_000)
+    evidence_gaps: list[str] = Field(default_factory=list, max_length=50)
+    next_data_to_collect: list[str] = Field(default_factory=list, max_length=50)
+    limitations: list[str] = Field(default_factory=list, max_length=50)
+    progress_delta: ProgressDelta = Field(default_factory=ProgressDelta)
     interaction_request: UserInteractionRequest | None = None
 
 
@@ -211,9 +391,10 @@ class EvaluationResult(StrictModel):
     passed: bool
     score: int = Field(ge=0, le=100)
     criteria_scores: CriteriaScores
-    strengths: list[str] = Field(default_factory=list)
-    deficiencies: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list, max_length=50)
+    deficiencies: list[str] = Field(default_factory=list, max_length=50)
     retry_guidance: list[str] = Field(default_factory=list, max_length=3)
+    interaction_request: UserInteractionRequest | None = None
 
     def enforce_rubric(
         self,
@@ -240,26 +421,33 @@ class EvaluationResult(StrictModel):
 
 
 class DiagnosisReport(StrictModel):
-    executive_summary: str
-    primary_conclusion: str | None = None
-    status_explanation: str
-    next_actions: list[str] = Field(default_factory=list)
+    executive_summary: str = Field(min_length=1, max_length=8_000)
+    primary_conclusion: str | None = Field(default=None, max_length=4_000)
+    status_explanation: str = Field(min_length=1, max_length=8_000)
+    next_actions: list[str] = Field(default_factory=list, max_length=50)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    limitations: list[str] = Field(default_factory=list, max_length=50)
 
 
 class DiagnosisState(StrictModel):
-    run_id: str
-    user_question: str
-    user_context: dict[str, str | list[str]] = Field(default_factory=dict)
-    source_evidence: list[Evidence] = Field(default_factory=list)
+    run_id: str = Field(min_length=1, max_length=128)
+    user_question: str = Field(min_length=1, max_length=12_000)
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    # Compatibility field for v1 callers; context is canonical in new code.
+    user_context: dict[str, ContextValue] = Field(default_factory=dict)
+    source_evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
     analysis: ProblemAnalysis | None = None
     investigation: InvestigationResult | None = None
     evaluation: EvaluationResult | None = None
     report: DiagnosisReport | None = None
-    answers: list[UserAnswer] = Field(default_factory=list)
-    clarification_round: int = 0
+    answers: list[UserAnswer] = Field(default_factory=list, max_length=100)
+    clarification_rounds: dict[str, int] = Field(default_factory=dict)
+    clarification_round: int = Field(default=0, ge=0)
     max_clarification_rounds: int = Field(default=2, ge=0, le=10)
-    attempt: int = 0
-    max_attempts: int = Field(default=2, ge=1, le=2)
+    attempt: int = Field(default=0, ge=0, le=10)
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    retry_cycle: int = Field(default=0, ge=0)
+    retry_index: int = Field(default=0, ge=0)
     lifecycle_status: LifecycleStatus = LifecycleStatus.CREATED
     outcome: DiagnosisOutcome | None = None
     current_node: GraphNode = GraphNode.ANALYZE
@@ -267,24 +455,57 @@ class DiagnosisState(StrictModel):
     pending_tool: PendingToolRequest | None = None
     pending_approval: PendingApproval | None = None
     revision: int = Field(default=0, ge=0)
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: int = Field(default=2, ge=1)
     config_snapshot_id: str = Field(default="pending", min_length=1, max_length=128)
-    config_profile: str = "default"
-    config_version: str = "default-v1"
+    config_profile: str = Field(default="default", min_length=1, max_length=128)
+    config_version: str = Field(default="default-v1", min_length=1, max_length=128)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_error: FailureRecord | None = None
-    # This is a serialized, typed node input used only to resume a deterministic
-    # graph step. It never contains SDK messages.
-    next_node_input: dict[str, object] | None = None
+    resume_available: bool = False
+    active_execution_id: str | None = Field(default=None, max_length=128)
+    skipped_interactions: list[SkippedInteraction] = Field(
+        default_factory=list, max_length=100
+    )
+    progress_deltas: list[ProgressDelta] = Field(default_factory=list, max_length=20)
+    no_progress_cycles: int = Field(default=0, ge=0, le=20)
+    cancel_requested_at: datetime | None = None
+    # Serialized typed input for resuming a deterministic graph step; never SDK messages.
+    next_node_input: dict[str, Any] | None = None
+    available_actions: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_lifecycle_invariants(self) -> DiagnosisState:
-        pending = [
-            self.pending_interaction,
-            self.pending_tool,
-            self.pending_approval,
-        ]
+        context_values = self.context.model_dump(
+            exclude_none=True, exclude_defaults=True
+        )
+        if not context_values and self.user_context:
+            object.__setattr__(
+                self, "context", DiagnosisContext.from_legacy(self.user_context)
+            )
+        elif not self.user_context and context_values:
+            object.__setattr__(self, "user_context", self.context.as_legacy())
+
+        rounds = {
+            node: int(self.clarification_rounds.get(node, 0))
+            for node in CLARIFICATION_NODES
+        }
+        if not any(rounds.values()) and self.clarification_round:
+            node = self.current_node.value
+            if node not in rounds:
+                node = "analyze"
+            rounds[node] = self.clarification_round
+        if any(
+            value < 0 or value > self.max_clarification_rounds
+            for value in rounds.values()
+        ):
+            raise ValueError(
+                "clarification rounds exceed the configured per-node budget"
+            )
+        object.__setattr__(self, "clarification_rounds", rounds)
+        object.__setattr__(self, "clarification_round", sum(rounds.values()))
+
+        pending = [self.pending_interaction, self.pending_tool, self.pending_approval]
         if sum(item is not None for item in pending) > 1:
             raise ValueError("at most one pending interaction/tool/approval is allowed")
         waiting_map = {
@@ -306,12 +527,34 @@ class DiagnosisState(StrictModel):
             raise ValueError("running and terminal states cannot have pending work")
         if self.lifecycle_status == LifecycleStatus.COMPLETED and self.outcome is None:
             raise ValueError("completed state requires a diagnosis outcome")
+        if self.lifecycle_status == LifecycleStatus.FAILED:
+            if self.last_error is None:
+                raise ValueError("failed state requires a failure record")
+            if self.resume_available and not self.last_error.retryable:
+                raise ValueError("only retryable failures can offer Resume")
+        if (
+            self.lifecycle_status == LifecycleStatus.CANCELED
+            and self.outcome is not None
+        ):
+            raise ValueError("canceled state cannot have a diagnosis outcome")
         if self.current_node == GraphNode.DONE and self.lifecycle_status not in {
             LifecycleStatus.COMPLETED,
             LifecycleStatus.FAILED,
             LifecycleStatus.CANCELED,
         }:
             raise ValueError("done cursor is only valid for a terminal state")
+
+        if self.lifecycle_status == LifecycleStatus.WAITING_USER:
+            actions = ["submit_answers", "skip_input", "cancel"]
+        elif self.lifecycle_status == LifecycleStatus.WAITING_APPROVAL:
+            actions = ["approve", "reject", "cancel"]
+        elif self.lifecycle_status == LifecycleStatus.FAILED and self.resume_available:
+            actions = ["resume"]
+        elif self.lifecycle_status == LifecycleStatus.RUNNING:
+            actions = ["cancel"]
+        else:
+            actions = []
+        object.__setattr__(self, "available_actions", actions)
         return self
 
     @property
@@ -325,12 +568,19 @@ class DiagnosisState(StrictModel):
             )
         return self.lifecycle_status.value
 
+    @property
+    def evidence(self) -> list[EvidenceRecord]:
+        return self.source_evidence
+
+    def clarification_count(self, node: str) -> int:
+        return self.clarification_rounds.get(node, 0)
+
     @classmethod
     def create(
         cls,
         question: str,
-        context: dict[str, str | list[str]],
-        evidence: list[Evidence],
+        context: dict[str, ContextValue] | DiagnosisContext,
+        evidence: list[EvidenceRecord],
         max_attempts: int = 2,
         max_clarification_rounds: int = 2,
         *,
@@ -339,55 +589,144 @@ class DiagnosisState(StrictModel):
         config_version: str = "default-v1",
     ) -> DiagnosisState:
         """Validate and redact all user data before it enters graph state."""
-        return cls.model_validate(
-            sanitize_data(
-                {
-                    "run_id": f"diag_{uuid4().hex}",
-                    "user_question": question,
-                    "user_context": context,
-                    "source_evidence": [item.model_dump() for item in evidence],
-                    "max_attempts": max_attempts,
-                    "max_clarification_rounds": max_clarification_rounds,
-                    "config_snapshot_id": config_snapshot_id,
-                    "config_profile": profile,
-                    "config_version": config_version,
-                }
-            )
+        raw_context = (
+            context.model_dump(mode="python")
+            if isinstance(context, DiagnosisContext)
+            else context
         )
+        clean_context = sanitize_data(raw_context)
+        if isinstance(context, DiagnosisContext):
+            canonical_context = DiagnosisContext.model_validate(clean_context)
+            clean_context = canonical_context.as_legacy()
+        else:
+            canonical_context = DiagnosisContext.from_legacy(clean_context)
+        clean_evidence: list[dict[str, Any]] = []
+        for item in evidence:
+            record = EvidenceRecord.model_validate(item)
+            record_data = dict(sanitize_data(record.model_dump(mode="python")))
+            # The hash must describe the stored, redacted content rather than
+            # an unsanitized value supplied by a caller.
+            record_data["content_hash"] = ""
+            clean_evidence.append(
+                EvidenceRecord.model_validate(record_data).model_dump(mode="python")
+            )
+        clean = sanitize_data(
+            {
+                "run_id": f"diag_{uuid4().hex}",
+                "user_question": question,
+                "context": canonical_context.model_dump(mode="python"),
+                "user_context": clean_context,
+                "source_evidence": clean_evidence,
+                "max_attempts": max_attempts,
+                "max_clarification_rounds": max_clarification_rounds,
+                "config_snapshot_id": config_snapshot_id,
+                "config_profile": profile,
+                "config_version": config_version,
+                "schema_version": 2,
+            }
+        )
+        return cls.model_validate(clean)
 
 
 class AnalyzeInput(StrictModel):
-    question: str
-    evidence: list[Evidence]
-    environment_hint: str | None = None
-    clarification_answers: list[UserAnswer] = Field(default_factory=list)
+    question: str = Field(min_length=1, max_length=12_000)
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    environment_hint: str | None = Field(default=None, max_length=256)
+    clarification_answers: list[UserAnswer] = Field(default_factory=list, max_length=20)
 
 
 class InvestigationInput(StrictModel):
     analysis: ProblemAnalysis
-    evidence: list[Evidence]
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
     previous_evaluation: EvaluationResult | None = None
-    clarification_answers: list[UserAnswer] = Field(default_factory=list)
-    prompt_config_version: str
+    previous_investigation: InvestigationResult | None = None
+    clarification_answers: list[UserAnswer] = Field(default_factory=list, max_length=20)
+    prompt_config_version: str = Field(default="default-v1", max_length=128)
+    investigation_attempt: int = Field(default=1, ge=1)
 
 
 class EvaluationInput(StrictModel):
     analysis: ProblemAnalysis
     investigation: InvestigationResult
-    rubric_version: str
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    previous_evaluation: EvaluationResult | None = None
+    progress_history: list[ProgressDelta] = Field(default_factory=list, max_length=20)
+    rubric_version: str = Field(default="rubric-v1", max_length=128)
 
 
 class SummaryInput(StrictModel):
     analysis: ProblemAnalysis
     investigation: InvestigationResult | None = None
     evaluation: EvaluationResult | None = None
+    context: DiagnosisContext = Field(default_factory=DiagnosisContext)
+    evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    skipped_interactions: list[SkippedInteraction] = Field(
+        default_factory=list, max_length=100
+    )
     status: Literal["completed", "inconclusive"]
-    attempts: int
+    attempts: int = Field(ge=0)
+    limitations: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ClarificationInput(StrictModel):
-    answers: list[UserAnswer] = Field(min_length=1, max_length=3)
+    answers: list[UserAnswer] = Field(default_factory=list, max_length=3)
+    information_unavailable: bool = False
+    skipped_question_ids: list[str] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def require_answer_or_skip(self) -> ClarificationInput:
+        if not self.answers and not self.information_unavailable:
+            raise ValueError(
+                "clarification input requires answers or information_unavailable"
+            )
+        return self
 
 
 class RetryInput(StrictModel):
     evaluation: EvaluationResult
+    previous_investigation: InvestigationResult | None = None
+
+
+class NodeExecutionPlan(StrictModel):
+    """Pure, serialization-safe description of one external node call."""
+
+    execution_id: str = Field(default_factory=lambda: f"nexec_{uuid4().hex}")
+    node: Literal["analyze", "investigate", "evaluate", "summarize"]
+    input_model: Any
+    session_id: str = Field(min_length=1, max_length=256)
+    investigation_attempt: int = Field(default=0, ge=0)
+    clarification_round: int = Field(default=0, ge=0)
+    retry_cycle: int = Field(default=0, ge=0)
+    retry_index: int = Field(default=0, ge=0)
+    config_snapshot_id: str = Field(min_length=1, max_length=128)
+    config_version: str = Field(min_length=1, max_length=128)
+    prompt_config_version: str = Field(min_length=1, max_length=128)
+    agent_definition_version: str = Field(default="unknown", max_length=128)
+
+
+class ExecutionFailure(StrictModel):
+    code: str = Field(min_length=1, max_length=64)
+    message: str = Field(min_length=1, max_length=1_000)
+    retryable: bool = False
+    # False means an inner SDK/runner retry budget was already consumed. The
+    # outer Runtime may still expose Resume when retryable is true.
+    auto_retry: bool = True
+
+
+class GraphTransition(StrictModel):
+    node: Literal["analyze", "investigate", "evaluate", "summarize"]
+    next_node: GraphNode
+    lifecycle_status: LifecycleStatus
+    outcome: DiagnosisOutcome | None = None
+    interaction_request: UserInteractionRequest | None = None
+    error: ExecutionFailure | None = None
+
+
+def replace_state(state: DiagnosisState, **updates: Any) -> DiagnosisState:
+    """Create and fully validate an immutable-style state transition."""
+    data = state.model_dump(mode="python")
+    data.update(updates)
+    return DiagnosisState.model_validate(data)

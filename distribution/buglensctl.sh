@@ -7,4 +7,4 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-exec uv run --python 3.11 "$distribution_root/buglensctl.py" "$@"
+exec uv run "$distribution_root/buglensctl.py" "$@"

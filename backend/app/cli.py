@@ -13,7 +13,13 @@ from .bootstrap import build_local_client
 from .client import AgentClient, RemoteAgentClient
 from .config import Settings
 from .models import Evidence, LifecycleStatus, UserAnswer, UserInteractionRequest
-from .protocol.commands import CancelDiagnosis, StartDiagnosis, SubmitUserAnswers
+from .protocol.commands import (
+    CancelDiagnosis,
+    ResumeDiagnosis,
+    SkipUserInteraction,
+    StartDiagnosis,
+    SubmitUserAnswers,
+)
 from .protocol.events import InputRequired, RunWaiting
 
 
@@ -89,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--remote", help="remote BugLens base URL")
     parser.add_argument("--resume", metavar="RUN_ID", help="resume a waiting run")
+    parser.add_argument("--skip", metavar="RUN_ID", help="skip pending clarification")
     parser.add_argument("--status", metavar="RUN_ID", help="show a run")
     parser.add_argument("--cancel", metavar="RUN_ID", help="cancel a run")
     parser.add_argument(
@@ -151,23 +158,52 @@ async def run_cli(
     settings = _settings(args)
     client, store, runner = await _client(settings)
     try:
-        run_id = args.resume or args.status or args.cancel
+        run_id = args.resume or args.status or args.cancel or args.skip
         if args.status:
             state = await client.get_run(args.status)
         elif args.cancel:
+            state = await client.get_run(args.cancel)
+            if "cancel" not in state.available_actions:
+                raise ValueError("run cannot be cancelled in its current state")
             async for _ in client.send(
                 CancelDiagnosis(
                     run_id=args.cancel,
-                    expected_revision=(await client.get_run(args.cancel)).revision,
+                    expected_revision=state.revision,
                     reason="cancelled from CLI",
                 )
             ):
                 pass
             state = await client.get_run(args.cancel)
+        elif args.skip:
+            state = await client.get_run(args.skip)
+            if (
+                "skip_input" not in state.available_actions
+                or not state.pending_interaction
+            ):
+                raise ValueError("run cannot skip input in its current state")
+            async for _ in client.send(
+                SkipUserInteraction(
+                    run_id=args.skip,
+                    expected_revision=state.revision,
+                    request_id=state.pending_interaction.request_id,
+                    reason="skipped from CLI",
+                )
+            ):
+                pass
+            state = await client.get_run(args.skip)
         elif args.resume:
             state = await client.get_run(args.resume)
-            if (
-                state.lifecycle_status == LifecycleStatus.WAITING_USER
+            if "resume" in state.available_actions:
+                async for _ in client.send(
+                    ResumeDiagnosis(
+                        run_id=args.resume,
+                        expected_revision=state.revision,
+                    )
+                ):
+                    pass
+                state = await client.get_run(args.resume)
+            elif (
+                "submit_answers" in state.available_actions
                 and state.pending_interaction
             ):
                 await _send_interactively(
@@ -183,6 +219,8 @@ async def run_cli(
                     clarifier or ConsoleClarifier(),
                 )
                 state = await client.get_run(args.resume)
+            else:
+                raise ValueError("run has no resumable action")
         else:
             context = _key_values(args.context, "--context")
             if args.tenant:

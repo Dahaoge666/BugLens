@@ -14,7 +14,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   throw "uv is required. Install it from https://docs.astral.sh/uv/."
 }
 
-$arguments = @("run", "--python", "3.11", $controller, $Command)
+$arguments = @("run", $controller, $Command)
 if ($PSBoundParameters.ContainsKey("Mode") -or $Command -eq "install") {
   $arguments += @("--mode", $Mode)
 }

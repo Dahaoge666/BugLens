@@ -15,7 +15,8 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-  "openai-agents>=0.14,<1",
+  "openai-agents>=0.22,<0.23",
+  "cryptography>=42,<47",
   "pydantic>=2.8,<3",
   "PyYAML>=6,<7",
 ]

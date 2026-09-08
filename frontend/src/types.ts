@@ -10,12 +10,21 @@ export type LifecycleStatus =
 
 export type Outcome = 'confirmed' | 'inconclusive'
 export type NodeName = 'analyze' | 'investigate' | 'evaluate' | 'summarize'
+export type ContextValue = string | number | boolean | string[] | null
 
 export type Evidence = {
+  evidence_id?: string
   source: string
+  source_type?: string
   content: string
   reference?: string | null
+  source_reference?: string | null
+  content_hash?: string
+  storage_reference?: string | null
   observed_at?: string | null
+  collected_at?: string
+  tool_execution_id?: string | null
+  metadata?: Record<string, unknown>
 }
 
 export type Hypothesis = {
@@ -40,17 +49,26 @@ export type ClarificationQuestion = {
 
 export type InteractionRequest = {
   request_id: string
-  source_node: 'analyze' | 'investigate'
+  source_node: 'analyze' | 'investigate' | 'evaluate'
   resume_node: 'analyze' | 'investigate'
   reason: string
   explanation: string
   questions: ClarificationQuestion[]
 }
 
+export type PendingApproval = {
+  request_id: string
+  tool_name: string
+  explanation: string
+  tool_call_ids: string[]
+  arguments: Record<string, ContextValue>
+}
+
 export type Run = {
   run_id: string
   user_question: string
-  user_context: Record<string, string | string[]>
+  user_context: Record<string, ContextValue>
+  context?: Record<string, ContextValue>
   source_evidence: Evidence[]
   analysis: {
     category: string
@@ -61,6 +79,7 @@ export type Run = {
     time_window?: string | null
     environment?: string | null
     missing_information: string[]
+    extracted_evidence?: Evidence[]
   } | null
   investigation: {
     investigation_summary: string
@@ -68,6 +87,7 @@ export type Run = {
     evidence_gaps: string[]
     next_data_to_collect: string[]
     limitations: string[]
+    progress_delta?: ProgressDelta
   } | null
   evaluation: {
     passed: boolean
@@ -76,30 +96,58 @@ export type Run = {
     strengths: string[]
     deficiencies: string[]
     retry_guidance: string[]
+    interaction_request?: InteractionRequest | null
   } | null
   report: {
     executive_summary: string
     primary_conclusion?: string | null
     status_explanation: string
     next_actions: string[]
+    evidence_ids?: string[]
+    limitations?: string[]
   } | null
   lifecycle_status: LifecycleStatus
   outcome?: Outcome | null
   current_node: NodeName | 'done'
   pending_interaction?: InteractionRequest | null
+  pending_approval?: PendingApproval | null
   revision: number
   attempt: number
   clarification_round: number
+  clarification_rounds?: Record<string, number>
+  retry_cycle?: number
+  retry_index?: number
+  resume_available?: boolean
+  active_execution_id?: string | null
+  cancel_requested_at?: string | null
+  available_actions?: string[]
   created_at: string
   updated_at: string
 }
 
+export type ProgressDelta = {
+  new_evidence_ids: string[]
+  resolved_gap_ids: string[]
+  changed_hypothesis_ids: string[]
+  discarded_hypothesis_ids: string[]
+}
+
 export type DomainEvent = {
+  protocol_version?: string
   event_id: string
+  id?: string
+  run_id?: string
+  runid?: string
   event_type: string
+  type?: string
+  specversion?: string
+  source?: string
+  subject?: string
   sequence: number
   revision: number
   occurred_at: string
+  time?: string
+  data?: Record<string, unknown>
   node?: NodeName
   next_node?: string
   summary?: string
@@ -118,7 +166,15 @@ export type AdminRun = {
   config_snapshot_id: string
   attempt: number
   clarification_round: number
+  clarification_rounds?: Record<string, number>
+  retry_cycle?: number
+  retry_index?: number
+  resume_available?: boolean
+  active_execution_id?: string | null
+  available_actions?: string[]
+  cancel_requested?: boolean
   pending_input: boolean
+  pending_approval?: boolean
   created_at: string
   updated_at: string
   last_error: string | null

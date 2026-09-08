@@ -1,22 +1,28 @@
 # TODO
 
-测试与可观测性相关的补遗。来源：2026-09-07 的真实模型端到端测试记录。核心修复（changelog 0001 的 #1–#8）已落地，以下为尚未覆盖的测试与可观测性增强项。
+本轮遗留项已完成。核心修复（changelog 0001 的 #1–#8）、生命周期实现、只读工具审批恢复和发布前验证均已落地；后续新增事项再在此记录。
 
 ## 测试
 
-- [ ] **兼容网关契约测试**：当前单测用 `FakeRunner`，不覆盖流式 / `response_format` / JSON coercion 的真实路径。增加一个基于本地 fake OpenAI server（或 `MockOpenAIClient`）的集成测试，锁定：自定义 `OPENAI_BASE_URL` 时走 `chat_completions` + 流式、`response_format` 不被强制时仍能解析结构化输出、coercion 行为稳定。
-- [ ] **`_schema_hint` / `_install_json_coercion` 单测**：
+- [x] **兼容网关契约测试**：新增基于 `httpx.MockTransport` 的真实 Agents SDK 路径测试，覆盖自定义端点的 Chat Completions、流式请求、网关忽略 `response_format` 时的结构化输出解析和 JSON coercion。
+- [x] **`_schema_hint` / `_install_json_coercion` 单测**：
   - coercion 表驱动：` ```json{...}``` `、首尾带解释文本、合法 JSON 不被破坏、无 JSON 时安全降级。
   - `_schema_hint` 对四个 `output_type` 均生成非空 JSON Schema 片段且包含 `properties`。
   - 幂等性：多次导入 `app.agents` 不会重复包装 `validate_json`。
-- [ ] **`streaming` 开关单测**：`OpenAINodeRunner(streaming=True)` 使用 `Runner.run_streamed`，`streaming=False` 使用 `Runner.run`（既有 `test_sdk_runner_uses_same_session_per_node_and_separate_node_sessions` 等用例需保持绿）。
-- [ ] **多模型解耦路径单测**：`NodeRuntimeContext.model_config` 携带 `ModelConfig` 时，`_model_instance` 构造的 `OpenAIChatCompletionsModel` 绑定了对应的 `base_url/api_key/timeout`，且按 `(model, base_url, timeout, api_key)` 缓存复用；`model_config=None` 时退回裸名 + 全局客户端；per-model `streaming` 覆盖 `default_streaming`。
-- [ ] **admin API key 脱敏 / 回填单测**：`AdminApplicationService.config()` 对 `models.*.api_key` 做脱敏；`apply_config` 收到空或含 `****` 的 api_key 时回填原值，收到新值时覆盖。
+- [x] **`streaming` 开关单测**：锁定 `Runner.run_streamed` / `Runner.run` 的分流行为，并保留 SDK Session 回归覆盖。
+- [x] **多模型解耦路径单测**：覆盖专用 `OpenAIChatCompletionsModel` 的端点、凭据、超时、缓存复用和 per-model streaming 覆盖。
+- [x] **admin API key 脱敏 / 回填单测**：覆盖公开响应脱敏、空/掩码值回填和新值覆盖。
 
 ## 后端健壮性
 
-- [ ] **列表端点不应因单个损坏 run 而 400**：当 `GET /v1/admin/runs` 或 `/sessions` 序列化列表时，若某条 `DiagnosisState` 违反校验（如 “running and terminal states cannot have pending work”），当前会抛 `validation_failed` 导致整个列表返回 400，进而连累前端的 `config` 请求（旧版 `Promise.all`）。应改为跳过/标记不可序列化的行并在响应中降级，而非让单个坏行 fail 整个列表。根因是一次测试写入了损坏的 run；更长期的修复是状态机本身不应允许持久化这种非法状态。
+- [x] **列表端点不应因单个损坏 run 而 400**：列表序列化现在跳过损坏行并返回 `degraded_count`，不会因单条非法状态拖垮 Admin API；同时保留状态机校验和回归测试。
 
 ## 可观测性
 
-- [ ] **`reasoning_content` 纳入可追溯性**：网关返回的思维链被 SDK 放入 `ResponseReasoningItem`，但 `DiagnosisState` 未保留推理过程，"为何得出此根因"无法回溯。评估在节点结果或 trace 中保留（脱敏后的）推理摘要，增强诊断可解释性，同时不违背"业务状态不保存 SDK 消息"的边界（推理摘要是结构化派生数据，非原始消息回放）。
+- [x] **`reasoning_content` 纳入可追溯性**：节点审计保存 provider 明确释放的、脱敏且有界的 reasoning summary；不保存 raw/encrypted content，并有回归测试确认隐藏推理内容不会落库。
+
+## 发布前检查
+
+- [x] 后端完整测试、ruff、格式检查和可构建性验证。
+- [x] 前端 typecheck 和 production build。
+- [x] 安装入口、CLI 帮助和副本 SQLite 数据库迁移/恢复演练。

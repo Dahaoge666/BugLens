@@ -12,6 +12,7 @@ from .graph import DiagnosisGraph
 from .infra import SQLiteCheckpointStore
 from .prompts import PromptRegistry
 from .runtime import DiagnosisRuntime
+from .security import SDKRunStateCipher
 
 
 def configure_openai_provider(
@@ -34,7 +35,10 @@ def configure_openai_provider(
     from agents import set_default_openai_api, set_default_openai_client
 
     client = AsyncOpenAI(
-        base_url=base_url or None, api_key=api_key or "", timeout=timeout
+        base_url=base_url or None,
+        api_key=api_key or "",
+        timeout=timeout,
+        max_retries=0,
     )
     set_default_openai_client(client, use_for_tracing=False)
     # Many OpenAI-compatible gateways do not implement the /responses endpoint;
@@ -63,14 +67,29 @@ def build_local_service(
     configs = ConfigRepository(settings.config_path)
     prompts = PromptRegistry(settings.prompt_config)
     runner = OpenAINodeRunner(
-        prompts, settings.session_db, default_streaming=custom_endpoint
+        prompts,
+        settings.session_db,
+        default_streaming=custom_endpoint,
+        default_base_url=settings.openai_base_url,
+        default_api_key=settings.openai_api_key,
+        default_timeout=settings.openai_timeout,
     )
     # A custom gateway's tracing endpoint usually differs from OpenAI's; default
     # to disabling tracing there unless the operator explicitly enables it.
     tracing_enabled = settings.tracing_enabled and not custom_endpoint
     graph = DiagnosisGraph(runner, prompts, tracing_enabled=tracing_enabled)
     store = SQLiteCheckpointStore(settings.session_db)
-    runtime = DiagnosisRuntime(graph, store, configs, tracing_enabled=tracing_enabled)
+    runtime = DiagnosisRuntime(
+        graph,
+        store,
+        configs,
+        tracing_enabled=tracing_enabled,
+        run_state_cipher=(
+            SDKRunStateCipher(settings.run_state_key)
+            if settings.run_state_key
+            else None
+        ),
+    )
     service = ApplicationService(
         runtime,
         configs,

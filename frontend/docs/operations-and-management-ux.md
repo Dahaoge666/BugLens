@@ -1,6 +1,6 @@
 # BugLens 安装、配置与任务管理交互设计
 
-> 实现状态（MVP）：前端已落地总览、任务、Session、配置与系统页；后端新增独立 `AdminApplicationService` 和 `/v1/admin/*` 适配端点；`distribution/` 提供不依赖 Docker 的 backend/full 原生安装和进程管理。
+> 实现状态（MVP）：前端已落地总览、任务、Session、配置与系统页；后端新增独立 `AdminApplicationService` 和 `/v1/admin/*` 适配端点；根目录 `install.ps1`/`install.sh` 提供默认 full 模式的一键安装，`distribution/` 只负责运行管理和静态代理。
 
 ## 1. 设计结论
 
@@ -54,23 +54,24 @@ Bearer Token。一次性 Setup Token、角色和多租户授权属于后续认�
 ```text
 buglens-<version>.whl             Python API + CLI，不依赖前端
 buglens-frontend-<version>.tar.gz 静态页面，不包含 Agent 代码
-buglensctl                        安装、启动、更新、备份、诊断
+install.ps1 / install.sh         前后端一键安装、部署、启动
+buglensctl                        启动、更新、备份、诊断
 ```
 
 用户只需要选择安装模式，不选择底层组件：
 
 ```powershell
 # 后端独立安装
-buglensctl install --mode backend
+./install.sh backend
 
 # 前后端完整安装
-buglensctl install --mode full
+./install.sh
 
 # 更新当前安装模式
 buglensctl update
 ```
 
-首期使用 uv 作为跨平台环境管理底座。`buglensctl` 由 uv 使用 Python 3.11 运行，并在安装目录创建隔离虚拟环境、配置、数据、日志
+首期使用 uv 作为跨平台环境管理底座。根目录安装器调用 backend/frontend 各自的安装脚本；`buglensctl` 由 uv 使用 Python 3.11 运行，并在安装目录创建隔离虚拟环境、配置、数据、日志
 和 PID 文件，负责选择 backend/full 模式、安装固定版本制品、检查健康状态并打印访问地址。full 模式的
 轻量同源服务器托管静态资源并代理 `/v1/*`；正式服务器可替换为现有 systemd 与 Nginx/Caddy。
 
@@ -80,19 +81,20 @@ buglensctl update
 BugLens/
 ├── backend/                            # 后端源码、测试、配置与后端文档
 ├── frontend/                           # 前端源码、测试与前端文档
-└── distribution/                       # 原生安装器、进程管理与升级入口
+├── install.ps1 / install.sh             # 前后端一键安装与启动
+└── distribution/                       # 进程管理、升级与静态代理
 ```
 
-正式发行的 `distribution/` 只依赖已发布制品。仓库内安装器允许从本地源码安装后端，并在缺少预构建
-前端时调用 pnpm；后端包、前端静态包、安装器仍分别构建和发布。
+正式发行时，distribution 只依赖已发布制品。仓库内前端安装器在缺少预构建静态资源时调用 pnpm；后端安装器按
+`backend/uv.lock` 同步运行环境。后端包、前端静态包、安装器仍分别构建和发布。
 
 ### 3.2 首次安装流程
 
 命令行安装保持一条主路径：
 
 ```text
-选择模式 → 检查 Python → 创建隔离环境与数据目录 → 安装制品
-        → 启动后端 → 健康检查 → 输出 Setup Token/访问地址
+选择模式 → 检查工具 → 创建隔离环境与数据目录 → 安装后端
+        → 安装/构建前端 → 启动后端与代理 → 健康检查 → 输出访问地址
 ```
 
 终端只显示当前步骤和可恢复错误，完整服务日志写入 `.runtime/logs/`。失败时保留已下载制品和配置草稿，重复执行

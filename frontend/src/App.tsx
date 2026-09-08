@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react'
 import { applyAdminConfig, createRunId, getAdminConfig, getAdminHealth, getAdminRuns, getAdminSessions, getAdminVersion, getRun, readCommandStream, readEvents, validateAdminConfig } from './api'
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, Evidence, Hypothesis, InteractionRequest, Run } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, Evidence, Hypothesis, InteractionRequest, PendingApproval, Run } from './types'
 
 type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'system' | 'run'
 
@@ -151,7 +151,7 @@ function App() {
 
   async function startDiagnosis(question: string, context: Record<string, string>, evidence: Evidence[], profile: string) {
     const runId = createRunId()
-    const command = { protocol_version: '1', command_id: crypto.randomUUID(), run_id: runId, expected_revision: null, submitted_at: new Date().toISOString(), command_type: 'start_diagnosis', question, context, evidence, profile }
+    const command = { protocol_version: '2', command_id: crypto.randomUUID(), run_id: runId, expected_revision: null, submitted_at: new Date().toISOString(), command_type: 'start_diagnosis', question, context, evidence, profile }
     setShowNew(false)
     navigate('run')
     setEvents([])
@@ -164,7 +164,7 @@ function App() {
       setNotice('已连接到 BugLens API，正在同步运行状态')
     } catch {
       setNotice('当前使用演示模式：已保留界面，API 尚未连接')
-      setRun({ ...demoRun, run_id: runId, user_question: question, user_context: context, source_evidence: evidence, lifecycle_status: 'running', outcome: null, current_node: 'analyze', report: null, evaluation: null, investigation: null, analysis: null, revision: 0 })
+      setRun({ ...demoRun, run_id: runId, user_question: question, user_context: context, source_evidence: evidence, lifecycle_status: 'running', outcome: null, current_node: 'analyze', report: null, evaluation: null, investigation: null, analysis: null, revision: 0, available_actions: ['cancel'] })
       setEvents([{ event_id: 'local-1', event_type: 'run_started', sequence: 1, revision: 0, occurred_at: new Date().toLocaleTimeString(), summary: '已在本地创建演示运行' }])
     }
   }
@@ -195,9 +195,10 @@ function App() {
   }
 
   async function cancelDiagnosis() {
-    if (run.lifecycle_status !== 'running' && run.lifecycle_status !== 'waiting_user') return
+    const canCancel = run.available_actions?.includes('cancel') ?? (run.lifecycle_status === 'running' || run.lifecycle_status === 'waiting_user')
+    if (!canCancel || run.cancel_requested_at) return
     const command = {
-      protocol_version: '1', command_id: crypto.randomUUID(), run_id: run.run_id,
+      protocol_version: '2', command_id: crypto.randomUUID(), run_id: run.run_id,
       expected_revision: run.revision, submitted_at: new Date().toISOString(),
       command_type: 'cancel_diagnosis', reason: '用户从前端取消运行',
     }
@@ -208,13 +209,13 @@ function App() {
       setNotice('诊断已取消')
     } catch {
       setNotice('演示模式：取消操作未连接到后端')
-      setRun((current) => ({ ...current, lifecycle_status: 'canceled', current_node: 'done', pending_interaction: null, updated_at: new Date().toISOString() }))
+      setRun((current) => ({ ...current, lifecycle_status: 'canceled', current_node: 'done', pending_interaction: null, available_actions: [], updated_at: new Date().toISOString() }))
     }
   }
 
   async function submitClarification(answers: Array<{ request_id: string; question_id: string; answer: string }>) {
     const command = {
-      protocol_version: '1', command_id: crypto.randomUUID(), run_id: run.run_id,
+      protocol_version: '2', command_id: crypto.randomUUID(), run_id: run.run_id,
       expected_revision: run.revision, submitted_at: new Date().toISOString(),
       command_type: 'submit_user_answers', request_id: answers[0]?.request_id ?? '', answers,
     }
@@ -225,6 +226,60 @@ function App() {
       setNotice('补充信息已提交，诊断继续推进')
     } catch {
       setNotice('演示模式：补充信息已记录在当前界面')
+    }
+  }
+
+  async function skipClarification() {
+    const request = run.pending_interaction
+    if (!request || !run.available_actions?.includes('skip_input')) return
+    const command = {
+      protocol_version: '2', command_id: crypto.randomUUID(), run_id: run.run_id,
+      expected_revision: run.revision, submitted_at: new Date().toISOString(),
+      command_type: 'skip_user_interaction', request_id: request.request_id, reason: '用户暂时无法提供该信息',
+    }
+    setNotice('正在跳过本轮补充…')
+    try {
+      await readCommandStream(`/v1/runs/${encodeURIComponent(run.run_id)}/commands`, command, (event) => setEvents((current) => appendEvent(current, event)))
+      setRun(await getRun(run.run_id))
+      setNotice('已跳过本轮补充，诊断继续推进')
+    } catch {
+      setNotice('演示模式：跳过操作未连接到后端')
+    }
+  }
+
+  async function resumeDiagnosis() {
+    if (!run.available_actions?.includes('resume')) return
+    const command = {
+      protocol_version: '2', command_id: crypto.randomUUID(), run_id: run.run_id,
+      expected_revision: run.revision, submitted_at: new Date().toISOString(), command_type: 'resume_diagnosis',
+    }
+    setNotice('正在恢复诊断…')
+    try {
+      await readCommandStream(`/v1/runs/${encodeURIComponent(run.run_id)}/commands`, command, (event) => setEvents((current) => appendEvent(current, event)))
+      setRun(await getRun(run.run_id))
+      setNotice('诊断已恢复')
+    } catch {
+      setNotice('演示模式：恢复操作未连接到后端')
+    }
+  }
+
+  async function resolveToolApproval(decision: 'approve' | 'reject') {
+    const request = run.pending_approval
+    if (!request || !run.available_actions?.includes(decision)) return
+    const command = {
+      protocol_version: '2', command_id: crypto.randomUUID(), run_id: run.run_id,
+      expected_revision: run.revision, submitted_at: new Date().toISOString(),
+      command_type: decision === 'approve' ? 'approve_tool' : 'reject_tool',
+      request_id: request.request_id,
+      ...(decision === 'reject' ? { reason: '用户拒绝执行该只读工具调用' } : {}),
+    }
+    setNotice(decision === 'approve' ? '正在批准工具调用…' : '正在拒绝工具调用…')
+    try {
+      await readCommandStream(`/v1/runs/${encodeURIComponent(run.run_id)}/commands`, command, (event) => setEvents((current) => appendEvent(current, event)))
+      setRun(await getRun(run.run_id))
+      setNotice(decision === 'approve' ? '工具调用已批准，诊断继续推进' : '工具调用已拒绝，诊断继续推进')
+    } catch {
+      setNotice('演示模式：审批操作未连接到后端')
     }
   }
 
@@ -239,13 +294,13 @@ function App() {
       {page !== 'run' ? <ManagementPage page={page} runs={adminRuns} sessions={adminSessions} config={adminConfig} health={adminHealth} version={adminVersion} onConfigChange={setAdminConfig} fetchError={fetchError} onNew={() => setShowNew(true)} onOpenRun={openRun} /> : <>
       <section className="run-heading">
         <div><div className="eyebrow">诊断运行 <span className="mono">/ {run.run_id}</span></div><h1>{run.user_question}</h1></div>
-        <div className="run-meta"><StatusPill status={run.lifecycle_status} label={statusText} /><span>更新于 {run.updated_at.includes('T') ? run.updated_at.slice(11, 16) : run.updated_at}</span>{(run.lifecycle_status === 'running' || run.lifecycle_status === 'waiting_user') && <button className="danger-button" onClick={cancelDiagnosis}>取消运行</button>}</div>
+        <div className="run-meta"><StatusPill status={run.lifecycle_status} label={statusText} /><span>更新于 {run.updated_at.includes('T') ? run.updated_at.slice(11, 16) : run.updated_at}</span>{run.available_actions?.includes('resume') && <button className="quiet-button" onClick={resumeDiagnosis}>恢复诊断</button>}{run.available_actions?.includes('approve') && <button className="primary-button" onClick={() => resolveToolApproval('approve')}>批准工具</button>}{run.available_actions?.includes('reject') && <button className="quiet-button" onClick={() => resolveToolApproval('reject')}>拒绝工具</button>}{(run.available_actions?.includes('cancel') ?? (run.lifecycle_status === 'running' || run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval')) && <button className="danger-button" onClick={cancelDiagnosis} disabled={Boolean(run.cancel_requested_at)}>{run.cancel_requested_at ? '取消中…' : '取消运行'}</button>}</div>
       </section>
       <section className="stage-track" aria-label="诊断阶段">
         {stageLabels.map(([node, label], index) => <div className={`stage ${index < stageIndex || run.lifecycle_status === 'completed' ? 'done' : ''} ${node === run.current_node ? 'active' : ''}`} key={node}><span className="stage-number">{index < stageIndex || run.lifecycle_status === 'completed' ? '✓' : `0${index + 1}`}</span><span>{label}</span>{index < stageLabels.length - 1 && <span className="stage-line" />}</div>)}
       </section>
       <nav className="view-tabs" aria-label="诊断视图">{[['overview', '概览'], ['evidence', '证据与假设'], ['events', '事件记录']].map(([key, label]) => <button className={view === key ? 'selected' : ''} onClick={() => setView(key as typeof view)} key={key}>{label}</button>)}</nav>
-      {view === 'events' ? <EventsPanel events={events} /> : view === 'evidence' ? <EvidenceView run={run} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} />}
+      {view === 'events' ? <EventsPanel events={events} /> : view === 'evidence' ? <EvidenceView run={run} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} onSkip={skipClarification} onApproval={resolveToolApproval} />}
       </>}
     </main>
     </div>
@@ -286,7 +341,7 @@ function PageHeading({ eyebrow, title, description, action }: { eyebrow: string;
 }
 
 function DashboardPage({ runs, sessions, health, onNew, onOpenRun }: { runs: AdminRun[]; sessions: AdminSession[]; health: AdminHealth | null; onNew: () => void; onOpenRun: (runId: string) => void }) {
-  const waiting = runs.filter((run) => run.lifecycle_status === 'waiting_user').length
+  const waiting = runs.filter((run) => run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval').length
   const running = runs.filter((run) => run.lifecycle_status === 'running').length
   const completed = runs.filter((run) => run.lifecycle_status === 'completed').length
   const healthOk = health?.status === 'ok' || health === null
@@ -308,7 +363,7 @@ function TasksPage({ runs, onNew, onOpenRun }: { runs: AdminRun[]; onNew: () => 
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
   const visible = runs.filter((run) => (filter === 'all' || run.lifecycle_status === filter || run.status === filter) && (!query.trim() || `${run.question} ${run.run_id}`.toLowerCase().includes(query.trim().toLowerCase())))
-  return <div className="management-content"><PageHeading eyebrow="控制台 / 诊断任务" title="诊断任务" description="统一查看运行状态、评测结果和待处理输入。" action={<button className="primary-button" onClick={onNew}>＋ 新建诊断</button>} /><div className="toolbar"><div className="filter-tabs">{[['all', '全部'], ['running', '运行中'], ['waiting_user', '待补充'], ['completed', '已完成'], ['failed', '失败'], ['canceled', '已取消']].map(([value, label]) => <button className={filter === value ? 'active' : ''} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div><div className="toolbar-actions"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="⌕ 搜索任务" /><button className="quiet-button" onClick={() => setQuery('')}>清除</button></div></div><section className="panel tasks-panel"><RunTable runs={visible} onOpenRun={onOpenRun} /></section></div>
+  return <div className="management-content"><PageHeading eyebrow="控制台 / 诊断任务" title="诊断任务" description="统一查看运行状态、评测结果和待处理输入。" action={<button className="primary-button" onClick={onNew}>＋ 新建诊断</button>} /><div className="toolbar"><div className="filter-tabs">{[['all', '全部'], ['running', '运行中'], ['waiting_user', '待补充'], ['waiting_approval', '待审批'], ['completed', '已完成'], ['failed', '失败'], ['canceled', '已取消']].map(([value, label]) => <button className={filter === value ? 'active' : ''} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div><div className="toolbar-actions"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="⌕ 搜索任务" /><button className="quiet-button" onClick={() => setQuery('')}>清除</button></div></div><section className="panel tasks-panel"><RunTable runs={visible} onOpenRun={onOpenRun} /></section></div>
 }
 
 function RunTable({ runs, onOpenRun }: { runs: AdminRun[]; onOpenRun: (runId: string) => void }) {
@@ -419,12 +474,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function SystemPage({ health, version }: { health: AdminHealth | null; version: string }) {
   const healthy = health?.status === 'ok' || health === null
   const componentStatus = (name: string) => health?.components.find((component) => component.name === name)?.status ?? 'ok'
-  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{[['HTTP / SSE Adapter', '协议 v1', 'configuration'], ['Application Service', '已连接', 'checkpoint_store'], ['Checkpoint Store', 'SQLite WAL', 'checkpoint_store'], ['Agent Runtime', '可恢复', 'model_credentials']].map(([name, detail, key]) => { const status = componentStatus(key); return <div className="component-row" key={name}><i className={`component-dot ${status}`} /><div><strong>{name}</strong><small>{detail}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>buglensctl install -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>Docker Compose 一键启动</p><code>buglensctl install --mode full</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与配置快照</p><code>buglensctl update</code></div></div></section></div>
+  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{[['HTTP / SSE Adapter', '协议 v2', 'configuration'], ['Application Service', '已连接', 'checkpoint_store'], ['Checkpoint Store', 'SQLite WAL', 'checkpoint_store'], ['Agent Runtime', '可恢复', 'model_credentials']].map(([name, detail, key]) => { const status = componentStatus(key); return <div className="component-row" key={name}><i className={`component-dot ${status}`} /><div><strong>{name}</strong><small>{detail}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>.\install.ps1 -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>根目录脚本一键启动</p><code>.\install.ps1</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与数据库</p><code>.\distribution\buglensctl.ps1 update</code></div></div></section></div>
 }
 
 function AdminStatusPill({ run }: { run: AdminRun }) {
   const label = runStatusLabel(run)
-  const tone = run.lifecycle_status === 'waiting_user' ? 'waiting' : run.lifecycle_status === 'running' ? 'running' : run.lifecycle_status === 'failed' ? 'failed' : run.lifecycle_status === 'canceled' ? 'canceled' : run.outcome === 'inconclusive' ? 'inconclusive' : 'completed'
+  const tone = run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval' ? 'waiting' : run.lifecycle_status === 'running' ? 'running' : run.lifecycle_status === 'failed' ? 'failed' : run.lifecycle_status === 'canceled' ? 'canceled' : run.outcome === 'inconclusive' ? 'inconclusive' : 'completed'
   return <span className={`admin-status-pill ${tone}`}><i />{label}</span>
 }
 
@@ -433,12 +488,13 @@ function formatTime(value: string) { return value.includes('T') ? value.slice(11
 
 function StatusPill({ status, label }: { status: Run['lifecycle_status']; label: string }) { return <span className={`status-pill ${status}`}><i />{label}</span> }
 
-function Overview({ run, latestEvent, onNew, onClarification }: { run: Run; latestEvent?: DomainEvent; onNew: () => void; onClarification: (answers: Array<{ request_id: string; question_id: string; answer: string }>) => Promise<void> }) {
+function Overview({ run, latestEvent, onNew, onClarification, onSkip, onApproval }: { run: Run; latestEvent?: DomainEvent; onNew: () => void; onClarification: (answers: Array<{ request_id: string; question_id: string; answer: string }>) => Promise<void>; onSkip: () => Promise<void>; onApproval: (decision: 'approve' | 'reject') => Promise<void> }) {
   return <div className="content-grid">
     <div className="primary-column">
       {run.report ? <section className={`conclusion-card ${run.outcome}`}><div className="section-kicker"><span className="signal">✦</span> 诊断结论 <span className="confidence-tag">评测 {run.evaluation?.score ?? '—'} / 100</span></div><h2>{run.report.primary_conclusion ?? '尚未形成确认结论'}</h2><p>{run.report.executive_summary}</p><div className="action-row">{run.report.next_actions.map((action) => <span className="action-chip" key={action}>→ {action}</span>)}</div></section> : <section className="waiting-card"><span className="spinner" /><div><strong>正在理解你的问题</strong><p>诊断运行已创建，事件会实时出现在活动记录中。</p></div></section>}
       {run.investigation && <section className="panel"><PanelHeader title="原因假设" meta={`${run.investigation.hypotheses.length} 个假设`} /><div className="hypothesis-list">{run.investigation.hypotheses.map((hypothesis) => <HypothesisCard hypothesis={hypothesis} key={hypothesis.rank} />)}</div></section>}
-      {run.pending_interaction && <ClarificationCard request={run.pending_interaction} onSubmit={onClarification} />}
+      {run.pending_approval && <ApprovalCard request={run.pending_approval} onResolve={onApproval} canApprove={run.available_actions?.includes('approve') ?? false} canReject={run.available_actions?.includes('reject') ?? false} />}
+      {run.pending_interaction && <ClarificationCard request={run.pending_interaction} onSubmit={onClarification} onSkip={onSkip} canSubmit={run.available_actions?.includes('submit_answers') ?? true} canSkip={run.available_actions?.includes('skip_input') ?? false} />}
     </div>
     <aside className="side-column"><section className="panel context-panel"><PanelHeader title="问题上下文" /><dl>{Object.entries(run.user_context).map(([key, value]) => <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd>{Array.isArray(value) ? value.join(', ') : value}</dd></div>)}</dl><div className="question-quote">“{run.user_question}”</div></section><section className="panel activity-panel"><PanelHeader title="最近活动" meta={latestEvent ? `#${latestEvent.sequence}` : ''} />{latestEvent && <div className="activity-item"><span className="activity-dot" /><div><strong>{latestEvent.summary}</strong><span>{latestEvent.occurred_at} · {latestEvent.event_type}</span></div></div>}<button className="text-button" onClick={() => document.querySelector<HTMLButtonElement>('[aria-label="诊断视图"] button:last-child')?.click()}>查看全部事件 →</button></section><button className="new-run-card" onClick={onNew}><span>＋</span><div><strong>开始一次新的诊断</strong><small>提交问题、环境与证据</small></div></button></aside>
   </div>
@@ -450,13 +506,13 @@ function EventsPanel({ events }: { events: DomainEvent[] }) { return <section cl
 
 function HypothesisCard({ hypothesis }: { hypothesis: Hypothesis }) { return <article className="hypothesis-card"><div className="hypothesis-rank">0{hypothesis.rank}</div><div className="hypothesis-main"><div className="hypothesis-title"><h3>{hypothesis.cause}</h3><span>{Math.round(hypothesis.confidence * 100)}%</span></div><p>{hypothesis.rationale}</p><div className="evidence-columns"><div><label>支持证据</label>{hypothesis.supporting_evidence.map((item) => <span className="evidence-line positive" key={item}>＋ {item}</span>)}</div><div><label>验证步骤</label>{hypothesis.verification_steps.map((item) => <span className="evidence-line" key={item}>◷ {item}</span>)}</div></div></div></article> }
 
-function ClarificationCard({ request, onSubmit }: { request: InteractionRequest; onSubmit: (answers: Array<{ request_id: string; question_id: string; answer: string }>) => Promise<void> }) {
+function ClarificationCard({ request, onSubmit, onSkip, canSubmit, canSkip }: { request: InteractionRequest; onSubmit: (answers: Array<{ request_id: string; question_id: string; answer: string }>) => Promise<void>; onSkip: () => Promise<void>; canSubmit: boolean; canSkip: boolean }) {
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [submitted, setSubmitted] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const requiredReady = request.questions.filter((question) => question.required).every((question) => answers[question.id]?.trim())
   async function submit() {
-    if (!requiredReady || submitting) return
+    if (!canSubmit || !requiredReady || submitting) return
     setSubmitting(true)
     try {
       await onSubmit(request.questions.filter((question) => answers[question.id]?.trim()).map((question) => ({ request_id: request.request_id, question_id: question.id, answer: answers[question.id] })))
@@ -465,7 +521,24 @@ function ClarificationCard({ request, onSubmit }: { request: InteractionRequest;
       setSubmitting(false)
     }
   }
-  return <section className="clarification-card"><div className="section-kicker"><span className="attention">!</span> 需要你的补充</div><h2>{request.explanation}</h2>{request.questions.map((question) => <label className="clarification-question" key={question.id}><span>{question.question}<em>{question.required ? '必填' : '选填'}</em></span><textarea value={answers[question.id] ?? ''} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} placeholder={question.rationale} rows={3} /></label>)}<div className="clarification-actions"><button className="primary-button" disabled={!requiredReady || submitted || submitting} onClick={submit}>{submitted ? '已提交，等待继续' : submitting ? '正在提交…' : '提交补充信息'}</button><span>回答会安全地附加到本次诊断</span></div></section>
+  const [skipping, setSkipping] = useState(false)
+  async function skip() {
+    if (!canSkip || skipping || submitting) return
+    setSkipping(true)
+    try { await onSkip() } finally { setSkipping(false) }
+  }
+  return <section className="clarification-card"><div className="section-kicker"><span className="attention">!</span> 需要你的补充</div><h2>{request.explanation}</h2>{request.questions.map((question) => <label className="clarification-question" key={question.id}><span>{question.question}<em>{question.required ? '必填' : '选填'}</em></span><textarea value={answers[question.id] ?? ''} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} placeholder={question.rationale} rows={3} /></label>)}<div className="clarification-actions"><button className="primary-button" disabled={!canSubmit || !requiredReady || submitted || submitting || skipping} onClick={submit}>{submitted ? '已提交，等待继续' : submitting ? '正在提交…' : '提交补充信息'}</button>{canSkip && <button className="quiet-button" disabled={submitted || submitting || skipping} onClick={skip}>{skipping ? '正在跳过…' : '暂时无法提供，跳过'}</button>}<span>回答会安全地附加到本次诊断</span></div></section>
+}
+
+function ApprovalCard({ request, onResolve, canApprove, canReject }: { request: PendingApproval; onResolve: (decision: 'approve' | 'reject') => Promise<void>; canApprove: boolean; canReject: boolean }) {
+  const [submitting, setSubmitting] = useState(false)
+  async function resolve(decision: 'approve' | 'reject') {
+    if (submitting || (decision === 'approve' ? !canApprove : !canReject)) return
+    setSubmitting(true)
+    try { await onResolve(decision) } finally { setSubmitting(false) }
+  }
+  const args = Object.entries(request.arguments ?? {})
+  return <section className="clarification-card approval-card"><div className="section-kicker"><span className="attention">!</span> 工具调用需要审批</div><h2>{request.explanation}</h2><p className="approval-tool">工具：<strong>{request.tool_name}</strong></p>{args.length > 0 && <div className="approval-arguments"><label>请求参数</label>{args.map(([key, value]) => <code key={key}>{key}: {Array.isArray(value) ? value.join(', ') : String(value ?? 'null')}</code>)}</div>}<div className="clarification-actions"><button className="primary-button" disabled={!canApprove || submitting} onClick={() => resolve('approve')}>{submitting ? '正在处理…' : '批准并继续'}</button><button className="quiet-button" disabled={!canReject || submitting} onClick={() => resolve('reject')}>拒绝并继续</button><span>仅允许已注册的只读工具，决定会记录在审计账本中。</span></div></section>
 }
 
 function NewDiagnosis({ profiles, onClose, onSubmit }: { profiles: string[]; onClose: () => void; onSubmit: (question: string, context: Record<string, string>, evidence: Evidence[], profile: string) => void }) { const [question, setQuestion] = useState(''); const [environment, setEnvironment] = useState('production'); const [service, setService] = useState(''); const [log, setLog] = useState(''); const [profile, setProfile] = useState(profiles[0] ?? 'default'); function submit(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; onSubmit(question, { environment, ...(service ? { service } : {}) }, log.trim() ? [{ source: 'log', content: log }] : [], profile) } return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option>production</option><option>staging</option><option>test</option></select></label><label>服务名称<input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label></div><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label></div><div className="modal-footer"><span>运行开始后会生成不可变配置快照</span><button type="submit" className="primary-button" disabled={!question.trim()}>开始诊断 →</button></div></form></div> }

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 
 from .models import StrictModel
 
@@ -59,8 +59,25 @@ class EvaluationPolicy(StrictModel):
 class ToolPolicy(StrictModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
+    allowed_nodes: list[str] = Field(default_factory=lambda: ["analyze"])
+    allowed_profiles: list[str] = Field(default_factory=list)
     max_results: int = Field(default=20, ge=0, le=100)
     timeout_seconds: int = Field(default=30, ge=1, le=120)
+    max_result_bytes: int = Field(default=65_536, ge=1_024, le=1_048_576)
+
+
+class RetryPolicy(StrictModel):
+    model_config = ConfigDict(extra="forbid")
+    max_retries: int = Field(default=5, ge=0, le=10)
+    initial_delay_seconds: float = Field(default=1.0, gt=0, le=60)
+    max_delay_seconds: float = Field(default=16.0, gt=0, le=300)
+    multiplier: float = Field(default=2.0, ge=1, le=10)
+    jitter: bool = True
+
+
+class SessionPolicy(StrictModel):
+    model_config = ConfigDict(extra="forbid")
+    history_item_limit: int = Field(default=100, ge=1, le=1_000)
 
 
 class RuntimePolicy(StrictModel):
@@ -72,6 +89,16 @@ class RuntimePolicy(StrictModel):
     evaluation: EvaluationPolicy = Field(default_factory=EvaluationPolicy)
     nodes: dict[str, NodePolicy] = Field(default_factory=dict)
     tools: ToolPolicy = Field(default_factory=ToolPolicy)
+    retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    sessions: SessionPolicy = Field(default_factory=SessionPolicy)
+    lease_seconds: int = Field(default=60, ge=5, le=3_600)
+    lease_renewal_seconds: int = Field(default=20, ge=1, le=1_800)
+
+    @model_validator(mode="after")
+    def validate_lease_window(self) -> RuntimePolicy:
+        if self.lease_renewal_seconds >= self.lease_seconds:
+            raise ValueError("lease_renewal_seconds must be less than lease_seconds")
+        return self
 
     def node(self, name: str) -> NodePolicy:
         return self.nodes.get(name, NodePolicy())
@@ -99,9 +126,15 @@ class ResolvedRunConfig(StrictModel):
     resolved_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def as_json(self) -> str:
-        return json.dumps(
-            self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-        )
+        # A run snapshot is immutable policy, not a credential vault.  Keep
+        # endpoint/model strategy but remove credentials from the persisted JSON.
+        payload = self.model_dump(mode="json")
+        models = payload.get("policy", {}).get("models", {})
+        if isinstance(models, dict):
+            for model_cfg in models.values():
+                if isinstance(model_cfg, dict):
+                    model_cfg.pop("api_key", None)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 DEFAULT_PROFILE: dict[str, Any] = {
@@ -134,6 +167,16 @@ DEFAULT_PROFILE: dict[str, Any] = {
         },
     },
     "tools": {"enabled": False, "max_results": 20, "timeout_seconds": 30},
+    "retry": {
+        "max_retries": 5,
+        "initial_delay_seconds": 1,
+        "max_delay_seconds": 16,
+        "multiplier": 2,
+        "jitter": True,
+    },
+    "sessions": {"history_item_limit": 100},
+    "lease_seconds": 60,
+    "lease_renewal_seconds": 20,
 }
 
 
@@ -271,7 +314,7 @@ class ConfigRepository:
             raise ValueError("node prompt_version values must be unique")
         policy = RuntimePolicy.model_validate(raw)
         # snapshot identity excludes api_key so rotating a key never invalidates
-        # in-flight runs (the run keeps its own resolved ModelConfig in memory).
+        # in-flight runs.  The persisted snapshot is also credential-free.
         policy_dump = policy.model_dump(mode="json")
         for model_cfg in policy_dump.get("models", {}).values():
             model_cfg.pop("api_key", None)
@@ -305,6 +348,9 @@ class Settings(StrictModel):
     remote: str | None = None
     cors_origin: str | None = None
     admin_token: str | None = None
+    # Secret used only to encrypt SDK RunState approval checkpoints; it is never
+    # included in a resolved config snapshot or admin response.
+    run_state_key: str | None = None
     openai_base_url: str | None = None
     openai_api_key: str | None = None
     openai_timeout: float = Field(default=60.0, gt=0, le=600)
@@ -325,6 +371,7 @@ class Settings(StrictModel):
             remote=os.getenv("BUGLENS_REMOTE"),
             cors_origin=os.getenv("BUGLENS_CORS_ORIGIN"),
             admin_token=os.getenv("BUGLENS_ADMIN_TOKEN"),
+            run_state_key=os.getenv("BUGLENS_RUN_STATE_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_timeout=float(os.getenv("BUGLENS_OPENAI_TIMEOUT", "60")),

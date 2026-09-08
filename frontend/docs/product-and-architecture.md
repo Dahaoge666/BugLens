@@ -231,7 +231,8 @@ BugLens/
 │   └── pyproject.toml
 ├── data/
 ├── backend/docs/          # 后端实现、架构与协议文档
-├── distribution/          # 只引用已发布制品的安装层
+├── install.ps1 / .sh      # 前后端一起安装、部署、启动
+└── distribution/          # 运行管理与静态代理
 └── frontend/              # 前端唯一根目录
     ├── docs/
     ├── public/

@@ -11,8 +11,16 @@ from pydantic import TypeAdapter
 from .admin import AdminApplicationService, ConfigMutation
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
-from .infra import RunNotFoundError
+from .infra import (
+    FencingTokenError,
+    InvalidRunStatusError,
+    LeaseConflictError,
+    PendingRequestMismatchError,
+    RevisionConflictError,
+    RunNotFoundError,
+)
 from .protocol.commands import AgentCommand
+from .security import sanitize_data
 
 
 class BugLensASGI:
@@ -130,6 +138,49 @@ class BugLensASGI:
                 method == "GET"
                 and len(parts) == 6
                 and parts[1:4] == ["v1", "admin", "runs"]
+                and parts[5] == "executions"
+            ):
+                query = self._query(scope)
+                records = self.admin.node_executions(
+                    run_id=parts[4],
+                    node=self._query_value(query, "node"),
+                    execution_id=self._query_value(query, "execution_id"),
+                    status=self._query_value(query, "status"),
+                    limit=self._query_int(query, "limit", 100),
+                )
+                return await self._json(
+                    send,
+                    200,
+                    {
+                        "items": [record.model_dump(mode="json") for record in records],
+                        "total": len(records),
+                    },
+                )
+            if (
+                method == "GET"
+                and len(parts) == 6
+                and parts[1:4] == ["v1", "admin", "runs"]
+                and parts[5] == "tools"
+            ):
+                query = self._query(scope)
+                records = self.admin.tool_executions(
+                    run_id=parts[4],
+                    node_execution_id=self._query_value(query, "node_execution_id"),
+                    sdk_tool_call_id=self._query_value(query, "sdk_tool_call_id"),
+                    limit=self._query_int(query, "limit", 100),
+                )
+                return await self._json(
+                    send,
+                    200,
+                    {
+                        "items": [record.model_dump(mode="json") for record in records],
+                        "total": len(records),
+                    },
+                )
+            if (
+                method == "GET"
+                and len(parts) == 6
+                and parts[1:4] == ["v1", "admin", "runs"]
                 and parts[5] == "sessions"
             ):
                 query = self._query(scope)
@@ -147,7 +198,12 @@ class BugLensASGI:
             if method == "GET" and len(parts) == 4 and parts[1:3] == ["v1", "runs"]:
                 view = await self.service.get_run(parts[3])
                 return await self._json(send, 200, view.model_dump(mode="json"))
-            if method == "GET" and len(parts) == 5 and parts[4] == "events":
+            if (
+                method == "GET"
+                and len(parts) == 5
+                and parts[1:3] == ["v1", "runs"]
+                and parts[4] == "events"
+            ):
                 query = parse_qs(scope.get("query_string", b"").decode())
                 after = int(query.get("after", ["0"])[0])
                 return await self._events(send, self.service.events(parts[3], after))
@@ -156,14 +212,25 @@ class BugLensASGI:
             status = 400
             if isinstance(exc, RunNotFoundError):
                 status = 404
-            elif isinstance(exc, (ConfigRevisionConflictError, ConfigNotWritableError)):
+            elif isinstance(
+                exc,
+                (
+                    ConfigRevisionConflictError,
+                    ConfigNotWritableError,
+                    RevisionConflictError,
+                    InvalidRunStatusError,
+                    PendingRequestMismatchError,
+                    LeaseConflictError,
+                    FencingTokenError,
+                ),
+            ):
                 status = 409
             return await self._json(
                 send,
                 status,
                 {
                     "code": getattr(exc, "code", "validation_failed"),
-                    "message": str(exc),
+                    "message": str(sanitize_data(str(exc))),
                 },
             )
 

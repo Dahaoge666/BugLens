@@ -18,6 +18,7 @@ from pydantic import Field
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
 from .models import StrictModel
+from .security import sanitize_data
 
 AdminStatus = Literal["ok", "degraded", "error"]
 
@@ -37,12 +38,12 @@ class HealthView(StrictModel):
 
 class VersionView(StrictModel):
     version: str
-    protocol_version: str = "1"
+    protocol_version: str = "2"
     api_prefix: str = "/v1"
 
 
 class CapabilitiesView(StrictModel):
-    protocol_version: str = "1"
+    protocol_version: str = "2"
     features: dict[str, bool]
 
 
@@ -81,7 +82,15 @@ class RunListItem(StrictModel):
     config_snapshot_id: str
     attempt: int
     clarification_round: int
+    clarification_rounds: dict[str, int]
+    retry_cycle: int
+    retry_index: int
+    resume_available: bool
+    active_execution_id: str | None = None
+    available_actions: list[str]
+    cancel_requested: bool = False
     pending_input: bool
+    pending_approval: bool = False
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
@@ -92,6 +101,7 @@ class RunListView(StrictModel):
     total: int
     offset: int
     limit: int
+    degraded_count: int = 0
 
 
 class SessionView(StrictModel):
@@ -110,6 +120,57 @@ class SessionListView(StrictModel):
     total: int
     offset: int
     limit: int
+    degraded_count: int = 0
+
+
+class NodeExecutionView(StrictModel):
+    execution_id: str
+    run_id: str
+    node: str
+    session_id: str
+    investigation_attempt: int
+    clarification_round: int
+    retry_cycle: int
+    retry_index: int
+    status: str
+    input_context_json: str | None = None
+    input_hash: str | None = None
+    output_json: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    retryable: bool
+    reasoning_summary_json: str | None = None
+    trace_id: str | None = None
+    config_snapshot_id: str
+    agent_definition_version: str
+    started_at: str
+    completed_at: str | None = None
+
+
+class ToolExecutionView(StrictModel):
+    tool_execution_id: str
+    node_execution_id: str
+    run_id: str
+    sdk_tool_call_id: str
+    tool_name: str
+    tool_version: str
+    retry_index: int
+    arguments_json: str | None = None
+    arguments_hash: str | None = None
+    status: str
+    error_code: str | None = None
+    error_message: str | None = None
+    retryable: bool
+    result_summary_json: str | None = None
+    evidence_ids_json: str
+    started_at: str
+    completed_at: str | None = None
+    duration_ms: int | None = None
+
+
+class AuditListView(StrictModel):
+    items: list[NodeExecutionView | ToolExecutionView]
+    total: int
 
 
 class BootstrapStatus(StrictModel):
@@ -149,6 +210,11 @@ class AdminApplicationService:
                 "admin_health": True,
                 "admin_config": True,
                 "admin_sessions": True,
+                "skip_input": True,
+                "resume": True,
+                "tool_approval": True,
+                "collaborative_cancel": True,
+                "execution_audit": True,
                 "one_click_update": False,
             }
         )
@@ -269,7 +335,7 @@ class AdminApplicationService:
                 valid=False,
                 profile=mutation.profile,
                 revision=self.service.configs.revision,
-                errors=[str(exc)],
+                errors=[str(sanitize_data(str(exc)))],
             )
         warnings: list[str] = []
         if not self.service.configs.writable:
@@ -339,7 +405,15 @@ class AdminApplicationService:
                     config_snapshot_id=state.config_snapshot_id,
                     attempt=state.attempt,
                     clarification_round=state.clarification_round,
+                    clarification_rounds=state.clarification_rounds,
+                    retry_cycle=state.retry_cycle,
+                    retry_index=state.retry_index,
+                    resume_available=state.resume_available,
+                    active_execution_id=state.active_execution_id,
+                    available_actions=state.available_actions,
+                    cancel_requested=state.cancel_requested_at is not None,
                     pending_input=state.pending_interaction is not None,
+                    pending_approval=state.pending_approval is not None,
                     created_at=state.created_at,
                     updated_at=state.updated_at,
                     last_error=state.last_error.message if state.last_error else None,
@@ -349,6 +423,7 @@ class AdminApplicationService:
             total=total,
             offset=offset,
             limit=limit,
+            degraded_count=self.service.runtime.store.last_list_degraded_count,
         )
 
     def sessions(
@@ -372,7 +447,46 @@ class AdminApplicationService:
             total=total,
             offset=offset,
             limit=limit,
+            degraded_count=self.service.runtime.store.last_list_degraded_count,
         )
+
+    def node_executions(
+        self,
+        *,
+        run_id: str | None = None,
+        node: str | None = None,
+        execution_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[NodeExecutionView]:
+        return [
+            NodeExecutionView.model_validate(record)
+            for record in self.service.runtime.store.list_node_executions(
+                run_id=run_id,
+                node=node,
+                execution_id=execution_id,
+                status=status,
+                limit=limit,
+            )
+        ]
+
+    def tool_executions(
+        self,
+        *,
+        run_id: str | None = None,
+        node_execution_id: str | None = None,
+        sdk_tool_call_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ToolExecutionView]:
+        return [
+            ToolExecutionView.model_validate(record)
+            for record in self.service.runtime.store.list_tool_executions(
+                run_id=run_id,
+                node_execution_id=node_execution_id,
+                sdk_tool_call_id=sdk_tool_call_id,
+                limit=limit,
+            )
+        ]
 
 
 __all__ = [
@@ -385,7 +499,9 @@ __all__ = [
     "ConfigNotWritableError",
     "ConfigRevisionConflictError",
     "HealthView",
+    "NodeExecutionView",
     "RunListView",
     "SessionListView",
+    "ToolExecutionView",
     "VersionView",
 ]

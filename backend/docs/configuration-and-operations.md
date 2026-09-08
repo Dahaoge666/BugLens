@@ -37,10 +37,16 @@ profiles:
       investigate: {model: default, max_turns: 6, prompt_version: investigator-v1}
       evaluate: {model: default, max_turns: 6, prompt_version: rubric-v1}
       summarize: {model: default, max_turns: 6, prompt_version: summary-v1}
-    tools: {enabled: false, max_results: 20, timeout_seconds: 30}
+    tools: {enabled: false, allowed_nodes: [analyze], max_results: 20, timeout_seconds: 30, max_result_bytes: 65536}
+    retry: {max_retries: 5, initial_delay_seconds: 1, max_delay_seconds: 16, multiplier: 2, jitter: true}
+    sessions: {history_item_limit: 100}
+    lease_seconds: 60
+    lease_renewal_seconds: 20
 ```
 
 `ConfigRepository` 使用严格 Pydantic Schema 解析全部 profile。未知字段、越界值、缺失节点或重复 config version 必须在启动、校验或创建 run 前失败。节点的 `model` 优先引用 `models` 中的命名端点；为兼容旧配置，不匹配注册表时按直接模型名解析。
+
+如果注册的只读工具设置 `needs_approval: true`，运行进程必须配置 `BUGLENS_RUN_STATE_KEY`。该密钥需要在可能接手审批恢复的进程间保持一致；它只用于加密 SDK RunState，不会写入 profile、run 快照或 Admin 响应。
 
 模型端点与节点策略分离：节点只引用命名模型；endpoint、model ID、timeout、streaming 和凭据回退由模型配置解析。API key 等 secret 不属于 profile 的公开视图，也不进入诊断状态、Event 或配置快照。
 
@@ -55,6 +61,8 @@ Application Service 在创建 run 时解析 profile，生成规范化、无 secr
 - 恢复只读取原快照，不重新解析当前 YAML；
 - 配置更新只影响之后创建的 run；
 - trace/Event 记录 snapshot ID 和版本，不记录完整 prompt 或 secret。
+- state history、node execution、tool execution 和 evidence 记录与状态 revision 关联；工具只在允许的 node/profile/tenant/capability 范围内暴露。
+- `retry.max_retries` 表示首次调用后的重试次数，默认 5；底层 OpenAI client 使用 `max_retries=0`，由 Agents SDK runner-managed retry 负责模型传输重试。
 
 ## Admin 控制面
 
@@ -66,9 +74,9 @@ Admin 控制面只访问 `ConfigRepository`、CheckpointStore 和安装能力信
 | --- | --- |
 | 启动与健康 | 初始化状态、组件健康、版本、能力开关 |
 | 配置 | 读取公开配置、校验候选 profile、按 revision 原子应用 |
-| 运维查询 | 分页查询 run 和 SDK Session 元数据 |
+| 运维查询 | 分页查询 run、SDK Session、节点尝试和脱敏工具审计 |
 
-健康检查至少区分 checkpoint store、配置解析和模型凭据状态；只返回状态与说明，不返回凭据。能力开关控制前端是否展示操作；浏览器不能执行 shell、容器更新或其他未实现的运维动作。
+健康检查至少区分 checkpoint store、配置解析和模型凭据状态；只返回状态与说明，不返回凭据。能力开关控制前端是否展示操作；浏览器不能执行 shell、容器更新或其他未实现的运维动作。Admin 列表遇到单条损坏快照时跳过该行，并通过 `degraded_count` 暴露降级数量。
 
 运行列表必须把 lifecycle 与 outcome 分开。Session 查询只返回 session ID、run/node、状态、时间、消息数量和 config snapshot，不返回 `agent_messages` 内容。
 
@@ -87,11 +95,12 @@ revision 冲突返回 `config_revision_conflict`；没有配置文件路径时�
 ## 安全与部署
 
 - 设置 `BUGLENS_ADMIN_TOKEN` 后，所有 Admin 请求必须使用 Bearer token；比较使用常量时间。
-- token、API key 和其他 secret 不写入业务状态、Event、日志或前端可读响应。若私有 profile 配置了 `api_key`，配置文件必须按凭据文件保护，Admin 视图只能返回掩码值。
+- token、API key 和其他 secret 不写入业务状态、Event、日志或前端可读响应。若私有 profile 配置了 `api_key`，配置文件必须按凭据文件保护，Admin 视图只能返回掩码值；空值或掩码值更新会保留原 key。
 - 独立域名部署使用精确 `BUGLENS_CORS_ORIGIN`，允许 `content-type`、`accept`、`authorization`；预检返回 204。
 - 生产环境使用 TLS；SSE 代理保留 `text/event-stream`、关闭缓冲并设置合理 idle timeout。
-- `distribution/` 在隔离 Python 环境中安装后端，并独立部署前端静态制品；backend 模式不需要 Node.js，使用预构建制品的 full 模式同样不需要 Node.js。
+- 根目录一键安装器分别调用 `backend/install.*` 和 `frontend/install.*`；`distribution/` 只负责运行管理与静态代理。backend 模式不需要 Node.js，使用预构建制品的 full 模式同样不需要 Node.js。
 - 前端不可用时，本地 CLI、远程 CLI、HTTP/SSE API 和 backend-only 部署仍可使用。
+- 审批状态只在后端数据库保存加密的 SDK RunState；公开 `pending_approval`、`tool_approval_required` 仅用于展示和 request ID 关联。
 
 ## 验收
 

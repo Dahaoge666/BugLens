@@ -16,6 +16,8 @@ flowchart LR
     RUNTIME --> SESSION[SDK SQLiteSession]
     ADMINAPP --> CONFIG[ConfigRepository]
     ADMINAPP --> STORE
+    GRAPH --> CONTEXT[ContextAssembler]
+    GRAPH --> TOOLS[ToolRegistry]
     GRAPH --> NODES[Analyze / Investigate / Evaluate / Summarize]
 ```
 
@@ -29,9 +31,11 @@ flowchart LR
 | AgentClient | 用统一 Command/Event 接口屏蔽本地与远程执行 | 业务状态判断 |
 | Application Service | run 创建、身份上下文、profile 选择、服务入口和查询 | 节点路由、模型推理 |
 | Runtime | 幂等、revision、加载检查点、推进 Graph、调用 NodeRunner、提交状态与 Event | 自主改变 Graph 流程 |
-| Graph | 基于结构化状态做确定性节点转换、澄清和评测重试 | stdin、HTTP、数据库、SDK Session |
+| Graph | 基于结构化状态做确定性节点转换、澄清和评测重试；通过 `prepare_step/apply_result` 与外部调用隔离 | stdin、HTTP、数据库、SDK Session |
 | NodeRunner | 把结构化输入交给指定 Agent，并返回严格输出 | 生命周期提交和跨节点路由 |
-| Store | 原子保存业务状态、Command、Event、租约和配置快照 | 保存或解释模型对话 |
+| ContextAssembler | 按节点显式组装上下文、证据 ID、回答、历史结果和版本 | 读取 SDK 消息或执行外部查询 |
+| ToolRegistry | 用 SDK `function_tool` 注册只读工具，按 node/profile/tenant/capability 过滤并交给审计 observer；显式工具可声明 `needs_approval` | 业务路由、写操作和权限越权 |
+| Store | 原子保存业务状态、state history、Command、Event、节点/工具审计、证据、租约和配置快照 | 保存或解释模型对话 |
 | SDK Session | 保存单节点模型消息历史 | 业务状态、恢复游标和前端会话 |
 | Admin Service | 健康、能力、配置和只读运维查询 | 调用 Graph 或触发诊断节点 |
 
@@ -48,7 +52,7 @@ analyze → investigate → evaluate ──通过/达到上限──→ summariz
 - `evaluate`：独立检查覆盖度、证据可追溯性、推理、验证步骤和不确定性。
 - `summarize`：转写已评测的结构化结果，不重新推理或改变结论。
 
-Analyze 或 Investigate 可以返回 `UserInteractionRequest`。Runtime 提交等待状态后结束本次短执行；答案通过新 Command 回到请求来源节点。Evaluate 未通过时，只能在代码规定的次数内回到原 Investigate Session。
+Analyze、Investigate 或 Evaluate 可以返回 `UserInteractionRequest`。Runtime 提交等待状态后结束本次短执行；答案通过新 Command 回到请求来源节点，Evaluate 的回答回到 Investigate。Skip、Resume 和协作式 Cancel 均由快照的 `available_actions` 驱动。Evaluate 未通过时，只能在代码规定的次数内回到原 Investigate Session。
 
 ## Agents SDK 边界
 
@@ -58,13 +62,17 @@ Analyze 或 Investigate 可以返回 `UserInteractionRequest`。Runtime 提交�
 | Pydantic `output_type` | 约束节点结构化输出 |
 | `Runner.run()` | 执行模型调用和 SDK 内部循环 |
 | `SQLiteSession` | 保存同一节点的多轮模型消息 |
+| `ModelSettings.retry` | 单次模型请求的 runner-managed retry policy；底层 OpenAI client 关闭重复重试 |
+| `SessionSettings` / `session_input_callback` | 限制同节点历史并控制本轮合并 |
+| `function_tool` / `RunHooks` | 只读工具 Schema、超时、调用 ID 和工具审计桥接 |
+| `needs_approval` / `RunState` | 将工具 interruption 映射为加密 checkpoint、`waiting_approval` 和批准/拒绝恢复 |
 | `RunContextWrapper` | 传递 run ID、节点名和配置版本等本地上下文 |
 | `trace()` | 以 `run_id` 聚合一次诊断的节点运行 |
 | `max_turns` | 限制单节点模型循环 |
 
 每个 `{run_id}:{node_name}` 使用独立 Session。同一节点的澄清和评测重试复用 Session；不同节点不共享完整对话。项目不同时使用 Session、`previous_response_id`、Conversations API 或手工消息回放。
 
-handoff 和 `Agent.as_tool()` 不用于主流程，因为节点顺序、评测门禁和重试上限必须由确定性 Graph 控制。SDK 的工具、guardrail、hooks、streaming 和 `RunState` 可在需要时接入，但必须先映射到项目协议和生命周期，不能直接暴露 SDK 对象给 Adapter。
+handoff 和 `Agent.as_tool()` 不用于主流程，因为节点顺序、评测门禁和重试上限必须由确定性 Graph 控制。SDK 的工具、guardrail、hooks、streaming 和 `RunState` 已按需映射到项目协议和生命周期；SDK RunState 只在后端加密保存，不能直接暴露给 Adapter。
 
 ## 源码布局
 
@@ -82,6 +90,8 @@ backend/app/
 ├── client.py             # 本地/远程客户端
 ├── infra.py              # SQLite Store
 ├── config.py             # profile 与快照解析
+├── context.py            # 节点上下文组装
+├── tools.py              # 只读工具注册与审计桥接
 ├── cli.py                # CLI Adapter
 ├── web.py                # ASGI Adapter
 ├── server.py             # Uvicorn 入口

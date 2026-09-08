@@ -19,6 +19,8 @@ DIST_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = DIST_ROOT.parent
 BACKEND_ROOT = PROJECT_ROOT / "backend"
 FRONTEND_ROOT = PROJECT_ROOT / "frontend"
+BACKEND_INSTALLER = BACKEND_ROOT / "install.py"
+FRONTEND_INSTALLER = FRONTEND_ROOT / "install.mjs"
 RUNTIME_ROOT = DIST_ROOT / ".runtime"
 ENV_FILE = RUNTIME_ROOT / ".env"
 MODE_FILE = RUNTIME_ROOT / "mode"
@@ -39,7 +41,7 @@ def ensure_runtime() -> None:
     for path in (RUNTIME_ROOT, DATA_ROOT, LOG_ROOT, PID_ROOT):
         path.mkdir(parents=True, exist_ok=True)
     if not ENV_FILE.exists():
-        shutil.copy2(DIST_ROOT / ".env.example", ENV_FILE)
+        shutil.copy2(BACKEND_ROOT / ".env.example", ENV_FILE)
         print(f"Created {ENV_FILE}")
     if not CONFIG_FILE.exists():
         shutil.copy2(BACKEND_ROOT / "config" / "buglens.example.yaml", CONFIG_FILE)
@@ -90,24 +92,13 @@ def run_checked(
 
 
 def install_backend() -> None:
-    uv = shutil.which("uv")
-    if not uv:
-        raise SystemExit("uv is required. Install it from https://docs.astral.sh/uv/.")
-    install_env = os.environ.copy()
-    install_env["UV_PROJECT_ENVIRONMENT"] = str(VENV_ROOT)
-    install_env["UV_PYTHON"] = "3.11"
     run_checked(
         [
-            uv,
-            "sync",
-            "--project",
-            str(BACKEND_ROOT),
-            "--locked",
-            "--no-dev",
-            "--extra",
-            "web",
-        ],
-        env=install_env,
+            sys.executable,
+            str(BACKEND_INSTALLER),
+            "--runtime-root",
+            str(RUNTIME_ROOT),
+        ]
     )
 
 
@@ -120,32 +111,32 @@ def frontend_source() -> Path:
     )
 
 
-def build_frontend_if_needed(source: Path) -> None:
-    if (source / "index.html").exists():
-        return
-    pnpm = shutil.which("pnpm")
-    corepack = shutil.which("corepack")
-    if pnpm:
-        prefix = [pnpm]
-    elif corepack:
-        prefix = [corepack, "pnpm"]
-    else:
-        raise SystemExit(
-            "No prebuilt frontend was found. Install Node.js/Corepack to build it, "
-            "or set BUGLENS_FRONTEND_SOURCE to a frontend-static release directory."
-        )
-    run_checked([*prefix, "install", "--frozen-lockfile"], cwd=FRONTEND_ROOT)
-    run_checked([*prefix, "build"], cwd=FRONTEND_ROOT)
-    if not (source / "index.html").exists():
-        raise SystemExit(f"Frontend build did not create {source / 'index.html'}")
-
-
 def install_frontend() -> None:
     source = frontend_source()
-    build_frontend_if_needed(source)
-    if FRONTEND_INSTALL_ROOT.exists():
-        shutil.rmtree(FRONTEND_INSTALL_ROOT)
-    shutil.copytree(source, FRONTEND_INSTALL_ROOT)
+    if (source / "index.html").exists() and not shutil.which("node"):
+        if FRONTEND_INSTALL_ROOT.exists():
+            shutil.rmtree(FRONTEND_INSTALL_ROOT)
+        shutil.copytree(source, FRONTEND_INSTALL_ROOT)
+        print(f"Installed prebuilt frontend to {FRONTEND_INSTALL_ROOT}")
+        return
+
+    node = shutil.which("node")
+    if not node:
+        raise SystemExit(
+            "No prebuilt frontend was found. Install Node.js 20+ to build the "
+            "frontend, or set BUGLENS_FRONTEND_SOURCE to a static release directory."
+        )
+    run_checked(
+        [
+            node,
+            str(FRONTEND_INSTALLER),
+            "--source",
+            str(source),
+            "--output",
+            str(FRONTEND_INSTALL_ROOT),
+        ],
+        cwd=FRONTEND_ROOT,
+    )
 
 
 def pid_file(name: str) -> Path:
