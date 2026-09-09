@@ -54,6 +54,17 @@ CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。
 
 多环境插件规范见 [environment-plugin-spec.md](docs/environment-plugin-spec.md)。参考插件分别位于 `../plugins/sqlite` 和 `../plugins/file-logs`，需要独立构建/安装 wheel；设置 `BUGLENS_ENVIRONMENTS_CONFIG` 后，配置目录仍默认不向 Agent 暴露，必须在 profile 中显式打开只读工具。
 
+本地试用 SQLite 插件可以使用仓库内的演示 profile 和环境目录：
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe --editable ..\plugins\sqlite
+$env:BUGLENS_CONFIG = "config/buglens.sqlite-demo.yaml"
+$env:BUGLENS_ENVIRONMENTS_CONFIG = "config/environments.sqlite-demo.yaml"
+uv run buglens-web --host 127.0.0.1 --port 8000
+```
+
+演示目录使用 `data/environments/` 下的两个只读 SQLite 数据库；默认只开放 `orders` 和 `order_events`，并拒绝 `payment_token` 列。
+
 ## 文档
 
 - [架构与 SDK 边界](docs/architecture.md)：组件职责、原生 loop、handoff/as_tool 与 SDK 能力边界；
