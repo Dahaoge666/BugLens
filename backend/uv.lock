@@ -80,7 +80,7 @@ provides-extras = ["web", "dev"]
 
 [[package]]
 name = "buglens-plugin-api"
-version = "1.0.0"
+version = "1.0.1"
 source = { directory = "../plugin-api" }
 dependencies = [
     { name = "pydantic" },

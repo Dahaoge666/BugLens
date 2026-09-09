@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import AsyncIterator, Literal, Protocol
+from typing import Any, AsyncIterator, Literal, Protocol
 from uuid import uuid4
 
 from agents import trace
@@ -20,6 +20,7 @@ from .config import ConfigRepository, ResolvedRunConfig
 from .environment import (
     EnvironmentConfigError,
     EnvironmentRepository,
+    EnvironmentRevisionConflictError,
     ResolvedEnvironmentSnapshot,
 )
 from .graph import DiagnosisGraph
@@ -120,6 +121,19 @@ class _StoreToolObserver:
             separators=(",", ":"),
         )
 
+    def reserve_tool_budget(
+        self, *, max_calls: int, max_concurrent: int, ttl_seconds: float
+    ) -> tuple[str | None, str | None]:
+        return self.store.reserve_tool_budget(
+            self.run_id,
+            max_calls=max_calls,
+            max_concurrent=max_concurrent,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def release_tool_budget(self, reservation_id: str) -> None:
+        self.store.release_tool_budget(reservation_id)
+
     def tool_started(self, **record) -> None:
         self.store.start_tool_execution(record)
         tool_execution_id = str(record["tool_execution_id"])
@@ -174,6 +188,8 @@ class _StoreToolObserver:
 class RunView(DiagnosisState):
     """Read model returned to adapters; it contains no SDK session details."""
 
+    environment_snapshot: dict[str, Any] | None = None
+
 
 class AgentRuntime(Protocol):
     def run(self, command: AgentCommand) -> AsyncIterator[AgentEvent]: ...
@@ -212,6 +228,11 @@ class DiagnosisRuntime:
         # Kept for compatibility with callers that displayed the old owner.  A
         # new command below receives its own owner/fencing token.
         self.owner = uuid4().hex
+
+    def close(self) -> None:
+        close = getattr(self.environment_tools, "close", None)
+        if callable(close):
+            close()
 
     async def run(
         self,
@@ -1238,6 +1259,7 @@ class DiagnosisRuntime:
                 request_id=f"target_{uuid4().hex}",
                 requested_target=command.target,
                 candidates=candidates,
+                config_revision=repository.revision,
             ),
         )
 
@@ -1250,9 +1272,20 @@ class DiagnosisRuntime:
             raise ValidationFailedError(
                 "environment target confirmation is unavailable"
             )
+        if (
+            pending.config_revision is not None
+            and pending.config_revision != repository.revision
+        ):
+            raise ValidationFailedError(
+                "environment config changed; start a new diagnosis to refresh candidates"
+            )
         target = TargetSpec(
             mode="explicit",
             environment_id=command.environment_id,
+            # The pending primary-service value may only have been a legacy
+            # name/alias used as an inference hint.  It is not safe to replay
+            # it as an ID; an explicit ID must come from the confirmation
+            # command itself.
             primary_service_id=command.primary_service_id,
         )
         try:
@@ -1261,9 +1294,11 @@ class DiagnosisRuntime:
                 candidate_ids={item.environment_id for item in pending.candidates},
             )
             snapshot = repository.snapshot(
-                resolved.environment_id, resolved.primary_service_id
+                resolved.environment_id,
+                resolved.primary_service_id,
+                expected_config_revision=pending.config_revision,
             )
-        except EnvironmentConfigError as exc:
+        except (EnvironmentConfigError, EnvironmentRevisionConflictError) as exc:
             raise ValidationFailedError(str(exc)) from exc
         return target, snapshot
 
@@ -1589,7 +1624,12 @@ class DiagnosisRuntime:
         config = self._config_snapshot(state.config_snapshot_id)
         state = self._recover_stale_run(state, config)
         state = self._hydrate_evidence(state)
-        return RunView.model_validate(state.model_dump())
+        payload = state.model_dump()
+        snapshot = self._environment_snapshot(state)
+        payload["environment_snapshot"] = (
+            snapshot.public_view() if snapshot is not None else None
+        )
+        return RunView.model_validate(payload)
 
     async def events(self, run_id: str, after: int = 0) -> AsyncIterator[AgentEvent]:
         self.store.get_state(run_id)

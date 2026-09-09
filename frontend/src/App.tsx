@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { applyAdminConfig, applyAdminEnvironmentConfig, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getRun, readCommandStream, readEvents, validateAdminConfig, validateAdminEnvironmentConfig } from './api'
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec } from './types'
+import { applyAdminConfig, applyAdminEnvironmentConfig, checkAdminPluginInstance, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig, validateAdminEnvironmentConfig } from './api'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
 
 type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'environments' | 'system' | 'run'
 
@@ -82,6 +82,7 @@ function sessionStatusLabel(status: string): string {
 function App() {
   const [run, setRun] = useState<Run>(demoRun)
   const [events, setEvents] = useState<DomainEvent[]>(demoEvents)
+  const [toolExecutions, setToolExecutions] = useState<ToolExecution[]>([])
   const [view, setView] = useState<'overview' | 'evidence' | 'events'>('overview')
   const [showNew, setShowNew] = useState(false)
   const [notice, setNotice] = useState('演示数据 · 可连接本地 BugLens API')
@@ -172,6 +173,7 @@ function App() {
       await readCommandStream('/v1/runs', command, (event) => setEvents((current) => appendEvent(current, event)))
       const nextRun = await getRun(runId)
       setRun(nextRun)
+      getRunTools(runId).then((result) => setToolExecutions(result.items)).catch(() => setToolExecutions([]))
       getAdminRuns().then((result) => setAdminRuns(result.items)).catch(() => undefined)
       setNotice('已连接到 BugLens API，正在同步运行状态')
     } catch {
@@ -185,7 +187,12 @@ function App() {
     navigate('run')
     setNotice('正在加载诊断运行…')
     try {
-      setRun(await getRun(runId))
+      const [nextRun, tools] = await Promise.all([
+        getRun(runId),
+        getRunTools(runId).catch(() => ({ items: [] as ToolExecution[], total: 0 })),
+      ])
+      setRun(nextRun)
+      setToolExecutions(tools.items)
       setEvents([])
       await readEvents(runId, 0, (event) => setEvents((current) => [...current, event]))
       setNotice('已连接 BugLens API · 运行状态已同步')
@@ -202,6 +209,7 @@ function App() {
         updated_at: item?.updated_at ?? demoRun.updated_at,
       })
       setEvents(demoEvents)
+      setToolExecutions([])
       setNotice('演示数据 · API 尚未连接')
     }
   }
@@ -238,6 +246,7 @@ function App() {
     try {
       await readCommandStream(`/v1/runs/${encodeURIComponent(run.run_id)}/commands`, command, (event) => setEvents((current) => appendEvent(current, event)))
       setRun(await getRun(run.run_id))
+      getRunTools(run.run_id).then((result) => setToolExecutions(result.items)).catch(() => undefined)
       setNotice('环境已确认，诊断继续推进')
     } catch {
       setNotice('演示模式：环境确认未连接到后端')
@@ -331,7 +340,7 @@ function App() {
         {stageLabels.map(([node, label], index) => <div className={`stage ${index < stageIndex || run.lifecycle_status === 'completed' ? 'done' : ''} ${node === run.current_node ? 'active' : ''}`} key={node}><span className="stage-number">{index < stageIndex || run.lifecycle_status === 'completed' ? '✓' : `0${index + 1}`}</span><span>{label}</span>{index < stageLabels.length - 1 && <span className="stage-line" />}</div>)}
       </section>
       <nav className="view-tabs" aria-label="诊断视图">{[['overview', '概览'], ['evidence', '证据与假设'], ['events', '事件记录']].map(([key, label]) => <button className={view === key ? 'selected' : ''} onClick={() => setView(key as typeof view)} key={key}>{label}</button>)}</nav>
-      {view === 'events' ? <EventsPanel events={events} /> : view === 'evidence' ? <EvidenceView run={run} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} onSkip={skipClarification} onApproval={resolveToolApproval} onConfirmTarget={confirmTarget} />}
+      {view === 'events' ? <EventsPanel events={events} /> : view === 'evidence' ? <EvidenceView run={run} toolExecutions={toolExecutions} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} onSkip={skipClarification} onApproval={resolveToolApproval} onConfirmTarget={confirmTarget} />}
       </>}
     </main>
     </div>
@@ -412,6 +421,8 @@ function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpe
 function EnvironmentPage({ environments, config, plugins, onConfigChange }: { environments: EnvironmentList; config: EnvironmentConfig | null; plugins: PluginList; onConfigChange: (config: EnvironmentConfig | null) => void }) {
   const [jsonText, setJsonText] = useState('')
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
+  const [secretClears, setSecretClears] = useState<Record<string, boolean>>({})
+  const [checkResults, setCheckResults] = useState<Record<string, string>>({})
   const [message, setMessage] = useState('')
   useEffect(() => {
     if (config) setJsonText(JSON.stringify(config.config, null, 2))
@@ -436,7 +447,15 @@ function EnvironmentPage({ environments, config, plugins, onConfigChange }: { en
     }
   }
   function buildSecretUpdates() {
-    const updates: Record<string, Record<string, { action: 'set'; value: string }>> = {}
+    const updates: Record<string, Record<string, { action: 'set' | 'clear'; value?: string }>> = {}
+    for (const [key, selected] of Object.entries(secretClears)) {
+      if (!selected) continue
+      const separator = key.indexOf(':')
+      const instanceId = key.slice(0, separator)
+      const field = key.slice(separator + 1)
+      if (!instanceId || !['username', 'password', 'token'].includes(field)) continue
+      updates[instanceId] = { ...(updates[instanceId] ?? {}), [field]: { action: 'clear' } }
+    }
     for (const [key, value] of Object.entries(secretDrafts)) {
       if (!value.trim()) continue
       const separator = key.indexOf(':')
@@ -453,6 +472,7 @@ function EnvironmentPage({ environments, config, plugins, onConfigChange }: { en
       const next = await applyAdminEnvironmentConfig({ config: payload, expected_revision: config.revision, secret_updates: buildSecretUpdates() })
       onConfigChange(next)
       setSecretDrafts({})
+      setSecretClears({})
       setMessage('环境目录已原子保存；已有运行继续使用原快照')
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '保存失败，请重试')
@@ -464,7 +484,38 @@ function EnvironmentPage({ environments, config, plugins, onConfigChange }: { en
       <section className="panel"><PanelHeader title="可用环境" meta={`${environments.items.length} 个`} />{environments.items.length === 0 ? <div className="empty-state">尚未配置环境目录</div> : <div className="environment-list">{environments.items.map((item) => <div className="environment-row" key={item.environment_id}><span className="environment-mark">◈</span><div><strong>{item.display_name}</strong><small className="mono">{item.environment_id} · {item.level}{item.region ? ` · ${item.region}` : ''}</small></div><span className="muted">{item.aliases.join(' / ') || '无别名'}</span></div>)}</div>}</section>
       <section className="panel"><PanelHeader title="已发现插件" meta={`${plugins.items.length} 个`} />{plugins.items.length === 0 ? <div className="empty-state">没有已安装的 tool plugin；外部工具默认关闭</div> : <div className="plugin-list">{plugins.items.map((plugin) => <div className="plugin-row" key={plugin.plugin_id}><div><strong className="mono">{plugin.plugin_id}</strong><small>{plugin.capabilities.join(' · ')} · API {plugin.api_major}</small></div><span className="admin-status-pill"><i />{plugin.instance_ids.length} 个实例</span></div>)}</div>}</section>
     </div>
-    <section className="panel environment-editor"><PanelHeader title="环境目录 JSON（非敏感字段）" meta={config ? `revision ${config.revision}` : '未连接'} /><p className="config-callout">密码、token、用户名不会从后端返回；保留字段中的 is_set 标记即可。需要轮换凭据时，在下方临时输入，提交后不会回显。</p><textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} rows={18} spellCheck={false} disabled={!config?.writable} /><div className="secret-editor">{instances.map((instance) => { const id = String(instance.id ?? ''); const pluginId = String(instance.plugin_id ?? 'unknown'); return <div className="secret-row" key={id}><strong>{id || '未命名实例'}</strong><small>{pluginId} · 仅本次提交使用</small><input type="password" value={secretDrafts[`${id}:password`] ?? ''} onChange={(event) => setSecretDrafts((current) => ({ ...current, [`${id}:password`]: event.target.value }))} placeholder="更新 password（可选）" autoComplete="new-password" /></div> })}</div><div className="settings-actions"><button className="quiet-button" onClick={validate} disabled={!config?.writable}>验证目录</button><button className="primary-button" onClick={save} disabled={!config?.writable}>保存环境配置</button></div>{message && <div className="form-message">{message}</div>}</section>
+    <section className="panel environment-editor">
+      <PanelHeader title="环境目录 JSON（非敏感字段）" meta={config ? `revision ${config.revision}` : '未连接'} />
+      <p className="config-callout">密码、token、用户名不会从后端返回；保留字段中的 is_set 标记即可。凭据只能通过下方 set/clear 操作更新。</p>
+      <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} rows={18} spellCheck={false} disabled={!config?.writable} />
+      <div className="secret-editor">{instances.map((instance) => {
+        const id = String(instance.id ?? '')
+        const pluginId = String(instance.plugin_id ?? 'unknown')
+        return <div className="secret-row" key={id}>
+          <strong>{id || '未命名实例'}</strong>
+          <small>{pluginId} · 凭据仅用于本次提交，不会回显</small>
+          {(['username', 'password', 'token'] as const).map((field) => {
+            const key = `${id}:${field}`
+            return <div className="form-row" key={field}>
+              <input type={field === 'username' ? 'text' : 'password'} value={secretDrafts[key] ?? ''} onChange={(event) => { const value = event.target.value; setSecretDrafts((current) => ({ ...current, [key]: value })); if (value) setSecretClears((current) => ({ ...current, [key]: false })) }} placeholder={`设置新的 ${field}（可选）`} autoComplete="new-password" />
+              <label><input type="checkbox" checked={secretClears[key] ?? false} onChange={(event) => { const checked = event.target.checked; setSecretClears((current) => ({ ...current, [key]: checked })); if (checked) setSecretDrafts((current) => ({ ...current, [key]: '' })) }} /> 清除 {field}</label>
+            </div>
+          })}
+          <button type="button" className="quiet-button" onClick={async () => {
+            setCheckResults((current) => ({ ...current, [id]: '检查中…' }))
+            try {
+              const result = await checkAdminPluginInstance(id)
+              setCheckResults((current) => ({ ...current, [id]: `${result.status} · ${result.detail}` }))
+            } catch (error) {
+              setCheckResults((current) => ({ ...current, [id]: error instanceof Error ? error.message : '连接检查失败' }))
+            }
+          }} disabled={!id}>检查连接</button>
+          {checkResults[id] && <small>{checkResults[id]}</small>}
+        </div>
+      })}</div>
+      <div className="settings-actions"><button className="quiet-button" onClick={validate} disabled={!config?.writable}>验证目录</button><button className="primary-button" onClick={save} disabled={!config?.writable}>保存环境配置</button></div>
+      {message && <div className="form-message">{message}</div>}
+    </section>
   </div>
 }
 
@@ -593,7 +644,23 @@ function Overview({ run, latestEvent, onNew, onClarification, onSkip, onApproval
   </div>
 }
 
-function EvidenceView({ run }: { run: Run }) { return <div className="evidence-layout"><section className="panel"><PanelHeader title="输入证据" meta={`${run.source_evidence.length} 条`} />{run.source_evidence.map((item, index) => <div className="evidence-row" key={`${item.source}-${index}`}><span className={`source-badge ${item.source}`}>{item.source}</span><div><p>{item.content}</p>{item.reference && <span className="mono muted">{item.reference}</span>}</div></div>)}</section><section className="panel"><PanelHeader title="待补充信息" />{run.investigation?.evidence_gaps.length ? <ul className="gap-list">{run.investigation.evidence_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul> : <div className="empty-state">当前没有待补充信息</div>}<div className="collect-box"><span>下一步建议</span>{run.investigation?.next_data_to_collect.map((item) => <p key={item}>＋ {item}</p>)}</div></section></div> }
+function EvidenceView({ run, toolExecutions }: { run: Run; toolExecutions: ToolExecution[] }) {
+  return <div className="evidence-layout">
+    <section className="panel"><PanelHeader title="输入证据" meta={`${run.source_evidence.length} 条`} />{run.source_evidence.map((item, index) => <div className="evidence-row" key={`${item.source}-${index}`}><span className={`source-badge ${item.source}`}>{item.source}</span><div><p>{item.content}</p>{item.reference && <span className="mono muted">{item.reference}</span>}</div></div>)}</section>
+    <section className="panel"><PanelHeader title="环境与数据源" meta={run.environment_snapshot?.display_name} />{run.environment_snapshot ? <div className="collect-box"><span className="mono">{run.environment_snapshot.snapshot_id}</span><p>{run.environment_snapshot.environment_id} · {run.environment_snapshot.level} · {run.environment_snapshot.timezone}</p>{run.environment_snapshot.sources.map((source) => <p key={source.id}>＋ {source.kind} · <span className="mono">{source.id}</span></p>)}</div> : <div className="empty-state">此运行没有环境快照</div>}</section>
+    <section className="panel"><PanelHeader title="只读工具审计" meta={`${toolExecutions.length} 次`} />{toolExecutions.length ? toolExecutions.map((item) => <div className="evidence-row" key={item.tool_execution_id}><span className={`admin-status-pill ${item.status}`}><i />{item.status}</span><div><p>{item.operation ?? item.tool_name} · {item.source_id ?? '无数据源'}{item.duration_ms != null ? ` · ${item.duration_ms}ms` : ''}{item.truncated ? ' · 已截断' : ''}</p><span className="mono muted">{item.plugin_id ?? 'core'}{item.plugin_implementation_version ? `@${item.plugin_implementation_version}` : ''} · Evidence {parseEvidenceIds(item.evidence_ids_json).join(', ') || '—'}</span>{item.redacted_query && <code>{item.redacted_query}</code>}</div></div>) : <div className="empty-state">当前没有外部工具调用</div>}</section>
+    <section className="panel"><PanelHeader title="待补充信息" />{run.investigation?.evidence_gaps.length ? <ul className="gap-list">{run.investigation.evidence_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul> : <div className="empty-state">当前没有待补信息</div>}<div className="collect-box"><span>下一步建议</span>{run.investigation?.next_data_to_collect.map((item) => <p key={item}>＋ {item}</p>)}</div></section>
+  </div>
+}
+
+function parseEvidenceIds(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed) ? parsed.map(String) : []
+  } catch {
+    return []
+  }
+}
 
 function EventsPanel({ events }: { events: DomainEvent[] }) { return <section className="panel events-panel"><PanelHeader title="事件记录" meta={`${events.length} 个已提交事件`} /><div className="event-table"><div className="event-header"><span>序号</span><span>事件</span><span>详情</span><span>时间</span></div>{events.map((event) => <div className="event-row" key={event.event_id}><span className="mono">{String(event.sequence).padStart(2, '0')}</span><span className="event-type"><i />{event.event_type}</span><span>{event.summary ?? event.node ?? '—'}</span><span className="muted">{event.occurred_at}</span></div>)}</div></section> }
 
@@ -648,18 +715,21 @@ function ApprovalCard({ request, onResolve, canApprove, canReject }: { request: 
 function NewDiagnosis({ profiles, environments, onClose, onSubmit }: { profiles: string[]; environments: EnvironmentSummary[]; onClose: () => void; onSubmit: (question: string, context: Record<string, string>, evidence: Evidence[], profile: string, target: TargetSpec) => void }) {
   const [question, setQuestion] = useState('')
   const [mode, setMode] = useState<'explicit' | 'infer'>('infer')
-  const [environment, setEnvironment] = useState(environments[0]?.environment_id ?? 'production')
+  const [environment, setEnvironment] = useState(environments[0]?.environment_id ?? '')
   const [environmentHint, setEnvironmentHint] = useState('')
   const [service, setService] = useState('')
   const [log, setLog] = useState('')
   const [profile, setProfile] = useState(profiles[0] ?? 'default')
+  useEffect(() => {
+    if (!environment && environments[0]) setEnvironment(environments[0].environment_id)
+  }, [environment, environments])
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (!question.trim()) return
-    const hint = mode === 'infer' ? (environmentHint.trim() || environment) : environment
-    onSubmit(question, { ...(hint ? { environment: hint } : {}), ...(service ? { service } : {}) }, log.trim() ? [{ source: 'log', content: log }] : [], profile, { mode, environment_id: mode === 'explicit' ? environment : null, primary_service_id: service || null })
+    if (!question.trim() || (mode === 'explicit' && !environment)) return
+    const hint = mode === 'infer' ? environmentHint.trim() : environment
+    onSubmit(question, { ...(hint ? { environment: hint } : {}), ...(service ? { service } : {}) }, log.trim() ? [{ source: 'log', content: log }] : [], profile, { mode, environment_id: hint || null, primary_service_id: service || null })
   }
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>目标方式<select value={mode} onChange={(event) => setMode(event.target.value as 'explicit' | 'infer')}><option value="infer">自动推断后确认</option><option value="explicit">明确选择环境</option></select></label>{mode === 'explicit' ? <label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}>{(environments.length ? environments : [{ environment_id: 'production', display_name: 'Production', aliases: [], level: 'unknown', timezone: 'UTC', tags: {} }]).map((item) => <option key={item.environment_id} value={item.environment_id}>{item.display_name} · {item.environment_id}</option>)}</select></label> : <label>环境/别名提示<input value={environmentHint} onChange={(event) => setEnvironmentHint(event.target.value)} placeholder="production、prod 或线上" /></label>}</div><label>主服务提示<span className="optional">可选</span><input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label></div><div className="modal-footer"><span>确认后会生成不可变环境快照</span><button type="submit" className="primary-button" disabled={!question.trim()}>开始诊断 →</button></div></form></div>
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>目标方式<select value={mode} onChange={(event) => setMode(event.target.value as 'explicit' | 'infer')}><option value="infer">自动推断后确认</option><option value="explicit">明确选择环境</option></select></label>{mode === 'explicit' ? <label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option value="" disabled>请选择已配置环境</option>{environments.map((item) => <option key={item.environment_id} value={item.environment_id}>{item.display_name} · {item.environment_id}</option>)}</select></label> : <label>环境/别名提示<input value={environmentHint} onChange={(event) => setEnvironmentHint(event.target.value)} placeholder="production、prod 或线上" /></label>}</div><label>主服务提示<span className="optional">可选</span><input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label></div><div className="modal-footer"><span>确认后会生成不可变环境快照</span><button type="submit" className="primary-button" disabled={!question.trim() || (mode === 'explicit' && !environment)}>开始诊断 →</button></div></form></div>
 }
 
 function PanelHeader({ title, meta }: { title: string; meta?: string }) { return <div className="panel-header"><h2>{title}</h2>{meta && <span>{meta}</span>}</div> }

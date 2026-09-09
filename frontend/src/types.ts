@@ -33,6 +33,7 @@ export type PendingTargetConfirmation = {
   request_id: string
   requested_target: TargetSpec
   candidates: TargetCandidate[]
+  config_revision?: string | null
 }
 
 export type EnvironmentSummary = {
@@ -64,10 +65,37 @@ export type PluginView = {
 
 export type PluginList = { items: PluginView[] }
 
+export type PluginHealth = {
+  status: 'ok' | 'degraded' | 'error'
+  detail: string
+  plugin_id?: string | null
+  implementation_version?: string | null
+}
+
 export type EnvironmentConfig = {
   revision: string
   writable: boolean
   config: Record<string, unknown>
+}
+
+export type ToolExecution = {
+  tool_execution_id: string
+  tool_name: string
+  plugin_id?: string | null
+  plugin_implementation_version?: string | null
+  plugin_instance_id?: string | null
+  environment_snapshot_id?: string | null
+  source_id?: string | null
+  operation?: string | null
+  redacted_query?: string | null
+  query_fingerprint?: string | null
+  status: string
+  error_code?: string | null
+  evidence_ids_json: string
+  truncated: boolean
+  started_at: string
+  completed_at?: string | null
+  duration_ms?: number | null
 }
 
 export type Evidence = {
@@ -172,6 +200,21 @@ export type Run = {
   target: TargetSpec
   pending_target_confirmation?: PendingTargetConfirmation | null
   environment_snapshot_id?: string | null
+  environment_snapshot?: {
+    snapshot_id: string
+    environment_id: string
+    display_name: string
+    level: string
+    region?: string | null
+    timezone: string
+    primary_service_id?: string | null
+    sources: Array<{
+      id: string
+      kind: 'database' | 'logs'
+      service_ids: string[]
+      node_ids: string[]
+    }>
+  } | null
   revision: number
   attempt: number
   clarification_round: number

@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import uuid4
 
 from .config import ResolvedRunConfig
 from .environment import ResolvedEnvironmentSnapshot
@@ -180,6 +181,15 @@ class SQLiteCheckpointStore:
             );
             CREATE INDEX IF NOT EXISTS idx_tool_executions_node
                 ON diagnosis_tool_executions(node_execution_id, started_at);
+            CREATE TABLE IF NOT EXISTS diagnosis_tool_budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                released_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_budget_run
+                ON diagnosis_tool_budget_reservations(run_id, released_at, expires_at);
             CREATE TABLE IF NOT EXISTS diagnosis_evidence (
                 evidence_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
@@ -658,6 +668,70 @@ class SQLiteCheckpointStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def reserve_tool_budget(
+        self,
+        run_id: str,
+        *,
+        max_calls: int,
+        max_concurrent: int,
+        ttl_seconds: float,
+    ) -> tuple[str | None, str | None]:
+        """Atomically reserve a durable, expiring external-tool call slot."""
+        now = time.time()
+        reservation_id = f"toolres_{uuid4().hex}"
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                """UPDATE diagnosis_tool_budget_reservations
+                   SET released_at = ?
+                   WHERE run_id = ? AND released_at IS NULL AND expires_at <= ?""",
+                (datetime.now(UTC).isoformat(), run_id, now),
+            )
+            used = int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM diagnosis_tool_budget_reservations WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            active = int(
+                self.db.execute(
+                    """SELECT COUNT(*) FROM diagnosis_tool_budget_reservations
+                       WHERE run_id = ? AND released_at IS NULL AND expires_at > ?""",
+                    (run_id, now),
+                ).fetchone()[0]
+            )
+            if used >= max(0, max_calls):
+                self.db.commit()
+                return None, "tool_budget_exceeded"
+            if active >= max(1, max_concurrent):
+                self.db.commit()
+                return None, "tool_concurrency_limit"
+            self.db.execute(
+                """INSERT INTO diagnosis_tool_budget_reservations
+                   (reservation_id, run_id, created_at, expires_at, released_at)
+                   VALUES (?, ?, ?, ?, NULL)""",
+                (
+                    reservation_id,
+                    run_id,
+                    datetime.now(UTC).isoformat(),
+                    now + max(1.0, ttl_seconds),
+                ),
+            )
+            self.db.commit()
+            return reservation_id, None
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def release_tool_budget(self, reservation_id: str) -> None:
+        self.db.execute(
+            """UPDATE diagnosis_tool_budget_reservations
+               SET released_at = COALESCE(released_at, ?)
+               WHERE reservation_id = ?""",
+            (datetime.now(UTC).isoformat(), reservation_id),
+        )
+        self.db.commit()
+
     def register_evidence(self, run_id: str, evidence: EvidenceRecord) -> None:
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -1028,6 +1102,13 @@ class SQLiteCheckpointStore:
     def recover_interrupted_executions(self, run_id: str) -> list[dict[str, Any]]:
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            now = datetime.now(UTC).isoformat()
+            self.db.execute(
+                """UPDATE diagnosis_tool_budget_reservations
+                   SET released_at = COALESCE(released_at, ?)
+                   WHERE run_id = ? AND released_at IS NULL""",
+                (now, run_id),
+            )
             rows = self.db.execute(
                 "SELECT * FROM diagnosis_node_executions WHERE run_id = ? AND status = 'running'",
                 (run_id,),
@@ -1035,7 +1116,6 @@ class SQLiteCheckpointStore:
             if not rows:
                 self.db.commit()
                 return []
-            now = datetime.now(UTC).isoformat()
             self.db.execute(
                 """UPDATE diagnosis_node_executions SET status = 'interrupted',
                 error_code = 'process_interrupted', error_message = ?, retryable = 1,

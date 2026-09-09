@@ -773,6 +773,7 @@ class NativeDiagnosisGraph(DiagnosisGraph):
             question=state.user_question,
             context=state.context,
             evidence=self.context_assembler.evidence(state),
+            target=self.context_assembler.target(state),
             answers=state.answers[-100:],
             analysis=state.analysis,
             investigation=state.investigation,

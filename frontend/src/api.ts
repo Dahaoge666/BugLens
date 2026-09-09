@@ -1,4 +1,4 @@
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, PluginList, Run } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, PluginHealth, PluginList, Run, ToolExecution } from './types'
 
 const baseUrl = (import.meta.env.VITE_BUGLENS_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 const adminToken = (import.meta.env.VITE_BUGLENS_ADMIN_TOKEN as string | undefined)?.trim()
@@ -65,6 +65,12 @@ export function getAdminSessions() {
   return getJson<{ items: AdminSession[]; total: number }>('/v1/admin/sessions?limit=100')
 }
 
+export function getRunTools(runId: string) {
+  return getJson<{ items: ToolExecution[]; total: number }>(
+    `/v1/admin/runs/${encodeURIComponent(runId)}/tools?limit=100`,
+  )
+}
+
 export function getAdminConfig() {
   return getJson<AdminConfig>('/v1/admin/config')
 }
@@ -87,6 +93,19 @@ export function getAdminPlugins() {
 
 export function getAdminEnvironmentConfig() {
   return getJson<EnvironmentConfig>('/v1/admin/environment-config')
+}
+
+export function checkAdminPluginInstance(instanceId: string) {
+  return fetch(
+    `${baseUrl}/v1/admin/plugin-instances/${encodeURIComponent(instanceId)}/check`,
+    {
+      method: 'POST',
+      headers: { accept: 'application/json', ...authHeaders() },
+    },
+  ).then(async (response) => {
+    if (!response.ok) throw new Error(`连接检查失败（${response.status}）`)
+    return response.json() as Promise<PluginHealth>
+  })
 }
 
 export function validateAdminConfig(payload: { profile: string; config: Record<string, unknown>; expected_revision: string }) {

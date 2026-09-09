@@ -31,6 +31,7 @@ from .environment import (
     EnvironmentRepository,
     PluginInstanceConfig,
     ResolvedEnvironmentSnapshot,
+    SnapshotPluginInstance,
     SnapshotSource,
     ToolLimits,
 )
@@ -79,12 +80,15 @@ def _call_factory(factory: Any, config: dict[str, Any]) -> Any:
     if not callable(factory):
         return copy.copy(factory)
     try:
-        return factory(config)
-    except TypeError as first_error:
-        try:
-            return factory()
-        except TypeError:
-            raise first_error
+        inspect.signature(factory).bind(config)
+    except TypeError:
+        return factory()
+    except (ValueError, AttributeError):
+        # Some extension callables do not expose a signature.  Calling with
+        # the documented config argument preserves their own TypeError rather
+        # than mistaking it for an arity mismatch.
+        pass
+    return factory(config)
 
 
 class PluginManager:
@@ -94,6 +98,7 @@ class PluginManager:
         self._registrations: dict[str, _PluginRegistration] = {}
         self._instances: dict[str, Any] = {}
         self._instance_fingerprints: dict[str, str] = {}
+        self._instance_lock = threading.RLock()
         for plugin in plugins or []:
             self.register(plugin)
 
@@ -250,6 +255,22 @@ class PluginManager:
             )
         for instance in directory.plugin_instances:
             self.validate_instance(instance, sources_by_instance.get(instance.id))
+        instances = {item.id: item for item in directory.plugin_instances}
+        for source in directory.sources:
+            if not source.enabled:
+                continue
+            instance = instances[source.plugin_instance_id]
+            if not instance.enabled:
+                raise PluginConfigError(
+                    f"enabled source {source.id} uses disabled plugin instance "
+                    f"{instance.id}"
+                )
+            capabilities = set(self.manifest(instance.plugin_id).capabilities)
+            if source.kind not in capabilities:
+                raise PluginConfigError(
+                    f"plugin {instance.plugin_id} does not support {source.kind} "
+                    f"source {source.id}"
+                )
 
     @staticmethod
     def _runtime_config(instance: PluginInstanceConfig) -> dict[str, Any]:
@@ -271,62 +292,79 @@ class PluginManager:
         registration = self._registrations.get(instance.plugin_id)
         if registration is None:
             raise PluginConfigError(f"plugin is not installed: {instance.plugin_id}")
-        config = self._runtime_config(instance)
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                config, sort_keys=True, default=str, separators=(",", ":")
-            ).encode()
-        ).hexdigest()
-        if self._instance_fingerprints.get(instance.id) != fingerprint:
-            old = self._instances.pop(instance.id, None)
-            if old is not None and callable(getattr(old, "close", None)):
-                old.close()
-            plugin = _call_factory(registration.factory, config)
-            validator = getattr(plugin, "validate_config", None)
-            if callable(validator):
-                try:
-                    _invoke_validate(validator, config, None)
-                except PluginConfigError:
-                    raise
-                except Exception as exc:
-                    raise PluginConfigError(
-                        f"plugin instance {instance.id} rejected its configuration"
-                    ) from exc
-            self._instances[instance.id] = plugin
-            self._instance_fingerprints[instance.id] = fingerprint
-        return self._instances[instance.id]
+        with self._instance_lock:
+            config = self._runtime_config(instance)
+            fingerprint_payload = {
+                "plugin_id": instance.plugin_id,
+                "implementation_version": registration.manifest.implementation_version,
+                "config": config,
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    fingerprint_payload,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if self._instance_fingerprints.get(instance.id) != fingerprint:
+                old = self._instances.pop(instance.id, None)
+                self._instance_fingerprints.pop(instance.id, None)
+                if old is not None and callable(getattr(old, "close", None)):
+                    old.close()
+                plugin = _call_factory(registration.factory, config)
+                validator = getattr(plugin, "validate_config", None)
+                if callable(validator):
+                    try:
+                        _invoke_validate(validator, config, None)
+                    except PluginConfigError:
+                        raise
+                    except Exception as exc:
+                        raise PluginConfigError(
+                            f"plugin instance {instance.id} rejected its configuration"
+                        ) from exc
+                self._instances[instance.id] = plugin
+                self._instance_fingerprints[instance.id] = fingerprint
+            return self._instances[instance.id]
 
     async def check_health(self, instance: PluginInstanceConfig) -> PluginHealth:
         try:
             plugin = self.instance(instance)
+            manifest = self.manifest(instance.plugin_id)
             checker = getattr(plugin, "check_health", None)
             if not callable(checker):
                 return PluginHealth(
                     status="degraded",
                     detail="plugin does not advertise a health check",
                     plugin_id=instance.plugin_id,
+                    implementation_version=manifest.implementation_version,
                 )
-            result = checker()
+            if inspect.iscoroutinefunction(checker):
+                result = checker()
+            else:
+                result = await asyncio.to_thread(checker)
             if inspect.isawaitable(result):
                 result = await result
             if isinstance(result, PluginHealth):
-                return result.model_copy(
+                health = result.model_copy(
                     update={
-                        "plugin_id": result.plugin_id or instance.plugin_id,
-                        "implementation_version": (
-                            result.implementation_version
-                            or self.manifest(instance.plugin_id).implementation_version
-                        ),
+                        # Identity comes from the installed registration, not
+                        # from connector-controlled health output.
+                        "plugin_id": instance.plugin_id,
+                        "implementation_version": manifest.implementation_version,
+                    },
+                )
+            else:
+                health = PluginHealth.model_validate(
+                    {
+                        **dict(result),
+                        "plugin_id": instance.plugin_id,
+                        "implementation_version": manifest.implementation_version,
                     }
                 )
-            return PluginHealth.model_validate(
-                {
-                    **dict(result),
-                    "plugin_id": instance.plugin_id,
-                    "implementation_version": self.manifest(
-                        instance.plugin_id
-                    ).implementation_version,
-                }
+            detail = str(sanitize_data(health.detail)).strip()
+            return health.model_copy(
+                update={"detail": detail[:1_000] or "plugin health check completed"}
             )
         except Exception:
             return PluginHealth(
@@ -347,7 +385,12 @@ class PluginManager:
         executor = getattr(plugin, "execute", None)
         if not callable(executor):
             raise PluginError("plugin does not implement execute")
-        result = executor(operation, source_config, request, context)
+        if inspect.iscoroutinefunction(executor):
+            result = executor(operation, source_config, request, context)
+        else:
+            result = await asyncio.to_thread(
+                executor, operation, source_config, request, context
+            )
         if inspect.isawaitable(result):
             result = await result
         if isinstance(result, ToolResult):
@@ -355,21 +398,26 @@ class PluginManager:
         return ToolResult.model_validate(result)
 
     def close(self) -> None:
-        for plugin in list(self._instances.values()):
-            close = getattr(plugin, "close", None)
-            if callable(close):
-                close()
-        self._instances.clear()
-        self._instance_fingerprints.clear()
+        with self._instance_lock:
+            for plugin in list(self._instances.values()):
+                close = getattr(plugin, "close", None)
+                if callable(close):
+                    close()
+            self._instances.clear()
+            self._instance_fingerprints.clear()
 
 
 def _invoke_validate(
     validator: Any, instance_config: dict[str, Any], source_config: Any
 ) -> None:
     try:
-        result = validator(instance_config, source_config)
+        inspect.signature(validator).bind(instance_config, source_config)
     except TypeError:
         result = validator(instance_config)
+    except (ValueError, AttributeError):
+        result = validator(instance_config, source_config)
+    else:
+        result = validator(instance_config, source_config)
     if inspect.isawaitable(result):
         raise PluginConfigError("validate_config must be synchronous")
     if result is False:
@@ -423,8 +471,7 @@ class EnvironmentToolService:
                     status=ToolResultStatus.REJECTED, warnings=["target_not_confirmed"]
                 )
             )
-        budget = self._budget(runtime)
-        rejection = self._reserve(budget)
+        rejection, reservation_id, budget = self._reserve_for_runtime(runtime)
         if rejection is not None:
             return _tool_result(
                 ToolResult(
@@ -433,14 +480,24 @@ class EnvironmentToolService:
                 )
             )
         try:
+            result = ToolResult(
+                status=ToolResultStatus.SUCCEEDED,
+                structured_result=snapshot.public_view(),
+            )
             return _tool_result(
-                ToolResult(
-                    status=ToolResultStatus.SUCCEEDED,
-                    structured_result=snapshot.model_dump(mode="json"),
+                self._bound_plugin_result(
+                    result,
+                    min(
+                        max(
+                            1_024,
+                            int(getattr(runtime, "tool_result_bytes", 65_536)),
+                        ),
+                        1_048_576,
+                    ),
                 )
             )
         finally:
-            self._release(budget)
+            self._release_for_runtime(runtime, reservation_id, budget)
 
     async def call(
         self, operation: str, runtime: Any, request: dict[str, Any]
@@ -452,8 +509,7 @@ class EnvironmentToolService:
                     status=ToolResultStatus.REJECTED, warnings=["target_not_confirmed"]
                 )
             )
-        budget = self._budget(runtime)
-        rejection = self._reserve(budget)
+        rejection, reservation_id, budget = self._reserve_for_runtime(runtime)
         if rejection is not None:
             return _tool_result(
                 ToolResult(
@@ -462,6 +518,8 @@ class EnvironmentToolService:
                 )
             )
         started = time.monotonic()
+        release_deferred = False
+        execution_task: asyncio.Task[Any] | None = None
         try:
             if operation == "describe_database":
                 kind = "database"
@@ -485,8 +543,17 @@ class EnvironmentToolService:
                         warnings=["source_not_allowed"],
                     )
                 )
+            if operation == "search_logs":
+                filter_error = self._validate_log_filters(snapshot, source, request)
+                if filter_error is not None:
+                    return _tool_result(
+                        ToolResult(
+                            status=ToolResultStatus.REJECTED,
+                            warnings=[filter_error],
+                        )
+                    )
             try:
-                instance = self._current_instance(source)
+                instance = self._current_instance(snapshot, source)
             except PluginError:
                 return _tool_result(
                     ToolResult(
@@ -531,17 +598,39 @@ class EnvironmentToolService:
             call_request["max_results"] = max_results
             call_request["max_bytes"] = max_bytes
             try:
-                result = await asyncio.wait_for(
+                execution_task = asyncio.create_task(
                     self.plugins.execute(
                         instance, operation, source.config, call_request, context
-                    ),
-                    timeout=max(0.1, context.remaining_seconds),
+                    )
                 )
-            except asyncio.TimeoutError:
-                result = ToolResult(
-                    status=ToolResultStatus.UNAVAILABLE,
-                    warnings=["tool_timeout"],
-                )
+                try:
+                    # Shield the connector task so a core timeout does not
+                    # cancel a sync plugin's worker thread.  Its budget slot
+                    # stays occupied until that task really finishes.
+                    result = await asyncio.wait_for(
+                        asyncio.shield(execution_task),
+                        timeout=max(0.1, context.remaining_seconds),
+                    )
+                except asyncio.TimeoutError:
+                    release_deferred = True
+                    execution_task.add_done_callback(
+                        lambda task: self._release_after_task(
+                            task, runtime, reservation_id, budget
+                        )
+                    )
+                    result = ToolResult(
+                        status=ToolResultStatus.UNAVAILABLE,
+                        warnings=["tool_timeout"],
+                    )
+                except asyncio.CancelledError:
+                    if not execution_task.done():
+                        release_deferred = True
+                        execution_task.add_done_callback(
+                            lambda task: self._release_after_task(
+                                task, runtime, reservation_id, budget
+                            )
+                        )
+                    raise
             except PluginError:
                 result = ToolResult(
                     status=ToolResultStatus.UNAVAILABLE,
@@ -553,6 +642,7 @@ class EnvironmentToolService:
                     status=ToolResultStatus.UNAVAILABLE,
                     warnings=["plugin_execution_failed"],
                 )
+            result = self._bound_plugin_result(result, max_bytes)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if result.elapsed_ms is None:
                 result = result.model_copy(update={"elapsed_ms": elapsed_ms})
@@ -561,7 +651,120 @@ class EnvironmentToolService:
                 evidence=self._evidence_for(result, source, operation, elapsed_ms),
             )
         finally:
-            self._release(budget)
+            if not release_deferred:
+                self._release_for_runtime(runtime, reservation_id, budget)
+
+    @staticmethod
+    def _release_after_task(
+        task: asyncio.Task[Any],
+        runtime: Any,
+        reservation_id: str | None,
+        budget: _RunBudget | None,
+    ) -> None:
+        """Consume a late connector outcome and release its held slot."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        try:
+            EnvironmentToolService._release_for_runtime(runtime, reservation_id, budget)
+        except Exception:
+            # A process may close its store while a timed-out worker is winding
+            # down. Durable reservations have an expiry and recovery also
+            # releases them, so cleanup failure must not surface as a task error.
+            pass
+
+    @staticmethod
+    def _bound_plugin_result(result: ToolResult, max_bytes: int) -> ToolResult:
+        # Normalize every plugin-controlled field before the result is used for
+        # Evidence, audit, or state persistence.  Sanitizing only the payload
+        # would still allow a faulty connector to put a credential in a
+        # warning, cursor, or source locator.
+        try:
+            result = ToolResult.model_validate(
+                sanitize_data(result.model_dump(mode="json"))
+            )
+        except (TypeError, ValueError):
+            return ToolResult(
+                status=ToolResultStatus.UNAVAILABLE,
+                warnings=["plugin_result_invalid"],
+            )
+        if result.structured_result is None:
+            return result
+        clean = sanitize_data(result.structured_result)
+        try:
+            encoded = json.dumps(
+                clean,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return ToolResult(
+                status=ToolResultStatus.UNAVAILABLE,
+                warnings=["plugin_result_invalid"],
+            )
+        if len(encoded) <= max_bytes:
+            status = (
+                ToolResultStatus.PARTIAL
+                if result.truncated and result.status == ToolResultStatus.SUCCEEDED
+                else result.status
+            )
+            return result.model_copy(
+                update={"status": status, "structured_result": clean}
+            )
+        return result.model_copy(
+            update={
+                "status": (
+                    ToolResultStatus.PARTIAL
+                    if result.status
+                    in {ToolResultStatus.SUCCEEDED, ToolResultStatus.PARTIAL}
+                    else result.status
+                ),
+                "structured_result": {
+                    "omitted": "plugin result exceeded the core byte limit",
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "bytes": len(encoded),
+                },
+                "truncated": True,
+                "warnings": [*result.warnings[:49], "core_result_limit"],
+            }
+        )
+
+    def _reserve_for_runtime(
+        self, runtime: Any
+    ) -> tuple[str | None, str | None, _RunBudget | None]:
+        observer = getattr(runtime, "execution_observer", None)
+        persistent_reserve = getattr(observer, "reserve_tool_budget", None)
+        max_calls = max(0, int(getattr(runtime, "tool_max_calls", 20)))
+        max_concurrent = max(1, int(getattr(runtime, "tool_max_concurrent", 2)))
+        if callable(persistent_reserve):
+            reservation_id, rejection = persistent_reserve(
+                max_calls=max_calls,
+                max_concurrent=max_concurrent,
+                ttl_seconds=max(
+                    5.0,
+                    float(getattr(runtime, "tool_timeout_seconds", 10)) + 5.0,
+                ),
+            )
+            return rejection, reservation_id, None
+        budget = self._budget(runtime)
+        return self._reserve(budget), None, budget
+
+    @staticmethod
+    def _release_for_runtime(
+        runtime: Any,
+        reservation_id: str | None,
+        budget: _RunBudget | None,
+    ) -> None:
+        if reservation_id is not None:
+            observer = getattr(runtime, "execution_observer", None)
+            release = getattr(observer, "release_tool_budget", None)
+            if callable(release):
+                release(reservation_id)
+                return
+        if budget is not None:
+            EnvironmentToolService._release(budget)
 
     @staticmethod
     def _reserve(budget: _RunBudget) -> str | None:
@@ -581,7 +784,55 @@ class EnvironmentToolService:
         with budget.lock:
             budget.active = max(0, budget.active - 1)
 
-    def _current_instance(self, source: SnapshotSource) -> PluginInstanceConfig:
+    @staticmethod
+    def _validate_log_filters(
+        snapshot: ResolvedEnvironmentSnapshot,
+        source: SnapshotSource,
+        request: dict[str, Any],
+    ) -> str | None:
+        requested_services, service_error = EnvironmentToolService._filter_ids(
+            request.get("service_ids", [])
+        )
+        requested_nodes, node_error = EnvironmentToolService._filter_ids(
+            request.get("node_ids", [])
+        )
+        if service_error:
+            return "service_filter_invalid"
+        if node_error:
+            return "node_filter_invalid"
+        snapshot_services = {item.id for item in snapshot.services}
+        snapshot_nodes = {item.id for item in snapshot.nodes}
+        allowed_services = set(source.service_ids) or snapshot_services
+        allowed_nodes = set(source.node_ids) or snapshot_nodes
+        if not requested_services.issubset(allowed_services & snapshot_services):
+            return "service_not_allowed"
+        if not requested_nodes.issubset(allowed_nodes & snapshot_nodes):
+            return "node_not_allowed"
+        return None
+
+    @staticmethod
+    def _filter_ids(value: Any) -> tuple[set[str], bool]:
+        if value is None:
+            return set(), False
+        if not isinstance(value, list) or len(value) > 100:
+            return set(), True
+        if any(not isinstance(item, str) for item in value):
+            return set(), True
+        return {item for item in value if item}, False
+
+    def _current_instance(
+        self,
+        snapshot: ResolvedEnvironmentSnapshot,
+        source: SnapshotSource,
+    ) -> PluginInstanceConfig:
+        pinned: SnapshotPluginInstance | None = snapshot.plugin_instance(
+            source.plugin_instance_id
+        )
+        if pinned is None or pinned.plugin_id != source.plugin_id:
+            # Snapshots created before plugin-instance pinning intentionally do
+            # not gain access after an upgrade; that would silently change an
+            # old run's connection and limits.
+            raise PluginConfigError("plugin instance is absent from the snapshot")
         current = next(
             (
                 item
@@ -596,7 +847,16 @@ class EnvironmentToolService:
             or current.plugin_id != source.plugin_id
         ):
             raise PluginConfigError("plugin instance is no longer enabled")
-        return current
+        return PluginInstanceConfig(
+            id=pinned.id,
+            plugin_id=pinned.plugin_id,
+            enabled=True,
+            config=copy.deepcopy(pinned.config),
+            username=current.username,
+            password=current.password,
+            token=current.token,
+            default_limits=pinned.default_limits,
+        )
 
     def audit_metadata(
         self, tool_name: str, runtime: Any, arguments: dict[str, Any] | Any

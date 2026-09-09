@@ -8,7 +8,6 @@ from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 PLUGIN_API_MAJOR = 1
 
 JSONScalar: TypeAlias = str | int | float | bool | None
@@ -72,7 +71,9 @@ class PluginManifest(_StrictModel):
         try:
             major = int(self.api_version.split(".", 1)[0])
         except (TypeError, ValueError) as exc:
-            raise ValueError("api_version must start with a numeric major version") from exc
+            raise ValueError(
+                "api_version must start with a numeric major version"
+            ) from exc
         if major != self.api_major:
             raise ValueError("api_major and api_version do not match")
         return self
@@ -89,7 +90,7 @@ class ExecutionContext(_StrictModel):
     max_results: int = Field(default=200, ge=1, le=1_000)
     max_bytes: int = Field(default=65_536, ge=1_024, le=1_048_576)
     max_scan_files: int = Field(default=100, ge=1, le=10_000)
-    max_scan_bytes: int = Field(default=16_777_216, ge=1_024, le=1_073_741_824)
+    max_scan_bytes: int = Field(default=16_777_216, ge=1_024, le=67_108_864)
 
     @property
     def remaining_seconds(self) -> float:
@@ -109,7 +110,9 @@ class ToolResult(_StrictModel):
 
     status: ToolResultStatus
     structured_result: JSONValue | None = Field(default=None, alias="result")
-    source_references: list[SourceReference] = Field(default_factory=list, max_length=100)
+    source_references: list[SourceReference] = Field(
+        default_factory=list, max_length=100
+    )
     cursor: str | None = Field(default=None, max_length=512)
     truncated: bool = False
     elapsed_ms: int | None = Field(default=None, ge=0)

@@ -94,6 +94,7 @@ class PendingTargetConfirmation(StrictModel):
     request_id: str = Field(min_length=1, max_length=128)
     requested_target: TargetSpec
     candidates: list[EnvironmentTargetCandidate] = Field(min_length=1, max_length=20)
+    config_revision: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class GraphNode(StrEnum):
@@ -701,6 +702,7 @@ class AnalyzeInput(StrictModel):
     question: str = Field(min_length=1, max_length=12_000)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    target: ResolvedTarget | None = None
     environment_hint: str | None = Field(default=None, max_length=256)
     clarification_answers: list[UserAnswer] = Field(default_factory=list, max_length=20)
 
@@ -709,6 +711,7 @@ class InvestigationInput(StrictModel):
     analysis: ProblemAnalysis
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    target: ResolvedTarget | None = None
     previous_evaluation: EvaluationResult | None = None
     previous_investigation: InvestigationResult | None = None
     clarification_answers: list[UserAnswer] = Field(default_factory=list, max_length=20)
@@ -721,6 +724,7 @@ class EvaluationInput(StrictModel):
     investigation: InvestigationResult
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    target: ResolvedTarget | None = None
     previous_evaluation: EvaluationResult | None = None
     progress_history: list[ProgressDelta] = Field(default_factory=list, max_length=20)
     rubric_version: str = Field(default="rubric-v1", max_length=128)
@@ -732,6 +736,7 @@ class SummaryInput(StrictModel):
     evaluation: EvaluationResult | None = None
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    target: ResolvedTarget | None = None
     skipped_interactions: list[SkippedInteraction] = Field(
         default_factory=list, max_length=100
     )
@@ -783,6 +788,7 @@ class NativeDiagnosisInput(StrictModel):
     question: str = Field(min_length=1, max_length=12_000)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
+    target: ResolvedTarget | None = None
     answers: list[UserAnswer] = Field(default_factory=list, max_length=100)
     analysis: ProblemAnalysis | None = None
     investigation: InvestigationResult | None = None
@@ -859,5 +865,9 @@ class GraphTransition(StrictModel):
 def replace_state(state: DiagnosisState, **updates: Any) -> DiagnosisState:
     """Create and fully validate an immutable-style state transition."""
     data = state.model_dump(mode="python")
+    # RunView adds a UI-only projection that is deliberately not part of the
+    # persisted DiagnosisState.  Keep state transitions compatible with a
+    # RunView returned by the runtime.
+    data.pop("environment_snapshot", None)
     data.update(updates)
     return DiagnosisState.model_validate(data)

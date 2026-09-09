@@ -97,7 +97,7 @@ data: {"protocol_version":"2","event_id":"evt_123","run_id":"diag_123","sequence
 - SSE 断线后，前端先读取快照，再使用最后一个已确认的 `sequence` 追赶事件；
 - 合法但没有新事件的追赶请求返回空的 200 SSE 流；Run 不存在返回 404。
 
-Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
+Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。确认过环境的 Run 还可包含无凭据的 `environment_snapshot` 展示投影（环境、服务、节点和 source 摘要）；其中不包含连接配置或插件实例凭据。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
 
 ## Admin JSON API
 
@@ -126,7 +126,7 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 
 配置更新必须发送 `expected_revision`。后端返回 409 时，前端重新读取配置并显示差异；API key 等 secret 只允许写入或清除，永远不会在响应中返回原值。SDK 审批检查点只在后端使用 `BUGLENS_RUN_STATE_KEY` 加密保存，HTTP/SSE 不返回序列化 RunState。
 
-环境目录更新同样使用 opaque `expected_revision`/`If-Match`。`secret_updates` 明确声明 `username`、`password` 或 `token` 的 `set`/`clear`；遗漏表示保留。已创建 Run 使用目标确认时的无凭据环境快照，凭据轮换对下一次插件调用生效。
+环境目录更新同样使用 opaque `expected_revision`/`If-Match`；两者同时提供时必须一致。`secret_updates` 明确声明 `username`、`password` 或 `token` 的 `set`/`clear`；遗漏表示保留。已创建 Run 使用目标确认时的无凭据环境快照，凭据轮换对下一次插件调用生效。
 
 当设置 `BUGLENS_ADMIN_TOKEN` 时，Admin 请求必须发送 `Authorization: Bearer <token>`；未设置时按部署环境决定是否允许可信内网访问。独立域名部署必须配置精确的 `BUGLENS_CORS_ORIGIN`。
 

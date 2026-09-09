@@ -15,6 +15,7 @@ from .config import Settings
 from .models import (
     Evidence,
     LifecycleStatus,
+    PendingTargetConfirmation,
     TargetSpec,
     UserAnswer,
     UserInteractionRequest,
@@ -69,7 +70,9 @@ class ConsoleClarifier:
             )
         return answers
 
-    def choose_target(self, request: TargetConfirmationRequired) -> str:
+    def choose_target(
+        self, request: TargetConfirmationRequired | PendingTargetConfirmation
+    ) -> str:
         if not self._stream.isatty():
             raise NonInteractiveClarifierError(
                 "diagnosis requires environment confirmation but stdin is not a TTY; "
@@ -251,7 +254,25 @@ async def run_cli(
             state = await client.get_run(args.skip)
         elif args.resume:
             state = await client.get_run(args.resume)
-            if "resume" in state.available_actions:
+            if (
+                "confirm_target" in state.available_actions
+                and state.pending_target_confirmation is not None
+            ):
+                pending_target = state.pending_target_confirmation
+                await _send_interactively(
+                    client,
+                    ConfirmDiagnosisTarget(
+                        run_id=args.resume,
+                        expected_revision=state.revision,
+                        request_id=pending_target.request_id,
+                        environment_id=(clarifier or ConsoleClarifier()).choose_target(
+                            pending_target
+                        ),
+                    ),
+                    clarifier or ConsoleClarifier(),
+                )
+                state = await client.get_run(args.resume)
+            elif "resume" in state.available_actions:
                 async for _ in client.send(
                     ResumeDiagnosis(
                         run_id=args.resume,
@@ -332,6 +353,9 @@ async def run_cli(
             else 2
         )
     finally:
+        service = getattr(client, "service", None)
+        if service is not None:
+            service.close()
         if runner is not None:
             runner.close()
         if store is not None:

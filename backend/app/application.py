@@ -99,6 +99,9 @@ class ApplicationService:
         async for event in self.runtime.events(run_id, after):
             yield event
 
+    def close(self) -> None:
+        self.runtime.close()
+
 
 class RuntimeApplication(Protocol):
     async def send(self, command: AgentCommand) -> AsyncIterator[AgentEvent]: ...

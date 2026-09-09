@@ -12,6 +12,7 @@ from .models import (
     EvidenceRecord,
     GraphNode,
     InvestigationInput,
+    ResolvedTarget,
     SummaryInput,
     UserAnswer,
 )
@@ -54,14 +55,29 @@ class ContextAssembler:
         ]
         return selected[-20:]
 
+    @staticmethod
+    def target(state: DiagnosisState) -> ResolvedTarget | None:
+        if not state.environment_snapshot_id or not state.target.environment_id:
+            return None
+        return ResolvedTarget(
+            environment_id=state.target.environment_id,
+            primary_service_id=state.target.primary_service_id,
+        )
+
     def build(self, node: GraphNode, state: DiagnosisState):
         evidence = self.evidence(state)
+        target = self.target(state)
         if node == GraphNode.ANALYZE:
             return AnalyzeInput(
                 question=state.user_question,
                 context=self.context(state),
                 evidence=evidence,
-                environment_hint=self.context(state).environment,
+                target=target,
+                environment_hint=(
+                    target.environment_id
+                    if target is not None
+                    else self.context(state).environment
+                ),
                 clarification_answers=self.answers(state, "analyze"),
             )
         if node == GraphNode.INVESTIGATE:
@@ -71,6 +87,7 @@ class ContextAssembler:
                 analysis=state.analysis,
                 context=self.context(state),
                 evidence=evidence,
+                target=target,
                 previous_evaluation=state.evaluation,
                 previous_investigation=state.investigation,
                 clarification_answers=self.answers(state, "investigate"),
@@ -87,6 +104,7 @@ class ContextAssembler:
                 investigation=state.investigation,
                 context=self.context(state),
                 evidence=evidence,
+                target=target,
                 previous_evaluation=state.evaluation,
                 progress_history=state.progress_deltas[-20:],
                 rubric_version=state.config_version,
@@ -108,6 +126,7 @@ class ContextAssembler:
                 evaluation=state.evaluation,
                 context=self.context(state),
                 evidence=evidence,
+                target=target,
                 skipped_interactions=state.skipped_interactions,
                 status=status,
                 attempts=state.attempt,

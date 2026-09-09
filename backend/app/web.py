@@ -45,6 +45,15 @@ class BugLensASGI:
         self.admin_token = admin_token
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    self.service.close()
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
         if scope["type"] != "http":
             return
         method = scope["method"]
@@ -367,7 +376,7 @@ class BugLensASGI:
                     ),
                     (
                         b"access-control-allow-headers",
-                        b"content-type, accept, authorization",
+                        b"content-type, accept, authorization, if-match",
                     ),
                     (b"access-control-expose-headers", b"content-type"),
                 ]
@@ -379,10 +388,15 @@ class BugLensASGI:
         payload = json.loads(body or b"{}")
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
-        if "expected_revision" not in payload:
-            value = BugLensASGI._header(scope, "if-match")
-            if value:
-                payload["expected_revision"] = value.strip('"')
+        value = BugLensASGI._header(scope, "if-match")
+        if value:
+            header_revision = value.strip('"')
+            body_revision = payload.get("expected_revision")
+            if body_revision is not None and str(body_revision) != header_revision:
+                raise EnvironmentRevisionConflictError(
+                    "If-Match does not match expected_revision"
+                )
+            payload["expected_revision"] = header_revision
         return payload
 
     @staticmethod

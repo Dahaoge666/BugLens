@@ -8,16 +8,27 @@ from cryptography.fernet import Fernet, InvalidToken
 from pydantic import JsonValue
 
 _SECRET_PATTERNS = (
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)"),
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"(?i)(cookie\s*[:=]\s*)[^\r\n]+"),
-    re.compile(r"(?i)((?:username|password|token|secret)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(
+        r"(?i)((?:username|password|passphrase|token|client_secret|"
+        r"private_key|credential)\s*[:=]\s*)[^\s,;]+"
+    ),
 )
 _SECRET_KEYS = {
     "api_key",
     "apikey",
+    "access_token",
     "authorization",
+    "bearer_token",
+    "client_secret",
     "cookie",
+    "credential",
+    "credentials",
+    "passphrase",
+    "private_key",
     "username",
     "password",
     "secret",
@@ -26,9 +37,17 @@ _SECRET_KEYS = {
 }
 
 
+def _is_secret_key(value: object) -> bool:
+    key = str(value).strip().casefold().replace("-", "_")
+    return key in _SECRET_KEYS or key.endswith(
+        ("_api_key", "_credential", "_password", "_secret", "_token")
+    )
+
+
 def sanitize_text(value: str) -> str:
-    for pattern in _SECRET_PATTERNS:
-        value = pattern.sub(r"\1[REDACTED]", value)
+    for index, pattern in enumerate(_SECRET_PATTERNS):
+        replacement = r"\1[REDACTED]\2" if index == 0 else r"\1[REDACTED]"
+        value = pattern.sub(replacement, value)
     value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[EMAIL REDACTED]", value)
     return re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[PHONE REDACTED]", value)
 
@@ -40,9 +59,7 @@ def sanitize_data(value: JsonValue) -> JsonValue:
         return [sanitize_data(item) for item in value]
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]"
-            if str(key).lower() in _SECRET_KEYS
-            else sanitize_data(item)
+            key: "[REDACTED]" if _is_secret_key(key) else sanitize_data(item)
             for key, item in value.items()
         }
     return value

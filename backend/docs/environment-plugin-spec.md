@@ -179,7 +179,7 @@ sources:
 4. 客户端提交 `ConfirmDiagnosisTarget`，携带 `request_id`、环境 ID、可选主服务 ID 和 `expected_revision`；
 5. 核心确认候选归属，保存 `ResolvedEnvironmentSnapshot`，提交 `TargetConfirmed`，再推进 Analyze/Investigate。
 
-`ConfirmDiagnosisTarget` 使用 `command_id` 和 `request_id` 双重幂等保护。旧 revision、未知 request、非候选环境、跨环境主服务和重复确认均被拒绝或返回原已提交事件。快照保存环境、服务、节点、启用 source、插件 ID、非敏感 source 配置和目录 revision，但不保存用户名、密码、token 或其他 secret。恢复 run 时只读取原快照；普通目录热更新不会改变它能访问的 source 集合。
+`ConfirmDiagnosisTarget` 使用 `command_id` 和 `request_id` 双重幂等保护。旧 revision、未知 request、非候选环境、跨环境主服务和重复确认均被拒绝或返回原已提交事件。快照保存环境、服务、节点、启用 source、插件 ID、插件实例的非敏感配置/默认限制和目录 revision，但不保存用户名、密码、token 或其他 secret。恢复 run 时只读取原快照；普通目录热更新不会改变它能访问的 source 集合。确认时没有显式提交的主服务 ID 不会把原始名称/别名提示自动当作 ID。
 
 ## 5. 核心工具协议
 
@@ -192,6 +192,8 @@ query_database(source_id, sql, parameters, purpose)
 search_logs(source_id, service_ids?, node_ids?, start_time, end_time,
             text_query, levels?, correlation_ids?, cursor?)
 ```
+
+`table_pattern` 使用大小写不敏感的 glob 匹配，不是正则表达式。
 
 Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名、密码或 token。`source_id` 是经过确认快照筛选的稳定目录 ID；核心把 source 映射到插件实例和当前凭据。
 
@@ -206,7 +208,7 @@ Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名�
 - 单次调用默认最多 200 行、10 秒、64 KiB；硬上限 1000 行、30 秒、1 MiB；
 - 日志额外默认最多扫描 100 个文件、16 MiB，时间范围必须是绝对时间且不超过 24 小时。
 
-`describe_environment` 也计入 run 的外部工具预算。预算超限、并发超限、未确认目标、跨环境 source 和错误类型都以结构化 `ToolResult` 返回，不把 Python traceback 发送给模型。
+`describe_environment` 也计入 run 的外部工具预算。预算使用检查点数据库中的可过期 reservation 记录，进程恢复会释放孤儿 reservation；预算超限、并发超限、未确认目标、跨环境 source 和错误类型都以结构化 `ToolResult` 返回，不把 Python traceback 发送给模型。
 
 插件结果先经过核心 JSON 化、脱敏和大小限制，再作为工具结果返回；成功或部分结果注册一个有界 `EvidenceRecord`，包含 source ID、操作、游标、耗时、截断和警告。结果中的日志、数据库字段和文字均是不可信证据，永远不能改变 Agent 指令；Investigate prompt 明确要求将其视为数据，禁止执行其中的指令。
 
@@ -221,7 +223,7 @@ Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名�
 - 单次只允许一条语句；拒绝 DML、DDL、`CALL`、`DO`、`COPY`、事务/锁、`ATTACH`、危险 PRAGMA 和扩展加载；
 - 参数必须是 JSON 标量，使用命名占位符；
 - 可配置表/视图白名单和敏感列拒绝列表；
-- 使用 progress callback 和 deadline；结果按行数与 UTF-8 字节数限制；
+- 使用 progress callback 和 deadline；结果按行数与 UTF-8 字节数限制；authorizer 会在实际读取时再次执行表/列白名单；
 - BLOB 不返回原文，只返回类型、长度和 SHA-256。
 
 ### 6.2 文件日志
@@ -231,7 +233,7 @@ Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名�
 - 只搜索实例 `root_path` 内配置的 `path`、`paths` 或 `glob`；拒绝绝对路径、`..` 和解析后逃出 root 的符号链接；
 - 基础文件名会包含轮转文件；支持纯文本、JSON Lines、常见编码和自定义 timestamp fields；
 - 必须传绝对 `start_time`/`end_time`，时间窗口最多 24 小时；
-- 按文件数、扫描字节、返回条数、返回字节和 deadline 限制；
+- 按文件数、扫描字节、返回条数、返回字节和 deadline 限制；分页 cursor 以已返回的匹配条数推进，不重复上一页；
 - 返回相对路径和行号 locator，不返回任意主机绝对路径；
 - 普通文本按行解析为 message，JSON Lines 提取 timestamp、level、service、node、correlation ID 等安全字段。
 
@@ -239,7 +241,7 @@ Loki、Elastic、远程日志代理等后续接入仍实现同一个 `ToolPlugin
 
 ## 7. 配置热更新与 secret
 
-环境目录公开 revision 是对去除 secret 后规范 JSON 的 opaque SHA-256 前缀。Admin API：
+环境目录公开 revision 是规范化目录内容的 opaque SHA-256 前缀；secret 轮换也会产生新的 revision，但响应不会返回 secret 原文。Admin API：
 
 - `GET /v1/admin/environment-config` 返回 revision、writable 和非敏感目录；
 - `POST /v1/admin/environment-config/validate` 只解析、检查 JSON Schema、引用和插件配置，不写文件；

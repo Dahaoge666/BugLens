@@ -7,12 +7,13 @@ an arbitrary shell command or returns a database connection to the caller.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 import sqlite3
 import time
-from datetime import UTC, datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,9 @@ from buglens_plugin_api import (
     ToolResultStatus,
 )
 
-
 manifest = PluginManifest(
     plugin_id="sqlite",
-    implementation_version="1.0.0",
+    implementation_version="1.0.1",
     api_major=1,
     api_version="1",
     capabilities=["database", "read_only_sql", "schema_description"],
@@ -117,11 +117,16 @@ class SQLitePlugin:
             self._resolve_path(path, root_path)
 
     async def check_health(self) -> PluginHealth:
+        return await asyncio.to_thread(self._check_health_sync)
+
+    def _check_health_sync(self) -> PluginHealth:
         health_path = self.instance_config.get("health_path")
         if not health_path:
             return PluginHealth(status="ok", detail="SQLite plugin is loaded")
         try:
-            path = self._resolve_path(str(health_path), self.instance_config.get("root_path"))
+            path = self._resolve_path(
+                str(health_path), self.instance_config.get("root_path")
+            )
             connection = self._connect(path)
             try:
                 connection.execute("SELECT 1").fetchone()
@@ -138,7 +143,21 @@ class SQLitePlugin:
         request: dict[str, Any],
         context: ExecutionContext,
     ) -> ToolResult:
+        return await asyncio.to_thread(
+            self._execute_sync, operation, source_config, request, context
+        )
+
+    def _execute_sync(
+        self,
+        operation: str,
+        source_config: dict[str, Any],
+        request: dict[str, Any],
+        context: ExecutionContext,
+    ) -> ToolResult:
         started = time.monotonic()
+        schema = request.get("schema")
+        if schema not in (None, "", "main"):
+            return self._rejected("schema_not_allowed")
         try:
             path = self._resolve_path(
                 str(source_config.get("path", "")),
@@ -150,7 +169,7 @@ class SQLitePlugin:
                 warnings=["source_path_rejected"],
             )
         if operation == "describe_database":
-            result = self._describe(path, source_config, request)
+            result = self._describe(path, source_config, request, context)
         elif operation == "query_database":
             result = self._query(path, source_config, request, context)
         else:
@@ -173,7 +192,9 @@ class SQLitePlugin:
         raw = Path(raw_path)
         if root_path:
             root = Path(root_path).expanduser().resolve()
-            candidate = (root / raw).resolve() if not raw.is_absolute() else raw.resolve()
+            candidate = (
+                (root / raw).resolve() if not raw.is_absolute() else raw.resolve()
+            )
             try:
                 candidate.relative_to(root)
             except ValueError as exc:
@@ -184,16 +205,69 @@ class SQLitePlugin:
             raise ValueError("sqlite database file does not exist")
         return candidate
 
-    def _connect(self, path: Path) -> sqlite3.Connection:
+    def _connect(
+        self,
+        path: Path,
+        source_config: dict[str, Any] | None = None,
+        denied_reason: list[str] | None = None,
+    ) -> sqlite3.Connection:
         uri = f"file:{path.as_posix()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=1.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
-        connection.set_authorizer(self._authorizer)
+        if source_config is None:
+            connection.set_authorizer(self._authorizer)
+        else:
+            connection.set_authorizer(
+                self._policy_authorizer(
+                    source_config,
+                    denied_reason if denied_reason is not None else [],
+                )
+            )
         return connection
 
+    def _policy_authorizer(
+        self,
+        source_config: dict[str, Any],
+        denied_reason: list[str],
+    ) -> Any:
+        allowed = self._allowed_tables(source_config)
+        denied_columns = {
+            str(item).casefold()
+            for item in source_config.get("denied_columns", [])
+            if item
+        }
+
+        def authorize(
+            action: int,
+            arg1: str | None,
+            arg2: str | None,
+            _database: str | None,
+            origin: str | None,
+        ) -> int:
+            base = self._authorizer(action, arg1, arg2)
+            if base != sqlite3.SQLITE_OK:
+                denied_reason[:] = ["read_only_statement_rejected"]
+                return base
+            if action != sqlite3.SQLITE_READ:
+                return sqlite3.SQLITE_OK
+            table = str(arg1 or "").casefold()
+            column = str(arg2 or "").casefold()
+            view = str(origin or "").casefold()
+            if column and column in denied_columns:
+                denied_reason[:] = ["sensitive_column_rejected"]
+                return sqlite3.SQLITE_DENY
+            if allowed and table not in allowed and view not in allowed:
+                denied_reason[:] = ["table_not_allowed"]
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        return authorize
+
     @staticmethod
-    def _authorizer(action: int, arg1: str | None, arg2: str | None, *_args: Any) -> int:
+    def _authorizer(
+        action: int, arg1: str | None, arg2: str | None, *_args: Any
+    ) -> int:
         denied = {
             sqlite3.SQLITE_INSERT,
             sqlite3.SQLITE_UPDATE,
@@ -231,10 +305,16 @@ class SQLitePlugin:
         return sqlite3.SQLITE_OK
 
     def _describe(
-        self, path: Path, source_config: dict[str, Any], request: dict[str, Any]
+        self,
+        path: Path,
+        source_config: dict[str, Any],
+        request: dict[str, Any],
+        context: ExecutionContext,
     ) -> ToolResult:
         allowed = self._allowed_tables(source_config)
         pattern = request.get("table_pattern") or source_config.get("table_pattern")
+        if pattern is not None and (not isinstance(pattern, str) or len(pattern) > 256):
+            return self._rejected("table_pattern_rejected")
         connection = None
         try:
             connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
@@ -242,22 +322,58 @@ class SQLitePlugin:
                 "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
             ).fetchall()
             tables = []
+            truncated = False
+            max_results = min(context.max_results, 1_000)
+            max_bytes = min(context.max_bytes, 1_048_576)
+            denied_columns = {
+                str(item).casefold()
+                for item in source_config.get("denied_columns", [])
+                if item
+            }
             for name, kind in rows:
-                if allowed and name not in allowed:
+                if context.remaining_seconds <= 0:
+                    return ToolResult(
+                        status=(
+                            ToolResultStatus.PARTIAL
+                            if tables
+                            else ToolResultStatus.UNAVAILABLE
+                        ),
+                        structured_result={"tables": tables} if tables else None,
+                        truncated=bool(tables),
+                        warnings=["query_timeout"],
+                    )
+                if allowed and str(name).casefold() not in allowed:
                     continue
-                if pattern and not re.search(str(pattern), name):
+                if pattern and not fnmatchcase(
+                    str(name).casefold(), str(pattern).casefold()
+                ):
                     continue
                 columns = [
                     {"name": row[1], "type": row[2] or ""}
                     for row in connection.execute(
                         f"PRAGMA table_info({self._quote_identifier(name)})"
                     ).fetchall()
-                    if row[1] not in set(source_config.get("denied_columns", []))
+                    if str(row[1]).casefold() not in denied_columns
                 ]
-                tables.append({"name": name, "type": kind, "columns": columns})
+                candidate = {"name": name, "type": kind, "columns": columns}
+                encoded = json.dumps(
+                    {"tables": [*tables, candidate]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(tables) >= max_results or len(encoded) > max_bytes:
+                    truncated = True
+                    break
+                tables.append(candidate)
             return ToolResult(
-                status=ToolResultStatus.SUCCEEDED,
+                status=(
+                    ToolResultStatus.PARTIAL
+                    if truncated
+                    else ToolResultStatus.SUCCEEDED
+                ),
                 structured_result={"tables": tables},
+                truncated=truncated,
+                cursor=str(len(tables)) if truncated else None,
                 source_references=[
                     SourceReference(source_id="sqlite", locator=f"{path.name}:schema")
                 ],
@@ -292,6 +408,7 @@ class SQLitePlugin:
             return self._rejected("parameters_must_be_json_scalars")
         connection = None
         timed_out = False
+        denied_reason: list[str] = []
 
         def progress() -> int:
             nonlocal timed_out
@@ -301,7 +418,7 @@ class SQLitePlugin:
             return 0
 
         try:
-            connection = self._connect(path)
+            connection = self._connect(path, source_config, denied_reason)
             connection.set_progress_handler(progress, 1_000)
             cursor = connection.execute(sql, parameters)
             columns = [description[0] for description in cursor.description or []]
@@ -328,12 +445,21 @@ class SQLitePlugin:
                 rows.append(candidate)
             if timed_out:
                 return ToolResult(
-                    status=ToolResultStatus.UNAVAILABLE,
+                    status=(
+                        ToolResultStatus.PARTIAL
+                        if rows
+                        else ToolResultStatus.UNAVAILABLE
+                    ),
+                    structured_result=(
+                        {"columns": columns, "rows": rows} if rows else None
+                    ),
                     truncated=bool(rows),
                     warnings=["query_timeout"],
                 )
             return ToolResult(
-                status=ToolResultStatus.PARTIAL if truncated else ToolResultStatus.SUCCEEDED,
+                status=ToolResultStatus.PARTIAL
+                if truncated
+                else ToolResultStatus.SUCCEEDED,
                 structured_result={"columns": columns, "rows": rows},
                 truncated=truncated,
                 cursor=str(len(rows)) if truncated else None,
@@ -342,20 +468,34 @@ class SQLitePlugin:
                 ],
             )
         except TimeoutError:
-            return ToolResult(status=ToolResultStatus.UNAVAILABLE, warnings=["query_timeout"])
+            return ToolResult(
+                status=ToolResultStatus.UNAVAILABLE, warnings=["query_timeout"]
+            )
         except sqlite3.OperationalError as exc:
             message = str(exc).casefold()
-            warning = "query_timeout" if "interrupt" in message else "query_error"
+            warning = (
+                "query_timeout"
+                if "interrupt" in message
+                else denied_reason[0]
+                if denied_reason
+                else "query_error"
+            )
             return self._rejected(warning)
         except sqlite3.Error:
-            return self._rejected("query_error")
+            return self._rejected(denied_reason[0] if denied_reason else "query_error")
         finally:
             if connection is not None:
                 connection.close()
 
     @staticmethod
     def _allowed_tables(source_config: dict[str, Any]) -> set[str]:
-        return {str(item) for item in source_config.get("allowed_tables", []) if item}
+        allowed: set[str] = set()
+        for item in source_config.get("allowed_tables", []):
+            if item:
+                value = str(item).casefold()
+                allowed.add(value)
+                allowed.add(value.split(".")[-1])
+        return allowed
 
     def _validate_sql(
         self, sql: str, source_config: dict[str, Any], parameters: Any
@@ -375,14 +515,22 @@ class SQLitePlugin:
             return "named_parameters_required"
         if not isinstance(parameters, dict):
             return "parameters_must_be_object"
-        denied_columns = {str(item).casefold() for item in source_config.get("denied_columns", [])}
+        denied_columns = {
+            str(item).casefold() for item in source_config.get("denied_columns", [])
+        }
         words = {item.casefold() for item in re.findall(r"[A-Za-z_][\w$]*", statement)}
         if denied_columns.intersection(words):
             return "sensitive_column_rejected"
         allowed = self._allowed_tables(source_config)
         if allowed:
-            referenced = {match[1].strip('"\'`') for match in _TABLE_REFERENCE.findall(statement)}
-            if any(item not in allowed and item.split(".")[-1] not in allowed for item in referenced):
+            referenced = {
+                match[1].strip("\"'`").casefold()
+                for match in _TABLE_REFERENCE.findall(statement)
+            }
+            if any(
+                item not in allowed and item.split(".")[-1] not in allowed
+                for item in referenced
+            ):
                 return "table_not_allowed"
         return None
 

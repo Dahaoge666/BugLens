@@ -12,7 +12,9 @@ import copy
 import hashlib
 import json
 import os
+import re
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -47,7 +49,7 @@ class ToolLimits(StrictModel):
     timeout_seconds: int = Field(default=10, ge=1, le=30)
     max_bytes: int = Field(default=65_536, ge=1_024, le=1_048_576)
     max_scan_files: int = Field(default=100, ge=1, le=10_000)
-    max_scan_bytes: int = Field(default=16 * 1024 * 1024, ge=1_024, le=1_073_741_824)
+    max_scan_bytes: int = Field(default=16 * 1024 * 1024, ge=1_024, le=64 * 1024 * 1024)
 
 
 class PluginInstanceConfig(StrictModel):
@@ -185,6 +187,12 @@ class EnvironmentDirectory(StrictModel):
         services = unique(self.services, "service")
         nodes = unique(self.nodes, "node")
         sources = unique(self.sources, "source")
+        for instance in instances.values():
+            _reject_credential_uris(
+                instance.config, f"plugin instance {instance.id} config"
+            )
+        for source in sources.values():
+            _reject_credential_uris(source.config, f"source {source.id} config")
         if not environments and (services or nodes or sources):
             raise EnvironmentConfigError(
                 "services, nodes and sources require at least one environment"
@@ -201,6 +209,17 @@ class EnvironmentDirectory(StrictModel):
                     f"service {service.id} references unknown dependencies: "
                     f"{sorted(unknown)}"
                 )
+            for dependency_id in service.dependencies:
+                dependency = services[dependency_id]
+                if (
+                    service.environment_id
+                    and dependency.environment_id
+                    and service.environment_id != dependency.environment_id
+                ):
+                    raise EnvironmentConfigError(
+                        f"service {service.id} dependency {dependency_id} belongs "
+                        "to another environment"
+                    )
         for node in nodes.values():
             if node.environment_id and node.environment_id not in environments:
                 raise EnvironmentConfigError(
@@ -289,6 +308,15 @@ class SnapshotSource(StrictModel):
     limits: ToolLimits = Field(default_factory=ToolLimits)
 
 
+class SnapshotPluginInstance(StrictModel):
+    """Credential-free plugin settings pinned for the lifetime of a run."""
+
+    id: str
+    plugin_id: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    default_limits: ToolLimits = Field(default_factory=ToolLimits)
+
+
 class ResolvedEnvironmentSnapshot(StrictModel):
     """Credential-free, immutable environment data used by one run."""
 
@@ -303,32 +331,127 @@ class ResolvedEnvironmentSnapshot(StrictModel):
     primary_service_id: str | None = None
     services: list[SnapshotService] = Field(default_factory=list)
     nodes: list[SnapshotNode] = Field(default_factory=list)
+    plugin_instances: list[SnapshotPluginInstance] = Field(default_factory=list)
     sources: list[SnapshotSource] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def source(self, source_id: str) -> SnapshotSource | None:
         return next((source for source in self.sources if source.id == source_id), None)
 
+    def plugin_instance(self, instance_id: str) -> SnapshotPluginInstance | None:
+        return next(
+            (item for item in self.plugin_instances if item.id == instance_id), None
+        )
+
+    def public_view(self) -> dict[str, Any]:
+        """Return the model-visible/UI-visible projection without connector config."""
+        return {
+            "snapshot_id": self.snapshot_id,
+            "environment_id": self.environment_id,
+            "display_name": self.display_name,
+            "level": self.level,
+            "region": self.region,
+            "timezone": self.timezone,
+            "tags": copy.deepcopy(self.tags),
+            "primary_service_id": self.primary_service_id,
+            "services": [item.model_dump(mode="json") for item in self.services],
+            "nodes": [item.model_dump(mode="json") for item in self.nodes],
+            "sources": [
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "service_ids": list(item.service_ids),
+                    "node_ids": list(item.node_ids),
+                }
+                for item in self.sources
+            ],
+        }
+
 
 def _normalize(value: str | None) -> str:
     return " ".join((value or "").strip().casefold().split())
 
 
-def _remove_secrets(value: Any) -> Any:
-    secret_keys = {
+def _is_secret_key(value: object) -> bool:
+    key = str(value).strip().casefold().replace("-", "_")
+    exact = {
+        "access_token",
+        "authorization",
+        "bearer_token",
+        "client_secret",
+        "cookie",
+        "credential",
+        "credentials",
         "username",
         "password",
+        "passphrase",
+        "private_key",
         "token",
         "api_key",
         "apikey",
         "secret",
         "secret_key",
     }
+    return key in exact or key.endswith(
+        ("_api_key", "_credential", "_password", "_secret", "_token")
+    )
+
+
+def _reject_credential_uris(value: Any, path: str) -> None:
+    if isinstance(value, str) and re.search(
+        r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s/]+@", value
+    ):
+        raise EnvironmentConfigError(
+            f"{path} must not embed credentials in a URI or DSN"
+        )
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_credential_uris(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_credential_uris(item, f"{path}[{index}]")
+
+
+def _merge_masked_nested_secrets(incoming: Any, current: Any, path: str) -> Any:
+    if isinstance(incoming, dict):
+        old = current if isinstance(current, dict) else {}
+        merged = copy.deepcopy(incoming)
+        for key, item in list(merged.items()):
+            if _is_secret_key(key):
+                if isinstance(item, dict) and "is_set" in item:
+                    if key in old:
+                        merged[key] = copy.deepcopy(old[key])
+                    else:
+                        merged.pop(key, None)
+                    continue
+                raise EnvironmentConfigError(
+                    f"{path}.{key} cannot contain a secret; use the dedicated "
+                    "username, password or token field with secret_updates"
+                )
+            merged[key] = _merge_masked_nested_secrets(
+                item, old.get(key), f"{path}.{key}"
+            )
+        return merged
+    if isinstance(incoming, list):
+        old_items = current if isinstance(current, list) else []
+        return [
+            _merge_masked_nested_secrets(
+                item,
+                old_items[index] if index < len(old_items) else None,
+                f"{path}[{index}]",
+            )
+            for index, item in enumerate(incoming)
+        ]
+    _reject_credential_uris(incoming, path)
+    return incoming
+
+
+def _remove_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: _remove_secrets(item)
             for key, item in value.items()
-            if str(key).casefold() not in secret_keys
+            if not _is_secret_key(key)
         }
     if isinstance(value, list):
         return [_remove_secrets(item) for item in value]
@@ -337,22 +460,9 @@ def _remove_secrets(value: Any) -> Any:
 
 def _public_value(value: Any) -> Any:
     """Mask secret-shaped nested configuration without returning its value."""
-    secret_keys = {
-        "username",
-        "password",
-        "token",
-        "api_key",
-        "apikey",
-        "authorization",
-        "cookie",
-        "secret",
-        "secret_key",
-    }
     if isinstance(value, dict):
         return {
-            key: {"is_set": bool(item)}
-            if str(key).casefold() in secret_keys
-            else _public_value(item)
+            key: {"is_set": bool(item)} if _is_secret_key(key) else _public_value(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -365,8 +475,9 @@ class EnvironmentRepository:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._directory = self._load()
+        self._file_signature = self._signature()
 
     @property
     def configured(self) -> bool:
@@ -378,9 +489,33 @@ class EnvironmentRepository:
 
     @property
     def revision(self) -> str:
-        payload = _remove_secrets(self._directory.model_dump(mode="json"))
+        # The digest is opaque and includes secret changes so concurrent secret
+        # rotations cannot retain the same If-Match token.  No secret value is
+        # ever included in the returned representation.
+        with self._write_lock:
+            self._refresh_from_disk()
+            return self._revision_for(self._directory)
+
+    @staticmethod
+    def _revision_for(directory: EnvironmentDirectory) -> str:
+        payload = directory.model_dump(mode="json")
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+    def _signature(self) -> tuple[int, int, int] | None:
+        if self.path is None:
+            return None
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
+    def _refresh_from_disk(self, *, force: bool = False) -> None:
+        signature = self._signature()
+        if self.path is not None and (force or signature != self._file_signature):
+            self._directory = self._load()
+            self._file_signature = self._signature()
 
     def _load(self) -> EnvironmentDirectory:
         if self.path is None:
@@ -400,22 +535,30 @@ class EnvironmentRepository:
             ) from exc
 
     def directory(self) -> EnvironmentDirectory:
-        return self._directory.model_copy(deep=True)
+        with self._write_lock:
+            self._refresh_from_disk()
+            return self._directory.model_copy(deep=True)
 
     def public_config(self) -> dict[str, Any]:
-        return _public_value(self._directory.model_dump(mode="python"))
+        with self._write_lock:
+            self._refresh_from_disk()
+            return _public_value(self._directory.model_dump(mode="python"))
 
     def environments(self) -> list[EnvironmentConfig]:
-        return [
-            item.model_copy(deep=True)
-            for item in self._directory.environments
-            if item.enabled
-        ]
+        with self._write_lock:
+            self._refresh_from_disk()
+            return [
+                item.model_copy(deep=True)
+                for item in self._directory.environments
+                if item.enabled
+            ]
 
     def get_environment(self, environment_id: str) -> EnvironmentConfig:
-        for environment in self._directory.environments:
-            if environment.id == environment_id and environment.enabled:
-                return environment
+        with self._write_lock:
+            self._refresh_from_disk()
+            for environment in self._directory.environments:
+                if environment.id == environment_id and environment.enabled:
+                    return environment.model_copy(deep=True)
         raise EnvironmentConfigError(f"environment is unavailable: {environment_id}")
 
     def _service_matches(self, service: ServiceConfig, hint: str) -> bool:
@@ -431,6 +574,9 @@ class EnvironmentRepository:
         target: TargetSpec,
         context: DiagnosisContext | dict[str, Any] | None = None,
     ) -> list[EnvironmentTargetCandidate]:
+        with self._write_lock:
+            self._refresh_from_disk()
+            directory = self._directory.model_copy(deep=True)
         context_values = (
             context.model_dump(mode="python")
             if isinstance(context, DiagnosisContext)
@@ -447,11 +593,18 @@ class EnvironmentRepository:
             else None
         )
         services_by_env: dict[str, list[ServiceConfig]] = {}
-        for service in self._directory.services:
+        unscoped_services: list[ServiceConfig] = []
+        for service in directory.services:
             if service.environment_id:
                 services_by_env.setdefault(service.environment_id, []).append(service)
+            else:
+                # Compatibility catalogs may define a service once and use it
+                # across environments.  It remains a valid inference hint in
+                # every candidate environment, while source/node associations
+                # still enforce the final environment boundary.
+                unscoped_services.append(service)
         scored: list[tuple[int, EnvironmentTargetCandidate]] = []
-        for environment in self._directory.environments:
+        for environment in directory.environments:
             if not environment.enabled:
                 continue
             score = 0
@@ -475,7 +628,10 @@ class EnvironmentRepository:
             if service_hint:
                 matching_services = [
                     service
-                    for service in services_by_env.get(environment.id, [])
+                    for service in [
+                        *services_by_env.get(environment.id, []),
+                        *unscoped_services,
+                    ]
                     if self._service_matches(service, service_hint)
                 ]
                 if not matching_services:
@@ -515,47 +671,88 @@ class EnvironmentRepository:
             raise EnvironmentConfigError(
                 "target environment is not a pending candidate"
             )
-        environment = self.get_environment(target.environment_id)
-        service_id = target.primary_service_id
-        if service_id:
-            service = next(
-                (item for item in self._directory.services if item.id == service_id),
+        with self._write_lock:
+            self._refresh_from_disk()
+            environment = next(
+                (
+                    item
+                    for item in self._directory.environments
+                    if item.id == target.environment_id and item.enabled
+                ),
                 None,
             )
-            if service is None:
-                raise EnvironmentConfigError(f"service is unknown: {service_id}")
-            if service.environment_id and service.environment_id != environment.id:
+            if environment is None:
                 raise EnvironmentConfigError(
-                    "primary service belongs to another environment"
+                    f"environment is unavailable: {target.environment_id}"
                 )
-        return ResolvedTarget(
-            mode="explicit",
-            environment_id=environment.id,
-            primary_service_id=service_id,
-        )
+            service_id = target.primary_service_id
+            if service_id:
+                service = next(
+                    (
+                        item
+                        for item in self._directory.services
+                        if item.id == service_id
+                    ),
+                    None,
+                )
+                if service is None:
+                    raise EnvironmentConfigError(f"service is unknown: {service_id}")
+                if service.environment_id and service.environment_id != environment.id:
+                    raise EnvironmentConfigError(
+                        "primary service belongs to another environment"
+                    )
+            return ResolvedTarget(
+                mode="explicit",
+                environment_id=environment.id,
+                primary_service_id=service_id,
+            )
 
     def snapshot(
         self,
         environment_id: str,
         primary_service_id: str | None = None,
+        *,
+        expected_config_revision: str | None = None,
     ) -> ResolvedEnvironmentSnapshot:
-        environment = self.get_environment(environment_id)
+        with self._write_lock:
+            self._refresh_from_disk()
+            directory = self._directory.model_copy(deep=True)
+        config_revision = self._revision_for(directory)
+        if (
+            expected_config_revision is not None
+            and config_revision != expected_config_revision
+        ):
+            raise EnvironmentRevisionConflictError(
+                "environment config changed while resolving the target"
+            )
+        environment = next(
+            (
+                item
+                for item in directory.environments
+                if item.id == environment_id and item.enabled
+            ),
+            None,
+        )
+        if environment is None:
+            raise EnvironmentConfigError(
+                f"environment is unavailable: {environment_id}"
+            )
         services = [
             service
-            for service in self._directory.services
+            for service in directory.services
             if service.environment_id in {None, environment_id}
         ]
         nodes = [
             node
-            for node in self._directory.nodes
+            for node in directory.nodes
             if node.environment_id in {None, environment_id}
         ]
         sources = [
             source
-            for source in self._directory.sources
+            for source in directory.sources
             if source.enabled and source.environment_id == environment_id
         ]
-        instances = {item.id: item for item in self._directory.plugin_instances}
+        instances = {item.id: item for item in directory.plugin_instances}
         snapshot_services = [
             SnapshotService.model_validate(
                 item.model_dump(mode="python", exclude={"environment_id"})
@@ -583,12 +780,26 @@ class EnvironmentRepository:
             if source.plugin_instance_id in instances
             and instances[source.plugin_instance_id].enabled
         ]
+        used_instance_ids = {source.plugin_instance_id for source in snapshot_sources}
+        snapshot_instances = [
+            SnapshotPluginInstance(
+                id=instance.id,
+                plugin_id=instance.plugin_id,
+                config=_remove_secrets(copy.deepcopy(instance.config)),
+                default_limits=instance.default_limits,
+            )
+            for instance in directory.plugin_instances
+            if instance.id in used_instance_ids and instance.enabled
+        ]
         canonical = {
-            "config_revision": self.revision,
+            "config_revision": config_revision,
             "environment": environment.model_dump(mode="json"),
             "primary_service_id": primary_service_id,
             "services": [item.model_dump(mode="json") for item in snapshot_services],
             "nodes": [item.model_dump(mode="json") for item in snapshot_nodes],
+            "plugin_instances": [
+                item.model_dump(mode="json") for item in snapshot_instances
+            ],
             "sources": [item.model_dump(mode="json") for item in snapshot_sources],
         }
         encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
@@ -597,7 +808,7 @@ class EnvironmentRepository:
         )
         return ResolvedEnvironmentSnapshot(
             snapshot_id=snapshot_id,
-            config_revision=self.revision,
+            config_revision=config_revision,
             environment_id=environment.id,
             display_name=environment.display_name,
             level=environment.level,
@@ -607,6 +818,7 @@ class EnvironmentRepository:
             primary_service_id=primary_service_id,
             services=snapshot_services,
             nodes=snapshot_nodes,
+            plugin_instances=snapshot_instances,
             sources=snapshot_sources,
         )
 
@@ -628,16 +840,17 @@ class EnvironmentRepository:
         merge happens before plugin validation so a failed plugin check cannot
         leave a newly written but unusable catalog behind.
         """
-        if expected_revision != self.revision:
-            raise EnvironmentRevisionConflictError(
-                "environment config revision changed"
-            )
-        if self.path is None:
-            raise EnvironmentConfigNotWritableError(
-                "environment config is not writable without BUGLENS_ENVIRONMENTS_CONFIG"
-            )
-        incoming = self._merge_secret_updates(raw, secret_updates)
-        return self.validate_raw(incoming)
+        with self._write_lock:
+            if expected_revision != self.revision:
+                raise EnvironmentRevisionConflictError(
+                    "environment config revision changed"
+                )
+            if self.path is None:
+                raise EnvironmentConfigNotWritableError(
+                    "environment config is not writable without BUGLENS_ENVIRONMENTS_CONFIG"
+                )
+            incoming = self._merge_secret_updates(raw, secret_updates)
+            return self.validate_raw(incoming)
 
     def _merge_secret_updates(
         self,
@@ -649,6 +862,7 @@ class EnvironmentRepository:
         incoming = copy.deepcopy(raw)
         current = self._directory.model_dump(mode="python")
         current_instances = {item["id"]: item for item in current["plugin_instances"]}
+        current_sources = {item["id"]: item for item in current["sources"]}
         incoming_instances = incoming.get("plugin_instances", [])
         if isinstance(incoming_instances, dict):
             incoming_instances = [
@@ -662,6 +876,11 @@ class EnvironmentRepository:
             if not isinstance(item, dict):
                 continue
             old = current_instances.get(str(item.get("id")), {})
+            item["config"] = _merge_masked_nested_secrets(
+                item.get("config", {}),
+                old.get("config", {}),
+                f"plugin_instances.{item.get('id', 'unknown')}.config",
+            )
             for secret_name in ("username", "password", "token"):
                 submitted = item.get(secret_name)
                 if isinstance(submitted, dict) and "is_set" in submitted:
@@ -669,9 +888,31 @@ class EnvironmentRepository:
                         item[secret_name] = old[secret_name]
                     else:
                         item.pop(secret_name, None)
+                elif secret_name in item:
+                    raise EnvironmentConfigError(
+                        f"{secret_name} must be changed through secret_updates"
+                    )
                 elif secret_name not in item and old.get(secret_name):
                     item[secret_name] = old[secret_name]
             item.pop("secret_updates", None)
+        incoming_sources = incoming.get("sources", [])
+        if isinstance(incoming_sources, dict):
+            incoming_sources = [
+                {**dict(value), "id": dict(value).get("id", item_id)}
+                for item_id, value in incoming_sources.items()
+            ]
+            incoming["sources"] = incoming_sources
+        if not isinstance(incoming_sources, list):
+            raise EnvironmentConfigError("sources must be a list or mapping")
+        for item in incoming_sources:
+            if not isinstance(item, dict):
+                continue
+            old = current_sources.get(str(item.get("id")), {})
+            item["config"] = _merge_masked_nested_secrets(
+                item.get("config", {}),
+                old.get("config", {}),
+                f"sources.{item.get('id', 'unknown')}.config",
+            )
         for instance_id, updates in (secret_updates or {}).items():
             target = next(
                 (item for item in incoming_instances if item.get("id") == instance_id),
@@ -714,17 +955,58 @@ class EnvironmentRepository:
         secret_updates: dict[str, dict[str, dict[str, Any]]] | None = None,
     ) -> str:
         with self._write_lock:
-            incoming = self._merge_secret_updates(raw, secret_updates)
-            directory = self.prepare(incoming, expected_revision)
-            payload = yaml.safe_dump(
-                directory.model_dump(mode="python"), sort_keys=False, allow_unicode=True
-            )
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(f".{self.path.name}.tmp")
-            temporary.write_text(payload, encoding="utf-8")
-            os.replace(temporary, self.path)
-            self._directory = directory
-            return self.revision
+            if self.path is None:
+                raise EnvironmentConfigNotWritableError(
+                    "environment config is not writable without "
+                    "BUGLENS_ENVIRONMENTS_CONFIG"
+                )
+            with _exclusive_catalog_lock(self.path):
+                self._refresh_from_disk(force=True)
+                directory = self.prepare(
+                    raw, expected_revision, secret_updates=secret_updates
+                )
+                payload = yaml.safe_dump(
+                    directory.model_dump(mode="python"),
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_name(f".{self.path.name}.tmp")
+                temporary.write_text(payload, encoding="utf-8")
+                os.replace(temporary, self.path)
+                self._directory = directory
+                self._file_signature = self._signature()
+                return self.revision
+
+
+@contextmanager
+def _exclusive_catalog_lock(path: Path):
+    """Serialize config replacement across local worker processes."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - exercised by Linux deployments
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 __all__ = [
@@ -739,6 +1021,7 @@ __all__ = [
     "ResolvedEnvironmentSnapshot",
     "ServiceConfig",
     "SnapshotNode",
+    "SnapshotPluginInstance",
     "SnapshotService",
     "SnapshotSource",
     "SourceConfig",
