@@ -418,15 +418,57 @@ function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpe
   return <div className="management-content"><PageHeading eyebrow="控制台 / Agent Sessions" title="Session 管理" description="每个 run_id + node 使用独立 SDK SQLiteSession；这里只展示生命周期元数据。" /><div className="session-summary"><MetricCard label="活跃 Session" value={String(active)} detail="正在执行" tone="teal" /><MetricCard label="等待输入" value={String(waiting)} detail="可恢复" tone="amber" /><MetricCard label="历史 Session" value={String(sessions.length)} detail="仅保留元数据" tone="blue" /></div><section className="panel sessions-panel"><PanelHeader title="Session 列表" meta={`${sessions.length} 个可见记录`} /><div className="session-table"><div className="session-header"><span>Session</span><span>节点</span><span>状态</span><span>消息数</span><span>更新时间</span><span /></div>{sessions.map((session) => <div className="session-row" key={session.session_id}><span><strong className="mono">{session.session_id}</strong><small>run {session.run_id}</small></span><span className="node-badge">{nodeLabel(session.node ?? 'unknown')}</span><span><span className={`session-status ${session.status}`}>{sessionStatusLabel(session.status)}</span></span><span className="mono">{session.message_count}</span><span className="muted">{session.updated_at}</span><button className="row-link" onClick={() => onOpenRun(session.run_id)}>查看运行 →</button></div>)}</div><div className="session-note">模型消息由 Agents SDK SQLiteSession 管理，业务状态和 checkpoint 不会复制消息内容。</div></section></div>
 }
 
+type EnvironmentPanel = 'overview' | 'plugins' | 'editor'
+type DirectoryRecord = Record<string, unknown>
+
+function directoryRecords(value: unknown): DirectoryRecord[] {
+  if (Array.isArray(value)) return value.filter(isRecord)
+  if (!isRecord(value)) return []
+  return Object.entries(value).flatMap(([id, item]) => isRecord(item) ? [{ ...item, id: item.id ?? id }] : [])
+}
+
+function textValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' && value.trim() ? value : fallback
+}
+
+function pluginDisplayName(pluginId: string): string {
+  return ({ sqlite: 'SQLite 数据库', file_logs: '文件日志' } as Record<string, string>)[pluginId] ?? pluginId
+}
+
+function capabilityDisplayName(capability: string): string {
+  return ({ database: '数据库', read_only_sql: '只读查询', schema_description: '表结构', logs: '日志检索' } as Record<string, string>)[capability] ?? capability
+}
+
+function sourceDisplayName(kind: string): string {
+  return kind === 'database' ? '数据库' : kind === 'logs' ? '日志' : kind
+}
+
+function healthTone(status: string): string {
+  if (status === 'ok') return 'ok'
+  if (status === 'degraded') return 'degraded'
+  if (status === 'error') return 'error'
+  if (status === 'checking') return 'checking'
+  if (status === 'disabled') return 'disabled'
+  return 'neutral'
+}
+
+function healthLabel(status: string): string {
+  return ({ ok: '连接正常', degraded: '需要关注', error: '不可用', checking: '检查中…', disabled: '已停用', configured: '已配置', neutral: '尚未检查' } as Record<string, string>)[status] ?? status
+}
+
 function EnvironmentPage({ environments, config, plugins, onConfigChange }: { environments: EnvironmentList; config: EnvironmentConfig | null; plugins: PluginList; onConfigChange: (config: EnvironmentConfig | null) => void }) {
+  const [activePanel, setActivePanel] = useState<EnvironmentPanel>('overview')
   const [jsonText, setJsonText] = useState('')
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [secretClears, setSecretClears] = useState<Record<string, boolean>>({})
-  const [checkResults, setCheckResults] = useState<Record<string, string>>({})
+  const [checkResults, setCheckResults] = useState<Record<string, { status: string; detail: string }>>({})
   const [message, setMessage] = useState('')
+  const [messageTone, setMessageTone] = useState<'success' | 'error' | 'info'>('info')
+
   useEffect(() => {
     if (config) setJsonText(JSON.stringify(config.config, null, 2))
   }, [config])
+
   const payload = (() => {
     try {
       const value: unknown = JSON.parse(jsonText)
@@ -435,17 +477,41 @@ function EnvironmentPage({ environments, config, plugins, onConfigChange }: { en
       return null
     }
   })()
-  const rawInstances = payload && Array.isArray(payload.plugin_instances) ? payload.plugin_instances : []
-  const instances = rawInstances.filter(isRecord)
+  const directory = config?.config ?? {}
+  const instances = directoryRecords(directory.plugin_instances)
+  const sourceRecords = directoryRecords(directory.sources)
+  const serviceRecords = directoryRecords(directory.services)
+  const nodeRecords = directoryRecords(directory.nodes)
+  const sqlitePlugin = plugins.items.find((plugin) => plugin.plugin_id === 'sqlite')
+  const enabledInstances = instances.filter((instance) => instance.enabled !== false)
+  const enabledSources = sourceRecords.filter((source) => source.enabled !== false)
+  const environmentCards = environments.items.map((item) => {
+    const inEnvironment = (record: DirectoryRecord) => textValue(record.environment_id) === item.environment_id
+    const sources = enabledSources.filter(inEnvironment)
+    return {
+      ...item,
+      serviceCount: serviceRecords.filter(inEnvironment).length,
+      nodeCount: nodeRecords.filter(inEnvironment).length,
+      sourceCount: sources.length,
+      databaseCount: sources.filter((source) => source.kind === 'database').length,
+    }
+  })
+
+  function showMessage(text: string, tone: 'success' | 'error' | 'info' = 'info') {
+    setMessage(text)
+    setMessageTone(tone)
+  }
+
   async function validate() {
-    if (!config || !payload) { setMessage('请输入合法的 JSON 配置，或等待后端连接'); return }
+    if (!config || !payload) { showMessage('请输入合法的 JSON 配置，或等待后端连接', 'error'); return }
     try {
       const result = await validateAdminEnvironmentConfig({ config: payload, expected_revision: config.revision, secret_updates: buildSecretUpdates() })
-      setMessage(result.valid ? '环境目录校验通过，尚未落盘' : result.errors.join('；'))
+      showMessage(result.valid ? '环境目录校验通过，尚未落盘' : result.errors.join('；'), result.valid ? 'success' : 'error')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '校验失败，请重试')
+      showMessage(error instanceof Error ? error.message : '校验失败，请重试', 'error')
     }
   }
+
   function buildSecretUpdates() {
     const updates: Record<string, Record<string, { action: 'set' | 'clear'; value?: string }>> = {}
     for (const [key, selected] of Object.entries(secretClears)) {
@@ -466,56 +532,54 @@ function EnvironmentPage({ environments, config, plugins, onConfigChange }: { en
     }
     return updates
   }
+
   async function save() {
-    if (!config || !payload) { setMessage('请输入合法的 JSON 配置，或等待后端连接'); return }
+    if (!config || !payload) { showMessage('请输入合法的 JSON 配置，或等待后端连接', 'error'); return }
     try {
       const next = await applyAdminEnvironmentConfig({ config: payload, expected_revision: config.revision, secret_updates: buildSecretUpdates() })
       onConfigChange(next)
       setSecretDrafts({})
       setSecretClears({})
-      setMessage('环境目录已原子保存；已有运行继续使用原快照')
+      showMessage('环境目录已原子保存；已有运行继续使用原快照', 'success')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存失败，请重试')
+      showMessage(error instanceof Error ? error.message : '保存失败，请重试', 'error')
     }
   }
+
+  async function checkInstance(instanceId: string) {
+    setCheckResults((current) => ({ ...current, [instanceId]: { status: 'checking', detail: '正在检查插件实例…' } }))
+    try {
+      const result = await checkAdminPluginInstance(instanceId)
+      setCheckResults((current) => ({ ...current, [instanceId]: { status: result.status, detail: result.detail } }))
+    } catch (error) {
+      setCheckResults((current) => ({ ...current, [instanceId]: { status: 'error', detail: error instanceof Error ? error.message : '连接检查失败' } }))
+    }
+  }
+
   return <div className="management-content">
-    <PageHeading eyebrow="管理 / 环境与插件" title="环境目录与工具插件" description="配置先校验再原子替换；运行确认后固定环境快照，凭据只以写入或清除操作提交。" />
-    <div className="dashboard-grid">
-      <section className="panel"><PanelHeader title="可用环境" meta={`${environments.items.length} 个`} />{environments.items.length === 0 ? <div className="empty-state">尚未配置环境目录</div> : <div className="environment-list">{environments.items.map((item) => <div className="environment-row" key={item.environment_id}><span className="environment-mark">◈</span><div><strong>{item.display_name}</strong><small className="mono">{item.environment_id} · {item.level}{item.region ? ` · ${item.region}` : ''}</small></div><span className="muted">{item.aliases.join(' / ') || '无别名'}</span></div>)}</div>}</section>
-      <section className="panel"><PanelHeader title="已发现插件" meta={`${plugins.items.length} 个`} />{plugins.items.length === 0 ? <div className="empty-state">没有已安装的 tool plugin；外部工具默认关闭</div> : <div className="plugin-list">{plugins.items.map((plugin) => <div className="plugin-row" key={plugin.plugin_id}><div><strong className="mono">{plugin.plugin_id}</strong><small>{plugin.capabilities.join(' · ')} · API {plugin.api_major}</small></div><span className="admin-status-pill"><i />{plugin.instance_ids.length} 个实例</span></div>)}</div>}</section>
-    </div>
-    <section className="panel environment-editor">
-      <PanelHeader title="环境目录 JSON（非敏感字段）" meta={config ? `revision ${config.revision}` : '未连接'} />
-      <p className="config-callout">密码、token、用户名不会从后端返回；保留字段中的 is_set 标记即可。凭据只能通过下方 set/clear 操作更新。</p>
-      <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} rows={18} spellCheck={false} disabled={!config?.writable} />
-      <div className="secret-editor">{instances.map((instance) => {
-        const id = String(instance.id ?? '')
-        const pluginId = String(instance.plugin_id ?? 'unknown')
-        return <div className="secret-row" key={id}>
-          <strong>{id || '未命名实例'}</strong>
-          <small>{pluginId} · 凭据仅用于本次提交，不会回显</small>
-          {(['username', 'password', 'token'] as const).map((field) => {
-            const key = `${id}:${field}`
-            return <div className="form-row" key={field}>
-              <input type={field === 'username' ? 'text' : 'password'} value={secretDrafts[key] ?? ''} onChange={(event) => { const value = event.target.value; setSecretDrafts((current) => ({ ...current, [key]: value })); if (value) setSecretClears((current) => ({ ...current, [key]: false })) }} placeholder={`设置新的 ${field}（可选）`} autoComplete="new-password" />
-              <label><input type="checkbox" checked={secretClears[key] ?? false} onChange={(event) => { const checked = event.target.checked; setSecretClears((current) => ({ ...current, [key]: checked })); if (checked) setSecretDrafts((current) => ({ ...current, [key]: '' })) }} /> 清除 {field}</label>
-            </div>
-          })}
-          <button type="button" className="quiet-button" onClick={async () => {
-            setCheckResults((current) => ({ ...current, [id]: '检查中…' }))
-            try {
-              const result = await checkAdminPluginInstance(id)
-              setCheckResults((current) => ({ ...current, [id]: `${result.status} · ${result.detail}` }))
-            } catch (error) {
-              setCheckResults((current) => ({ ...current, [id]: error instanceof Error ? error.message : '连接检查失败' }))
-            }
-          }} disabled={!id}>检查连接</button>
-          {checkResults[id] && <small>{checkResults[id]}</small>}
-        </div>
-      })}</div>
-      <div className="settings-actions"><button className="quiet-button" onClick={validate} disabled={!config?.writable}>验证目录</button><button className="primary-button" onClick={save} disabled={!config?.writable}>保存环境配置</button></div>
-      {message && <div className="form-message">{message}</div>}
+    <PageHeading
+      eyebrow="管理 / 环境与插件"
+      title="环境目录与工具插件"
+      description="先确认可用环境，再查看插件健康状态；只有需要精细调整时才进入高级配置。"
+      action={<div className="environment-heading-actions"><span className={`directory-badge ${config ? (config.writable ? 'ok' : 'neutral') : 'neutral'}`}>{config ? (config.writable ? '目录可写' : '只读目录') : '未连接'}</span>{config && <button className="quiet-button" onClick={() => setActivePanel('editor')}>编辑高级配置</button>}</div>}
+    />
+    <section className="panel directory-hero">
+      <div className="directory-hero-copy"><span className="section-kicker">环境目录</span><h2>{environments.items.length ? '诊断可以访问这些目标' : '还没有可用的诊断目标'}</h2><p>{environments.items.length ? '环境确认后会生成不可变快照，诊断只能读取快照里已启用的数据源。' : '配置一个环境和只读数据源后，新的诊断就可以按目标使用外部证据。'}</p></div>
+      <div className="directory-stats"><div><strong>{environments.items.length}</strong><span>可用环境</span></div><div><strong>{enabledSources.length}</strong><span>只读数据源</span></div><div><strong>{enabledInstances.length}</strong><span>启用实例</span></div><span className="directory-revision mono">{config ? `rev ${config.revision.slice(0, 10)}` : '未配置 revision'}</span></div>
     </section>
+    <div className="environment-tabs" role="tablist" aria-label="环境管理视图"><button role="tab" aria-selected={activePanel === 'overview'} className={activePanel === 'overview' ? 'active' : ''} onClick={() => setActivePanel('overview')}>环境概览</button><button role="tab" aria-selected={activePanel === 'plugins'} className={activePanel === 'plugins' ? 'active' : ''} onClick={() => setActivePanel('plugins')}>插件状态 <span>{plugins.items.length}</span></button><button role="tab" aria-selected={activePanel === 'editor'} className={activePanel === 'editor' ? 'active' : ''} onClick={() => setActivePanel('editor')}>高级配置</button></div>
+
+    {activePanel === 'overview' && <>
+      <div className="environment-overview-grid">
+        <section className="panel"><PanelHeader title="可用环境" meta={`${environmentCards.length} 个`} />{environmentCards.length === 0 ? <div className="empty-state"><strong>尚未配置环境目录</strong><span>进入“高级配置”粘贴或编辑目录，然后先校验再保存。</span></div> : <div className="environment-card-list">{environmentCards.map((item) => <article className="environment-card" key={item.environment_id}><div className="environment-card-head"><span className="environment-mark">◈</span><div><strong>{item.display_name}</strong><small className="mono">{item.environment_id} · {item.level}{item.region ? ` · ${item.region}` : ''}</small></div><span className="directory-badge ok">可用于诊断</span></div><p>{item.aliases.length ? `别名：${item.aliases.join('、')}` : '未设置别名'} · {item.timezone}</p><div className="environment-card-stats"><span><strong>{item.sourceCount}</strong> 数据源</span><span><strong>{item.databaseCount}</strong> 数据库</span><span><strong>{item.serviceCount}</strong> 服务</span><span><strong>{item.nodeCount}</strong> 节点</span></div></article>)}</div>}</section>
+        <section className="panel sqlite-trial-card"><div className="sqlite-trial-top"><span className="plugin-icon">▦</span><div><span className="section-kicker">推荐试用</span><h2>SQLite 只读数据源</h2></div>{sqlitePlugin ? <span className="directory-badge ok">已接入</span> : <span className="directory-badge neutral">未安装</span>}</div><p>{sqlitePlugin ? '插件已被后端发现，可用于表结构查看和受限的参数化查询。' : '安装 SQLite 插件并重启后端，即可在这里完成实例检查。'}</p>{sqlitePlugin && <div className="sqlite-trial-meta"><span><strong>{instances.filter((instance) => instance.plugin_id === 'sqlite').length}</strong> 个插件实例</span><span><strong>{sourceRecords.filter((source) => source.kind === 'database' && instances.some((instance) => instance.id === source.plugin_instance_id && instance.plugin_id === 'sqlite')).length}</strong> 个数据库源</span></div>}<div className="sqlite-trial-actions"><button className="primary-button" onClick={() => setActivePanel('plugins')}>查看 SQLite 状态</button><button className="quiet-button" onClick={() => setActivePanel('editor')}>编辑数据源</button></div></section>
+      </div>
+      <section className="panel source-inventory"><PanelHeader title="只读数据源" meta={`${enabledSources.length} 个已启用`} />{enabledSources.length === 0 ? <div className="empty-state"><strong>还没有绑定数据源</strong><span>数据源会把环境、插件实例和具体数据库/日志位置连接起来。</span></div> : <div className="source-grid">{enabledSources.map((source) => { const instanceId = textValue(source.plugin_instance_id, '未绑定实例'); const instance = instances.find((item) => textValue(item.id) === instanceId); return <div className="source-card" key={textValue(source.id, instanceId)}><div className="source-card-icon">{source.kind === 'database' ? '▦' : '≋'}</div><div><strong>{textValue(source.id, '未命名数据源')}</strong><small>{sourceDisplayName(textValue(source.kind, '未知类型'))} · {pluginDisplayName(textValue(instance?.plugin_id, '未安装插件'))}</small></div><span className="mono muted">{instanceId}</span></div> })}</div>}</section>
+    </>}
+
+    {activePanel === 'plugins' && <section className="panel plugin-directory-panel"><div className="plugin-directory-heading"><div><span className="section-kicker">工具插件目录</span><h2>已发现的只读连接器</h2><p>插件负责确定性读取；BugLens 控制环境边界、调用预算和审计。</p></div><span className="directory-badge neutral">{plugins.items.length} 个已发现</span></div>{plugins.items.length === 0 ? <div className="empty-state"><strong>没有已安装插件</strong><span>外部工具默认关闭。安装插件包并重启后端后，会在这里显示。</span></div> : <div className="plugin-detail-list">{plugins.items.map((plugin) => { const pluginInstances = instances.filter((instance) => instance.plugin_id === plugin.plugin_id); const enabledCount = pluginInstances.filter((instance) => instance.enabled !== false).length; return <article className={`plugin-detail-card ${plugin.plugin_id === 'sqlite' ? 'featured' : ''}`} key={plugin.plugin_id}><div className="plugin-detail-head"><span className="plugin-icon">{plugin.plugin_id === 'sqlite' ? '▦' : '◌'}</span><div className="plugin-detail-title"><span className="plugin-friendly-name">{pluginDisplayName(plugin.plugin_id)}</span><h2 className="mono">{plugin.plugin_id}</h2><p>{plugin.capabilities.map(capabilityDisplayName).join(' · ') || '已注册，只读能力由插件声明。'}</p></div><div className="plugin-version"><strong>v{plugin.implementation_version}</strong><small>Plugin API {plugin.api_major}</small></div></div><div className="plugin-detail-summary"><span className={`directory-badge ${enabledCount ? 'ok' : 'neutral'}`}>{enabledCount} 个启用实例</span><span>{plugin.health_check ? '支持连接检查' : '未提供连接检查'}</span></div><div className="plugin-instance-list">{pluginInstances.length === 0 ? <div className="plugin-unbound">插件已发现，但还没有在环境目录中创建实例。</div> : pluginInstances.map((instance) => { const id = textValue(instance.id, '未命名实例'); const result = checkResults[id]; const status = result?.status ?? (instance.enabled === false ? 'disabled' : 'configured'); return <div className="plugin-instance-card" key={id}><div className="plugin-instance-copy"><span className={`instance-pulse ${healthTone(status)}`} /><div><strong className="mono">{id}</strong><small>{instance.enabled === false ? '实例已停用' : result?.detail ?? '已配置，尚未执行连接检查'}</small></div></div><div className="plugin-instance-actions"><span className={`plugin-health ${healthTone(status)}`}><i />{healthLabel(status)}</span><button className="quiet-button" onClick={() => checkInstance(id)} disabled={status === 'checking' || !plugin.health_check}>检查连接</button></div></div> })}</div><details className="schema-details"><summary>查看配置 Schema</summary><div className="schema-grid"><div><span>实例配置</span><pre>{JSON.stringify(plugin.instance_config_schema, null, 2)}</pre></div><div><span>数据源配置</span><pre>{JSON.stringify(plugin.source_config_schema, null, 2)}</pre></div></div></details></article> })}</div>}</section>}
+
+    {activePanel === 'editor' && <section className="panel environment-editor"><div className="editor-heading"><div><span className="section-kicker">高级配置</span><h2>环境目录 JSON</h2><p>仅编辑非敏感字段；保存前会先校验，已有运行继续使用原快照。</p></div><div className="editor-meta"><span className={`directory-badge ${config?.writable ? 'ok' : 'neutral'}`}>{config?.writable ? '可写' : '只读'}</span><span className="mono">{config ? `revision ${config.revision}` : '未连接'}</span></div></div><p className="config-callout">密码、token、用户名不会从后端返回；保留字段中的 is_set 标记即可。凭据只能通过下方 set/clear 操作更新。</p>{config ? <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} rows={18} spellCheck={false} disabled={!config.writable} /> : <div className="empty-state">后端未提供环境目录配置。</div>}<div className="secret-editor"><div className="secret-editor-heading"><div><h3>凭据轮换</h3><p>只在需要更新时填写；提交后不会回显原值。</p></div><span className="mono">{instances.length} 个实例</span></div>{instances.length === 0 ? <div className="empty-state">当前目录没有需要管理凭据的插件实例。</div> : instances.map((instance) => { const id = textValue(instance.id); const pluginId = textValue(instance.plugin_id, 'unknown'); return <div className="secret-row" key={id}><div className="secret-row-title"><strong>{id || '未命名实例'}</strong><small>{pluginDisplayName(pluginId)} · 凭据仅用于本次提交</small></div>{(['username', 'password', 'token'] as const).map((field) => { const key = `${id}:${field}`; return <div className="secret-field" key={field}><label>{field === 'username' ? '用户名' : field === 'password' ? '密码' : 'Token'}<input type={field === 'username' ? 'text' : 'password'} value={secretDrafts[key] ?? ''} onChange={(event) => { const value = event.target.value; setSecretDrafts((current) => ({ ...current, [key]: value })); if (value) setSecretClears((current) => ({ ...current, [key]: false })) }} placeholder="留空表示不变" autoComplete="new-password" /></label><label className="clear-secret"><input type="checkbox" checked={secretClears[key] ?? false} onChange={(event) => { const checked = event.target.checked; setSecretClears((current) => ({ ...current, [key]: checked })); if (checked) setSecretDrafts((current) => ({ ...current, [key]: '' })) }} /> 清除</label></div> })}<button type="button" className="quiet-button secret-check-button" onClick={() => checkInstance(id)} disabled={!id}>检查连接</button></div> })}</div><div className="settings-actions"><button className="quiet-button" onClick={validate} disabled={!config?.writable}>验证目录</button><button className="primary-button" onClick={save} disabled={!config?.writable}>保存环境配置</button></div>{message && <div className={`form-message ${messageTone}`}>{message}</div>}</section>}
   </div>
 }
 
@@ -532,6 +596,8 @@ function SettingsPage({ config, onConfigChange, fetchError }: { config: AdminCon
   const [models, setModels] = useState<Record<string, ModelEntry>>({})
   const [saved, setSaved] = useState(false)
   const [message, setMessage] = useState('')
+  const [messageTone, setMessageTone] = useState<'neutral' | 'success' | 'error'>('neutral')
+  const [busyAction, setBusyAction] = useState<'validate' | 'save' | null>(null)
   useEffect(() => {
     if (!config) return
     const raw = config.profiles[profile]
@@ -582,24 +648,42 @@ function SettingsPage({ config, onConfigChange, fetchError }: { config: AdminCon
   }
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (!config) { setMessage('当前为演示模式，后端连接后可保存配置'); return }
+    if (!config) { setMessageTone('error'); setMessage('尚未连接后端，连接恢复后才能保存配置。'); return }
+    setBusyAction('save')
+    setMessage('')
     try {
+      const validation = await validateAdminConfig({ profile, config: buildPayload(), expected_revision: config.revision })
+      if (!validation.valid) {
+        setMessageTone('error')
+        setMessage(validation.errors.join('；') || '配置未通过校验，请检查标记的内容。')
+        return
+      }
       const next = await applyAdminConfig({ profile, config: buildPayload(), expected_revision: config.revision })
       onConfigChange(next)
       setSaved(true)
-      setMessage('配置已保存；新运行会使用新的快照')
+      setMessageTone('success')
+      setMessage('配置已校验并保存。之后创建的诊断将使用新快照。')
       setTimeout(() => setSaved(false), 2500)
     } catch (error) {
+      setMessageTone('error')
       setMessage(error instanceof Error ? error.message : '保存失败，请重试')
+    } finally {
+      setBusyAction(null)
     }
   }
   async function validate() {
-    if (!config) { setMessage('当前为演示模式，后端连接后可校验配置'); return }
+    if (!config) { setMessageTone('error'); setMessage('尚未连接后端，连接恢复后才能校验配置。'); return }
+    setBusyAction('validate')
+    setMessage('')
     try {
       const result = await validateAdminConfig({ profile, config: buildPayload(), expected_revision: config.revision })
-      setMessage(result.valid ? '配置校验通过' : result.errors.join('；'))
+      setMessageTone(result.valid ? 'success' : 'error')
+      setMessage(result.valid ? '校验通过，可以安全保存。' : result.errors.join('；'))
     } catch (error) {
+      setMessageTone('error')
       setMessage(error instanceof Error ? error.message : '校验失败，请重试')
+    } finally {
+      setBusyAction(null)
     }
   }
   function addModel() { let i = 1; while (models[`model-${i}`]) i++; setModels((c) => ({ ...c, [`model-${i}`]: { model: 'gpt-4.1-mini', base_url: '', api_key: '', timeout: 60, streaming: null } })) }
@@ -607,7 +691,136 @@ function SettingsPage({ config, onConfigChange, fetchError }: { config: AdminCon
   function removeModel(name: string) { setModels((c) => { const next = { ...c }; delete next[name]; return next }) }
   const modelNames = Object.keys(models)
   const profiles = Object.keys(config?.profiles ?? { default: {} })
-  return <div className="management-content"><PageHeading eyebrow="管理 / 配置与初始化" title="配置与初始化" description="先配置可用模型（含凭据），再为每个节点选择模型；策略与凭据解耦。" /><div className="setup-banner"><span className="setup-icon">✓</span><div><strong>{config === null ? '等待后端连接' : config.writable === false ? '使用内置默认配置' : '后端已初始化'}</strong><p>{config === null ? '当前显示演示状态' : `配置文件${config.writable === false ? '只读' : '可写'} · 当前 profile：${profile} · revision ${config.revision}`}</p></div><span className="setup-step">1 / 3</span></div><form className="settings-layout" onSubmit={submit}><section className="panel config-preview settings-full"><PanelHeader title="模型管理" meta={`${modelNames.length} 个模型`} /><p className="config-callout">每个模型是一个命名的端点（模型名 + 凭据）。节点通过引用名选择模型；留空 base_url/api_key 则回退到环境变量 OPENAI_BASE_URL / OPENAI_API_KEY。</p>{Object.entries(models).map(([name, m]) => <div className="model-card" key={name}><div className="model-card-head"><strong className="mono">{name}</strong><button type="button" className="row-link" onClick={() => removeModel(name)}>删除</button></div><label>模型名<input value={m.model} onChange={(e) => updateModel(name, { model: e.target.value })} placeholder="如 gpt-4.1-mini 或 maas-glm-5.2-volcengine-codeagent" /></label><div className="form-row"><label>Base URL<input value={m.base_url} onChange={(e) => updateModel(name, { base_url: e.target.value })} placeholder="留空=环境变量" /></label><label>API Key<input value={m.api_key} onChange={(e) => updateModel(name, { api_key: e.target.value })} type="password" placeholder="留空=保留原值" /></label></div><div className="form-row"><label>超时(秒)<input type="number" min="1" max="600" value={m.timeout} onChange={(e) => updateModel(name, { timeout: Number(e.target.value) })} /></label><label>流式<select value={m.streaming === null ? '' : String(m.streaming)} onChange={(e) => updateModel(name, { streaming: e.target.value === '' ? null : e.target.value === 'true' })}><option value="">默认</option><option value="true">开</option><option value="false">关</option></select></label></div></div>)}<button type="button" className="quiet-button model-add" onClick={addModel}>＋ 新增模型</button></section><section className="panel settings-form"><PanelHeader title="运行配置" meta="保存前会先校验" /><label>配置 Profile<input value={profile} onChange={(event) => setProfile(event.target.value)} list="profile-options" /><datalist id="profile-options">{profiles.map((name) => <option key={name} value={name} />)}</datalist><small>可选择已有 profile，也可以输入名称创建新的版本化 profile。</small></label><label>配置版本<input value={configVersion} onChange={(event) => setConfigVersion(event.target.value)} /><small>用于审计和恢复；不能与其他 profile 重复。</small></label><div className="form-row number-row"><label>定位尝试上限<input type="number" min="1" max="2" value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} /></label><label>澄清轮数上限<input type="number" min="0" max="10" value={maxClarifications} onChange={(event) => setMaxClarifications(Number(event.target.value))} /></label></div><label>评测通过分<input type="number" min="0" max="100" value={passingScore} onChange={(event) => setPassingScore(Number(event.target.value))} /><small>运行中的任务继续使用原 config snapshot；这里只影响新运行。</small></label><div className="settings-actions"><button type="button" className="quiet-button" onClick={validate}>验证配置</button><button type="submit" className="primary-button">{saved ? '已保存 ✓' : '保存配置'}</button></div>{message && <div className="form-message">{message}</div>}</section><section className="panel config-preview"><PanelHeader title="节点策略（当前生效）" meta={String(config?.profiles[profile]?.config_version ?? configVersion)} />{nodeKeys.map((key) => <div className="form-row node-config-row" key={key}><label className="node-name">{key}<select value={nodeModels[key]} onChange={(e) => setNodeModels((c) => ({ ...c, [key]: e.target.value }))}>{modelNames.map((n) => <option key={n} value={n}>{n}</option>)}{nodeModels[key] && !modelNames.includes(nodeModels[key]) && <option value={nodeModels[key]}>{nodeModels[key]}</option>}</select></label><label className="turns-field">轮数<input type="number" min="1" max="20" value={nodeTurns[key]} onChange={(e) => setNodeTurns((c) => ({ ...c, [key]: Number(e.target.value) }))} /></label></div>)}<div className="config-callout">保存新的 profile 后，新运行使用新配置；已创建运行继续使用自己的快照。</div></section></form></div>
+  const nodeCopy = {
+    analyze: { index: '01', title: '理解问题', description: '整理现象、上下文与已有证据' },
+    investigate: { index: '02', title: '定位原因', description: '调用只读数据源并形成原因假设' },
+    evaluate: { index: '03', title: '独立评测', description: '检查证据链和验证步骤是否充分' },
+    summarize: { index: '04', title: '生成报告', description: '区分结论、假设与信息缺口' },
+  } as const
+  const connected = config !== null
+  const writable = config?.writable !== false
+  const readyNodes = nodeKeys.filter((key) => modelNames.includes(nodeModels[key])).length
+  function scrollToSetting(sectionId: string) {
+    document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  return <div className="management-content settings-page">
+    <PageHeading
+      eyebrow="管理 / 配置与初始化"
+      title="配置与初始化"
+      description="把连接、模型和诊断策略整理成一条清晰的启用路径。"
+    />
+
+    <section className={`settings-hero ${connected ? 'is-connected' : 'is-offline'}`}>
+      <div className="settings-hero-copy">
+        <span className="settings-hero-orb" aria-hidden="true">{connected ? '✓' : '…'}</span>
+        <div>
+          <span className="settings-overline">INITIALIZATION STATUS</span>
+          <h2>{connected ? (writable ? 'BugLens 已准备就绪' : '已连接，只读运行') : '正在等待后端连接'}</h2>
+          <p>{fetchError || (connected ? '配置会以不可变快照应用到之后创建的诊断，现有任务不会被改变。' : '连接建立后即可校验模型端点和诊断策略。')}</p>
+        </div>
+      </div>
+      <div className="settings-hero-meta">
+        <span className="settings-status-chip"><i />{connected ? '后端在线' : '未连接'}</span>
+        <span className="settings-status-chip subtle">{config ? (writable ? '配置可写' : '内置只读') : '演示视图'}</span>
+        {config && <span className="settings-revision mono">rev {config.revision.slice(0, 10)}</span>}
+      </div>
+      <div className="setup-progress" aria-label="初始化进度">
+        <div className={connected ? 'complete' : 'current'}><span>{connected ? '✓' : '1'}</span><div><strong>连接实例</strong><small>{connected ? '连接正常' : '等待连接'}</small></div></div>
+        <i />
+        <div className={modelNames.length > 0 ? 'complete' : connected ? 'current' : ''}><span>{modelNames.length > 0 ? '✓' : '2'}</span><div><strong>模型服务</strong><small>{modelNames.length} 个端点</small></div></div>
+        <i />
+        <div className={readyNodes === nodeKeys.length && modelNames.length > 0 ? 'complete' : modelNames.length > 0 ? 'current' : ''}><span>{readyNodes === nodeKeys.length && modelNames.length > 0 ? '✓' : '3'}</span><div><strong>诊断策略</strong><small>{readyNodes} / {nodeKeys.length} 节点</small></div></div>
+      </div>
+    </section>
+
+    <form className="settings-form-shell" onSubmit={submit}>
+      <aside className="settings-index" aria-label="配置页面目录">
+        <span>配置目录</span>
+        <button type="button" onClick={() => scrollToSetting('settings-models')}><b>01</b><div><strong>模型服务</strong><small>端点与凭据</small></div></button>
+        <button type="button" onClick={() => scrollToSetting('settings-policy')}><b>02</b><div><strong>运行策略</strong><small>Profile 与阈值</small></div></button>
+        <button type="button" onClick={() => scrollToSetting('settings-nodes')}><b>03</b><div><strong>节点策略</strong><small>模型与轮数</small></div></button>
+        <div className="settings-index-note"><i>i</i><p>所有改动仅影响之后创建的诊断。</p></div>
+      </aside>
+
+      <main className="settings-sections">
+        <section className="settings-card" id="settings-models">
+          <div className="settings-section-heading">
+            <div className="settings-section-number">01</div>
+            <div><span className="settings-overline">MODEL PROVIDERS</span><h2>模型服务</h2><p>配置可复用的模型端点，再由各诊断节点按名称引用。</p></div>
+            <span className="settings-count">{modelNames.length} 个端点</span>
+          </div>
+          <div className="settings-note"><span>⌁</span><p>Base URL 和 API Key 留空时使用服务端环境变量。密钥为只写字段，保存后不会显示原值。</p></div>
+          <div className="model-list">
+            {Object.entries(models).map(([name, model], index) => {
+              const usedBy = nodeKeys.filter((key) => nodeModels[key] === name)
+              const canRemove = modelNames.length > 1 && usedBy.length === 0
+              return <article className="model-endpoint-card" key={name}>
+                <div className="model-endpoint-head">
+                  <span className="model-symbol" aria-hidden="true">✦</span>
+                  <div><strong>{name}</strong><small>模型端点 {String(index + 1).padStart(2, '0')}</small></div>
+                  <span className={`endpoint-state ${model.api_key ? 'custom' : ''}`}><i />{model.api_key ? '独立凭据' : '环境凭据'}</span>
+                  <button type="button" className="icon-button danger" onClick={() => removeModel(name)} disabled={!canRemove} title={canRemove ? '删除模型端点' : usedBy.length ? '先从诊断节点解除引用' : '至少保留一个模型端点'} aria-label={`删除模型端点 ${name}`}>×</button>
+                </div>
+                <div className="endpoint-fields">
+                  <label className="field-wide"><span>模型标识</span><input value={model.model} onChange={(event) => updateModel(name, { model: event.target.value })} placeholder="例如 gpt-4.1-mini" /></label>
+                  <label><span>请求超时</span><div className="input-with-suffix"><input type="number" min="1" max="600" value={model.timeout} onChange={(event) => updateModel(name, { timeout: Number(event.target.value) })} /><em>秒</em></div></label>
+                  <label className="field-wide"><span>Base URL <em>可选</em></span><input value={model.base_url} onChange={(event) => updateModel(name, { base_url: event.target.value })} placeholder="使用 OPENAI_BASE_URL" autoComplete="url" /></label>
+                  <label className="field-wide"><span>API Key <em>只写</em></span><input value={model.api_key} onChange={(event) => updateModel(name, { api_key: event.target.value })} type="password" placeholder="留空以使用或保留环境凭据" autoComplete="new-password" /></label>
+                  <label><span>流式响应</span><select value={model.streaming === null ? '' : String(model.streaming)} onChange={(event) => updateModel(name, { streaming: event.target.value === '' ? null : event.target.value === 'true' })}><option value="">跟随默认</option><option value="true">开启</option><option value="false">关闭</option></select></label>
+                </div>
+                {usedBy.length > 0 && <div className="endpoint-usage">用于 {usedBy.map((key) => nodeCopy[key].title).join('、')}</div>}
+              </article>
+            })}
+            {modelNames.length === 0 && <div className="settings-empty"><span>✦</span><strong>还没有模型端点</strong><p>新增一个端点后，才能为诊断节点分配模型。</p></div>}
+          </div>
+          <button type="button" className="add-endpoint-button" onClick={addModel}><span>＋</span><div><strong>新增模型端点</strong><small>添加独立的模型、地址和凭据</small></div></button>
+        </section>
+
+        <section className="settings-card" id="settings-policy">
+          <div className="settings-section-heading">
+            <div className="settings-section-number">02</div>
+            <div><span className="settings-overline">RUN POLICY</span><h2>运行策略</h2><p>定义配置身份、诊断上限与结论通过标准。</p></div>
+            <span className="settings-count">仅影响新任务</span>
+          </div>
+          <div className="policy-grid">
+            <label className="setting-field"><span>配置 Profile</span><input value={profile} onChange={(event) => setProfile(event.target.value)} list="profile-options" /><datalist id="profile-options">{profiles.map((name) => <option key={name} value={name} />)}</datalist><small>选择现有 Profile，或输入新名称创建一份策略。</small></label>
+            <label className="setting-field"><span>配置版本</span><input value={configVersion} onChange={(event) => setConfigVersion(event.target.value)} /><small>用于审计和恢复，必须在所有 Profile 中保持唯一。</small></label>
+            <label className="setting-field compact"><span>定位尝试上限</span><div className="stepper-input"><button type="button" onClick={() => setMaxAttempts(Math.max(1, maxAttempts - 1))}>−</button><input type="number" min="1" max="2" value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} /><button type="button" onClick={() => setMaxAttempts(Math.min(2, maxAttempts + 1))}>＋</button></div><small>最多两次定位，避免无界循环。</small></label>
+            <label className="setting-field compact"><span>澄清轮数上限</span><div className="stepper-input"><button type="button" onClick={() => setMaxClarifications(Math.max(0, maxClarifications - 1))}>−</button><input type="number" min="0" max="10" value={maxClarifications} onChange={(event) => setMaxClarifications(Number(event.target.value))} /><button type="button" onClick={() => setMaxClarifications(Math.min(10, maxClarifications + 1))}>＋</button></div><small>信息不足时允许向用户追问的次数。</small></label>
+            <label className="setting-field score-field"><span>评测通过分 <b>{passingScore}</b></span><input type="range" min="0" max="100" value={passingScore} onChange={(event) => setPassingScore(Number(event.target.value))} style={{ '--score': `${passingScore}%` } as React.CSSProperties} /><div className="range-labels"><span>宽松 0</span><span>建议 75</span><span>严格 100</span></div></label>
+          </div>
+        </section>
+
+        <section className="settings-card" id="settings-nodes">
+          <div className="settings-section-heading">
+            <div className="settings-section-number">03</div>
+            <div><span className="settings-overline">AGENT WORKFLOW</span><h2>节点策略</h2><p>四个节点依次执行；每个节点独立选择模型和轮数。</p></div>
+            <span className="settings-count">{configVersion}</span>
+          </div>
+          <div className="node-policy-list">
+            {nodeKeys.map((key, index) => <div className="node-policy-row" key={key}>
+              <div className="node-order"><span>{nodeCopy[key].index}</span>{index < nodeKeys.length - 1 && <i />}</div>
+              <div className="node-policy-copy"><strong>{nodeCopy[key].title}</strong><small>{nodeCopy[key].description}</small></div>
+              <label><span>模型</span><select value={nodeModels[key]} onChange={(event) => setNodeModels((current) => ({ ...current, [key]: event.target.value }))}>{modelNames.map((name) => <option key={name} value={name}>{name}</option>)}{nodeModels[key] && !modelNames.includes(nodeModels[key]) && <option value={nodeModels[key]}>{nodeModels[key]}（未配置）</option>}</select></label>
+              <label className="node-turns"><span>最大轮数</span><div className="input-with-suffix"><input type="number" min="1" max="20" value={nodeTurns[key]} onChange={(event) => setNodeTurns((current) => ({ ...current, [key]: Number(event.target.value) }))} /><em>轮</em></div></label>
+            </div>)}
+          </div>
+        </section>
+      </main>
+
+      <div className="settings-actionbar">
+        <div className="actionbar-status" aria-live="polite">
+          <span className={message ? messageTone : 'neutral'}>{message ? (messageTone === 'success' ? '✓' : messageTone === 'error' ? '!' : 'i') : 'i'}</span>
+          <div><strong>{message || '保存前会先完成完整配置校验'}</strong><small>{config ? `当前 Profile：${profile} · ${configVersion}` : '等待后端连接'}</small></div>
+        </div>
+        <div className="actionbar-buttons">
+          <button type="button" className="quiet-button" onClick={validate} disabled={!connected || busyAction !== null}>{busyAction === 'validate' ? '正在校验…' : '验证配置'}</button>
+          <button type="submit" className="primary-button" disabled={!connected || !writable || busyAction !== null}>{busyAction === 'save' ? '正在保存…' : saved ? '已保存 ✓' : '保存并应用'}</button>
+        </div>
+      </div>
+    </form>
+  </div>
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
