@@ -1,7 +1,7 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 
-.status-pill.waiting_user, .status-pill.waiting_tool, .status-pill.waiting_approval { color: #d8b25d; background: rgba(216,178,93,.1); }
-.status-pill.waiting_user i, .status-pill.waiting_tool i, .status-pill.waiting_approval i { background: #d8b25d; }
+.status-pill.waiting_user, .status-pill.waiting_tool, .status-pill.waiting_approval, .status-pill.waiting_for_target_confirmation { color: #d8b25d; background: rgba(216,178,93,.1); }
+.status-pill.waiting_user i, .status-pill.waiting_tool i, .status-pill.waiting_approval i, .status-pill.waiting_for_target_confirmation i { background: #d8b25d; }
 .status-pill.canceled { color: #8c9caf; background: rgba(140,156,175,.1); }
 .status-pill.canceled i { background: #8c9caf; }
 .status-pill.inconclusive { color: #c3a26a; background: rgba(195,162,106,.1); }

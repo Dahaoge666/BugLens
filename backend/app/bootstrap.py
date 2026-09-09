@@ -8,8 +8,10 @@ from .agents import NativeDiagnosisRunner, OpenAINodeRunner
 from .application import ApplicationService
 from .client import LocalAgentClient
 from .config import ConfigRepository, Settings
+from .environment import EnvironmentRepository
 from .graph import NativeDiagnosisGraph
 from .infra import SQLiteCheckpointStore
+from .plugins import build_plugin_runtime
 from .prompts import PromptRegistry
 from .runtime import DiagnosisRuntime
 from .security import SDKRunStateCipher
@@ -65,6 +67,10 @@ def build_local_service(
         timeout=settings.openai_timeout,
     )
     configs = ConfigRepository(settings.config_path)
+    environments = EnvironmentRepository(settings.environments_config_path)
+    _plugin_manager, environment_tools, environment_registry = build_plugin_runtime(
+        environments
+    )
     prompts = PromptRegistry(settings.prompt_config)
     runner = NativeDiagnosisRunner(
         prompts,
@@ -73,6 +79,7 @@ def build_local_service(
         default_base_url=settings.openai_base_url,
         default_api_key=settings.openai_api_key,
         default_timeout=settings.openai_timeout,
+        tool_registry=environment_registry,
     )
     # A custom gateway's tracing endpoint usually differs from OpenAI's; default
     # to disabling tracing there unless the operator explicitly enables it.
@@ -89,6 +96,8 @@ def build_local_service(
             if settings.run_state_key
             else None
         ),
+        environment_repository=environments,
+        environment_tools=environment_tools,
     )
     service = ApplicationService(
         runtime,
@@ -96,5 +105,6 @@ def build_local_service(
         require_model_credentials=True,
         openai_base_url=settings.openai_base_url,
         openai_api_key=settings.openai_api_key,
+        environments=environments,
     )
     return service, store, runner

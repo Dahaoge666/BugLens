@@ -17,6 +17,12 @@ from pydantic import Field
 
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
+from .environment import (
+    EnvironmentConfigError,
+    EnvironmentConfigNotWritableError,
+    EnvironmentRepository,
+    EnvironmentRevisionConflictError,
+)
 from .models import StrictModel
 from .security import sanitize_data
 
@@ -70,6 +76,57 @@ class ConfigValidationView(StrictModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EnvironmentSummaryView(StrictModel):
+    environment_id: str
+    display_name: str
+    aliases: list[str]
+    level: str
+    region: str | None = None
+    timezone: str
+    tags: dict[str, str]
+
+
+class EnvironmentListView(StrictModel):
+    revision: str
+    items: list[EnvironmentSummaryView]
+
+
+class PluginView(StrictModel):
+    plugin_id: str
+    implementation_version: str
+    api_major: int
+    capabilities: list[str]
+    health_check: bool
+    instance_ids: list[str] = Field(default_factory=list)
+    instance_status: dict[str, str] = Field(default_factory=dict)
+    instance_config_schema: dict[str, Any] = Field(default_factory=dict)
+    source_config_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class PluginListView(StrictModel):
+    items: list[PluginView]
+
+
+class EnvironmentConfigView(StrictModel):
+    revision: str
+    writable: bool
+    config: dict[str, Any]
+
+
+class EnvironmentConfigMutation(StrictModel):
+    config: dict[str, Any]
+    expected_revision: str = Field(min_length=8, max_length=128)
+    secret_updates: dict[str, dict[str, dict[str, Any]]] = Field(default_factory=dict)
+
+
+class PluginHealthView(StrictModel):
+    instance_id: str
+    plugin_id: str | None = None
+    status: AdminStatus
+    detail: str
+    checked_at: datetime
+
+
 class RunListItem(StrictModel):
     run_id: str
     question: str
@@ -91,6 +148,9 @@ class RunListItem(StrictModel):
     cancel_requested: bool = False
     pending_input: bool
     pending_approval: bool = False
+    environment_id: str | None = None
+    environment_snapshot_id: str | None = None
+    pending_target_confirmation: bool = False
     created_at: datetime
     updated_at: datetime
     last_error: str | None = None
@@ -163,6 +223,15 @@ class ToolExecutionView(StrictModel):
     retryable: bool
     result_summary_json: str | None = None
     evidence_ids_json: str
+    plugin_id: str | None = None
+    plugin_implementation_version: str | None = None
+    plugin_instance_id: str | None = None
+    environment_snapshot_id: str | None = None
+    source_id: str | None = None
+    operation: str | None = None
+    redacted_query: str | None = None
+    query_fingerprint: str | None = None
+    truncated: bool = False
     started_at: str
     completed_at: str | None = None
     duration_ms: int | None = None
@@ -209,6 +278,9 @@ class AdminApplicationService:
                 "server_sent_events": True,
                 "admin_health": True,
                 "admin_config": True,
+                "environment_catalog": self._environments() is not None,
+                "plugin_discovery": self._environment_tools() is not None,
+                "target_confirmation": True,
                 "admin_sessions": True,
                 "skip_input": True,
                 "resume": True,
@@ -349,6 +421,178 @@ class AdminApplicationService:
             warnings=warnings,
         )
 
+    def _environments(self) -> EnvironmentRepository | None:
+        return getattr(self.service, "environments", None)
+
+    def _environment_tools(self):
+        return getattr(self.service.runtime, "environment_tools", None)
+
+    def environment_list(self) -> EnvironmentListView:
+        repository = self._environments()
+        if repository is None:
+            return EnvironmentListView(revision="", items=[])
+        return EnvironmentListView(
+            revision=repository.revision,
+            items=[
+                EnvironmentSummaryView(
+                    environment_id=item.id,
+                    display_name=item.display_name,
+                    aliases=item.aliases,
+                    level=item.level,
+                    region=item.region,
+                    timezone=item.timezone,
+                    tags=item.tags,
+                )
+                for item in repository.environments()
+            ],
+        )
+
+    def environment_config(self) -> EnvironmentConfigView:
+        repository = self._environments()
+        if repository is None:
+            return EnvironmentConfigView(revision="", writable=False, config={})
+        return EnvironmentConfigView(
+            revision=repository.revision,
+            writable=repository.writable,
+            config=repository.public_config(),
+        )
+
+    def plugins(self) -> PluginListView:
+        repository = self._environments()
+        runtime_tools = self._environment_tools()
+        manager = getattr(runtime_tools, "plugins", None)
+        if manager is None:
+            return PluginListView(items=[])
+        instances = repository.directory().plugin_instances if repository else []
+        by_plugin: dict[str, list[str]] = {}
+        statuses: dict[str, dict[str, str]] = {}
+        for instance in instances:
+            by_plugin.setdefault(instance.plugin_id, []).append(instance.id)
+            statuses.setdefault(instance.plugin_id, {})[instance.id] = (
+                "enabled" if instance.enabled else "disabled"
+            )
+        result: list[PluginView] = []
+        for manifest in manager.manifests():
+            result.append(
+                PluginView(
+                    plugin_id=manifest.plugin_id,
+                    implementation_version=manifest.implementation_version,
+                    api_major=manifest.api_major,
+                    capabilities=manifest.capabilities,
+                    health_check=manifest.health_check,
+                    instance_ids=by_plugin.get(manifest.plugin_id, []),
+                    instance_status=statuses.get(manifest.plugin_id, {}),
+                    instance_config_schema=manifest.instance_config_schema,
+                    source_config_schema=manifest.source_config_schema,
+                )
+            )
+        return PluginListView(items=result)
+
+    def validate_environment_config(
+        self, mutation: EnvironmentConfigMutation
+    ) -> ConfigValidationView:
+        repository = self._environments()
+        runtime_tools = self._environment_tools()
+        if repository is None:
+            return ConfigValidationView(
+                valid=False,
+                profile="environments",
+                revision="",
+                errors=["environment repository is unavailable"],
+            )
+        if mutation.expected_revision != repository.revision:
+            return ConfigValidationView(
+                valid=False,
+                profile="environments",
+                revision=repository.revision,
+                errors=["environment config revision changed"],
+            )
+        try:
+            directory = repository.prepare(
+                mutation.config,
+                mutation.expected_revision,
+                secret_updates=mutation.secret_updates,
+            )
+            validator = getattr(
+                getattr(runtime_tools, "plugins", None), "validate_directory", None
+            )
+            if callable(validator):
+                validator(directory)
+        except Exception as exc:
+            return ConfigValidationView(
+                valid=False,
+                profile="environments",
+                revision=repository.revision,
+                errors=[str(sanitize_data(str(exc)))],
+            )
+        return ConfigValidationView(
+            valid=True,
+            profile="environments",
+            revision=repository.revision,
+            config_version=directory.config_version,
+        )
+
+    def apply_environment_config(
+        self, mutation: EnvironmentConfigMutation
+    ) -> EnvironmentConfigView:
+        repository = self._environments()
+        if repository is None:
+            raise EnvironmentConfigNotWritableError(
+                "environment repository is unavailable"
+            )
+        validation = self.validate_environment_config(mutation)
+        if not validation.valid:
+            if mutation.expected_revision != repository.revision:
+                raise EnvironmentRevisionConflictError(
+                    "environment config revision changed"
+                )
+            raise EnvironmentConfigError(
+                validation.errors[0]
+                if validation.errors
+                else "invalid environment config"
+            )
+        repository.apply(
+            mutation.config,
+            mutation.expected_revision,
+            secret_updates=mutation.secret_updates,
+        )
+        return self.environment_config()
+
+    async def check_plugin_instance(self, instance_id: str) -> PluginHealthView:
+        repository = self._environments()
+        runtime_tools = self._environment_tools()
+        if repository is None or runtime_tools is None:
+            return PluginHealthView(
+                instance_id=instance_id,
+                status="error",
+                detail="environment plugin runtime is unavailable",
+                checked_at=datetime.now(UTC),
+            )
+        checker = getattr(runtime_tools, "check_instance", None)
+        if not callable(checker):
+            return PluginHealthView(
+                instance_id=instance_id,
+                status="error",
+                detail="plugin health checks are unavailable",
+                checked_at=datetime.now(UTC),
+            )
+        health = await checker(instance_id)
+        instance = next(
+            (
+                item
+                for item in repository.directory().plugin_instances
+                if item.id == instance_id
+            ),
+            None,
+        )
+        return PluginHealthView(
+            instance_id=instance_id,
+            plugin_id=instance.plugin_id if instance else health.plugin_id,
+            status=health.status,
+            detail=health.detail,
+            checked_at=health.checked_at,
+        )
+
     def apply_config(self, mutation: ConfigMutation) -> ConfigView:
         config = copy.deepcopy(mutation.config)
         # A masked or empty api_key means "keep the existing value"; only an
@@ -414,6 +658,11 @@ class AdminApplicationService:
                     cancel_requested=state.cancel_requested_at is not None,
                     pending_input=state.pending_interaction is not None,
                     pending_approval=state.pending_approval is not None,
+                    environment_id=state.target.environment_id,
+                    environment_snapshot_id=state.environment_snapshot_id,
+                    pending_target_confirmation=(
+                        state.pending_target_confirmation is not None
+                    ),
                     created_at=state.created_at,
                     updated_at=state.updated_at,
                     last_error=state.last_error.message if state.last_error else None,
@@ -498,10 +747,17 @@ __all__ = [
     "ConfigView",
     "ConfigNotWritableError",
     "ConfigRevisionConflictError",
+    "EnvironmentConfigMutation",
+    "EnvironmentConfigView",
+    "EnvironmentListView",
+    "EnvironmentSummaryView",
     "HealthView",
     "NodeExecutionView",
     "RunListView",
     "SessionListView",
     "ToolExecutionView",
+    "PluginHealthView",
+    "PluginListView",
+    "PluginView",
     "VersionView",
 ]

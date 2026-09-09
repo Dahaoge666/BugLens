@@ -15,4 +15,4 @@ profiles:
       investigate: {max_turns: 6, prompt_version: tenant-prompts-v1}
       evaluate: {max_turns: 6, prompt_version: rubric-v1}
       summarize: {max_turns: 6, prompt_version: summary-v1}
-    tools: {enabled: false, allowed_nodes: [investigate], max_results: 20, timeout_seconds: 30}
+    tools: {enabled: false, allowed_nodes: [investigate], max_results: 20, max_result_rows: 200, timeout_seconds: 30}

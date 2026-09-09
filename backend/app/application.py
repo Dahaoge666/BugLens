@@ -7,6 +7,7 @@ from typing import AsyncIterator, Protocol
 from pydantic import Field
 
 from .config import ConfigRepository
+from .environment import EnvironmentRepository
 from .models import StrictModel
 from .protocol.commands import AgentCommand, StartDiagnosis
 from .protocol.events import AgentEvent
@@ -34,12 +35,14 @@ class ApplicationService:
         require_model_credentials: bool = False,
         openai_base_url: str | None = None,
         openai_api_key: str | None = None,
+        environments: EnvironmentRepository | None = None,
     ) -> None:
         self.runtime = runtime
         self.configs = configs
         self._require_model_credentials = require_model_credentials
         self._openai_base_url = openai_base_url
         self._openai_api_key = openai_api_key
+        self.environments = environments
 
     async def send(
         self, command: AgentCommand, identity: Identity | None = None

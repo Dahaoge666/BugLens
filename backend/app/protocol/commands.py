@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
-from ..models import ContextValue, EvidenceRecord, StrictModel, UserAnswer
+from ..models import ContextValue, EvidenceRecord, StrictModel, TargetSpec, UserAnswer
 
 
 class CommandEnvelope(StrictModel):
@@ -30,6 +30,16 @@ class StartDiagnosis(CommandEnvelope):
     context: dict[str, ContextValue] = Field(default_factory=dict)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
     profile: str = Field(default="default", min_length=1, max_length=128)
+    target: TargetSpec = Field(default_factory=TargetSpec)
+
+
+class ConfirmDiagnosisTarget(CommandEnvelope):
+    """Confirm one backend-generated environment candidate."""
+
+    command_type: Literal["confirm_diagnosis_target"] = "confirm_diagnosis_target"
+    request_id: str = Field(min_length=1, max_length=128)
+    environment_id: str = Field(min_length=1, max_length=128)
+    primary_service_id: str | None = Field(default=None, max_length=128)
 
 
 class SubmitUserAnswers(CommandEnvelope):
@@ -66,6 +76,7 @@ class RejectTool(CommandEnvelope):
 
 AgentCommand = (
     StartDiagnosis
+    | ConfirmDiagnosisTarget
     | SubmitUserAnswers
     | SkipUserInteraction
     | ResumeDiagnosis

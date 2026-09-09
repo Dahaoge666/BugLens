@@ -564,7 +564,11 @@ class DiagnosisGraph:
             tool_allowed_nodes=frozenset(config.policy.tools.allowed_nodes),
             tool_allowed_profiles=frozenset(config.policy.tools.allowed_profiles),
             tool_max_results=config.policy.tools.max_results,
+            tool_max_result_rows=config.policy.tools.max_result_rows,
             tool_timeout_seconds=config.policy.tools.timeout_seconds,
+            tool_max_calls=config.policy.tools.max_calls_per_run,
+            tool_max_concurrent=config.policy.tools.max_concurrent_calls,
+            environment_snapshot_id=state.environment_snapshot_id,
         )
 
     def session_id_for_state(self, state: DiagnosisState) -> str:

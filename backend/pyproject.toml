@@ -19,6 +19,8 @@ dependencies = [
   "cryptography>=42,<47",
   "pydantic>=2.8,<3",
   "PyYAML>=6,<7",
+  "buglens-plugin-api>=1,<2",
+  "jsonschema>=4.20,<5",
 ]
 
 [project.urls]
@@ -31,6 +33,9 @@ buglens-web = "app.server:main"
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+buglens-plugin-api = { path = "../plugin-api" }
 
 [tool.setuptools.packages.find]
 include = ["app*"]

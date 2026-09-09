@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import ResolvedRunConfig
+from .environment import ResolvedEnvironmentSnapshot
 from .models import (
     DiagnosisState,
     EvidenceRecord,
@@ -53,7 +54,7 @@ class FencingTokenError(RuntimeError):
 class SQLiteCheckpointStore:
     """Small SQLite repository with explicit, repeatable schema migrations."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -102,6 +103,13 @@ class SQLiteCheckpointStore:
                 config_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS run_environment_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                environment_id TEXT NOT NULL,
+                config_revision TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS run_leases (
                 run_id TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
@@ -148,6 +156,14 @@ class SQLiteCheckpointStore:
                 sdk_tool_call_id TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 tool_version TEXT NOT NULL,
+                plugin_id TEXT,
+                plugin_implementation_version TEXT,
+                plugin_instance_id TEXT,
+                environment_snapshot_id TEXT,
+                source_id TEXT,
+                operation TEXT,
+                redacted_query TEXT,
+                query_fingerprint TEXT,
                 retry_index INTEGER NOT NULL,
                 arguments_json TEXT,
                 arguments_hash TEXT,
@@ -157,6 +173,7 @@ class SQLiteCheckpointStore:
                 retryable INTEGER NOT NULL DEFAULT 0,
                 result_summary_json TEXT,
                 evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                truncated INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT NOT NULL,
                 completed_at TEXT,
                 duration_ms INTEGER
@@ -204,6 +221,18 @@ class SQLiteCheckpointStore:
         self._ensure_column(
             "diagnosis_node_executions", "reasoning_summary_json", "TEXT"
         )
+        for column, definition in (
+            ("plugin_id", "TEXT"),
+            ("plugin_implementation_version", "TEXT"),
+            ("plugin_instance_id", "TEXT"),
+            ("environment_snapshot_id", "TEXT"),
+            ("source_id", "TEXT"),
+            ("operation", "TEXT"),
+            ("redacted_query", "TEXT"),
+            ("query_fingerprint", "TEXT"),
+            ("truncated", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            self._ensure_column("diagnosis_tool_executions", column, definition)
         self._ensure_column("diagnosis_sdk_run_states", "decision", "TEXT")
         self._ensure_column("diagnosis_sdk_run_states", "decision_reason", "TEXT")
         self.db.execute(
@@ -283,6 +312,31 @@ class SQLiteCheckpointStore:
         if row is None:
             raise RunNotFoundError(f"config snapshot not found: {snapshot_id}")
         return ResolvedRunConfig.model_validate_json(row["config_json"])
+
+    def save_environment_snapshot(self, snapshot: ResolvedEnvironmentSnapshot) -> None:
+        payload = _remove_secrets(snapshot.model_dump(mode="json"))
+        self.db.execute(
+            """INSERT OR IGNORE INTO run_environment_snapshots
+            (snapshot_id, environment_id, config_revision, snapshot_json, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                snapshot.snapshot_id,
+                snapshot.environment_id,
+                snapshot.config_revision,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                snapshot.created_at.isoformat(),
+            ),
+        )
+        self.db.commit()
+
+    def get_environment_snapshot(self, snapshot_id: str) -> ResolvedEnvironmentSnapshot:
+        row = self.db.execute(
+            "SELECT snapshot_json FROM run_environment_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise RunNotFoundError(f"environment snapshot not found: {snapshot_id}")
+        return ResolvedEnvironmentSnapshot.model_validate_json(row["snapshot_json"])
 
     def get_state(self, run_id: str) -> DiagnosisState:
         row = self.db.execute(
@@ -652,9 +706,11 @@ class SQLiteCheckpointStore:
         self.db.execute(
             """INSERT INTO diagnosis_tool_executions
             (tool_execution_id, node_execution_id, run_id, sdk_tool_call_id,
-             tool_name, tool_version, retry_index, arguments_json, arguments_hash,
-             status, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
+             tool_name, tool_version, plugin_id, plugin_implementation_version,
+             plugin_instance_id, environment_snapshot_id, source_id, operation,
+             redacted_query, query_fingerprint, retry_index, arguments_json,
+             arguments_hash, status, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
             (
                 record["tool_execution_id"],
                 record["node_execution_id"],
@@ -662,6 +718,14 @@ class SQLiteCheckpointStore:
                 record["sdk_tool_call_id"],
                 record["tool_name"],
                 record.get("tool_version", "unknown"),
+                record.get("plugin_id"),
+                record.get("plugin_implementation_version"),
+                record.get("plugin_instance_id"),
+                record.get("environment_snapshot_id"),
+                record.get("source_id"),
+                record.get("operation"),
+                sanitize_data(record.get("redacted_query")),
+                record.get("query_fingerprint"),
                 record.get("retry_index", 0),
                 record.get("arguments_json"),
                 record.get("arguments_hash"),
@@ -678,6 +742,7 @@ class SQLiteCheckpointStore:
             "retryable",
             "result_summary_json",
             "evidence_ids_json",
+            "truncated",
             "completed_at",
             "duration_ms",
         }
@@ -1103,6 +1168,7 @@ class SQLiteCheckpointStore:
                 "waiting_user",
                 "waiting_approval",
                 "waiting_tool",
+                "waiting_for_target_confirmation",
             }:
                 session_status = "waiting"
             elif state.lifecycle_status.value in {"completed", "failed", "canceled"}:
@@ -1321,6 +1387,7 @@ def _remove_secrets(value: Any) -> Any:
         "apikey",
         "authorization",
         "cookie",
+        "username",
         "password",
         "secret",
         "secret_key",
@@ -1409,6 +1476,8 @@ def event_from_json(value: str) -> AgentEvent:
         RunResumed,
         RunStarted,
         RunWaiting,
+        TargetConfirmationRequired,
+        TargetConfirmed,
         ToolApprovalRequired,
         ToolApprovalResolved,
         ToolCallCompleted,
@@ -1427,6 +1496,8 @@ def event_from_json(value: str) -> AgentEvent:
         "tool_call_started": ToolCallStarted,
         "tool_call_completed": ToolCallCompleted,
         "tool_call_failed": ToolCallFailed,
+        "target_confirmation_required": TargetConfirmationRequired,
+        "target_confirmed": TargetConfirmed,
         "tool_approval_required": ToolApprovalRequired,
         "tool_approval_resolved": ToolApprovalResolved,
         "input_required": InputRequired,

@@ -3,6 +3,7 @@
 from .commands import (
     AgentCommand,
     CancelDiagnosis,
+    ConfirmDiagnosisTarget,
     StartDiagnosis,
     SubmitUserAnswers,
 )
@@ -16,11 +17,14 @@ from .events import (
     RunFailed,
     RunStarted,
     RunWaiting,
+    TargetConfirmationRequired,
+    TargetConfirmed,
 )
 
 __all__ = [
     "AgentCommand",
     "CancelDiagnosis",
+    "ConfirmDiagnosisTarget",
     "SubmitUserAnswers",
     "StartDiagnosis",
     "AgentEvent",
@@ -32,4 +36,6 @@ __all__ = [
     "RunFailed",
     "RunStarted",
     "RunWaiting",
+    "TargetConfirmationRequired",
+    "TargetConfirmed",
 ]

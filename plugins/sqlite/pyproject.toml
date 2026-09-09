@@ -1,0 +1,20 @@
+[project]
+name = "buglens-sqlite-plugin"
+version = "1.0.0"
+description = "Read-only SQLite data source plugin for BugLens"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = []
+dependencies = [
+  "buglens-plugin-api>=1,<2",
+]
+
+[project.entry-points."buglens.tool_plugins"]
+sqlite = "buglens_sqlite_plugin:plugin_factory"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["buglens_sqlite_plugin*"]

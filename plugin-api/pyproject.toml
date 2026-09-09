@@ -1,0 +1,17 @@
+[project]
+name = "buglens-plugin-api"
+version = "1.0.0"
+description = "Stable read-only plugin protocol for BugLens"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = []
+dependencies = [
+  "pydantic>=2.8,<3",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["buglens_plugin_api*"]

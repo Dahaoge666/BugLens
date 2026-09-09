@@ -43,7 +43,11 @@ frontend/ ── HTTP JSON / HTTP Command + SSE Event ──> backend/
   "evidence": [
     {"source": "log", "content": "timeout waiting for database connection", "reference": "trace_1001"}
   ],
-  "profile": "default"
+  "profile": "default",
+  "target": {
+    "mode": "infer",
+    "primary_service_id": "order-api"
+  }
 }
 ```
 
@@ -54,6 +58,7 @@ frontend/ ── HTTP JSON / HTTP Command + SSE Event ──> backend/
 - `POST /v1/runs/{run_id}/commands`：提交 `submit_user_answers`，请求体包含 `request_id` 和 1–3 个 `answers`；答案必须引用当前 `input_required` 事件中的问题 ID。
 - `POST /v1/runs/{run_id}/commands`：提交 `skip_user_interaction`，请求体包含当前 `request_id` 和 `reason`；不伪造答案，运行以信息不可用继续。
 - `POST /v1/runs/{run_id}/commands`：提交 `resume_diagnosis`，只允许快照 `available_actions` 包含 `resume` 的运行。
+- `POST /v1/runs/{run_id}/commands`：提交 `confirm_diagnosis_target`，携带当前 `target_confirmation_required.request_id`、候选环境 ID、可选主服务 ID 和 `expected_revision`；确认成功后后端保存不可变无凭据环境快照。
 - `POST /v1/runs/{run_id}/commands`：`approve_tool` / `reject_tool` 处理已注册只读工具的 SDK 审批中断；必须携带当前 `request_id` 和 `expected_revision`。默认 profile 不暴露需要审批的工具。
 - `POST /v1/runs/{run_id}/cancel`：提交 `cancel_diagnosis`，请求体包含非空 `reason`。
 
@@ -81,7 +86,7 @@ data: {"protocol_version":"2","event_id":"evt_123","run_id":"diag_123","sequence
 | `occurred_at` | UTC 时间 |
 | `event_type` | 事件类型及其专属字段 |
 
-当前事件类型包括 `run_started`、`node_attempt_started`、`node_retry_scheduled`、`node_attempt_failed`、`node_completed`、`tool_call_started`、`tool_call_completed`、`tool_call_failed`、`tool_approval_required`、`tool_approval_resolved`、`input_required`、`input_skipped`、`run_waiting`、`run_resume_available`、`run_resumed`、`run_cancel_requested`、`user_input_submitted`、`run_completed`、`run_failed` 和 `run_canceled`。Graph 固定经过 `analyze`、`investigate`、`evaluate`、`summarize`；前端只展示事件，不自行推进节点。
+当前事件类型包括 `run_started`、`target_confirmation_required`、`target_confirmed`、`node_attempt_started`、`node_retry_scheduled`、`node_attempt_failed`、`node_completed`、`tool_call_started`、`tool_call_completed`、`tool_call_failed`、`tool_approval_required`、`tool_approval_resolved`、`input_required`、`input_skipped`、`run_waiting`、`run_resume_available`、`run_resumed`、`run_cancel_requested`、`user_input_submitted`、`run_completed`、`run_failed` 和 `run_canceled`。目标确认前 `lifecycle_status` 为 `waiting_for_target_confirmation`，确认前不暴露环境工具；确认后 Run 快照提供 `target` 和 `environment_snapshot_id`。Graph 固定经过 `analyze`、`investigate`、`evaluate`、`summarize`；前端只展示事件，不自行推进节点。
 
 `input_required` 携带结构化 `request`，前端展示 `explanation`、`questions`、`answer_type` 和 `options`，提交答案时保留 `request_id`。`run_completed` 的 `outcome` 可能是 `confirmed` 或 `inconclusive`；`run_failed` 只表示基础设施或执行失败，不应被渲染成已确认根因。
 
@@ -105,6 +110,12 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/version` | 后端版本和协议版本 |
 | GET | `/v1/admin/capabilities` | 能力与可用操作 |
 | GET | `/v1/admin/config` | 当前非敏感配置 |
+| GET | `/v1/environments` | 可选择环境摘要和目录 revision；不返回凭据 |
+| GET | `/v1/admin/plugins` | entry point 发现的插件、版本、能力、Schema 和实例状态 |
+| GET | `/v1/admin/environment-config` | 非敏感环境目录；凭据只返回 `is_set` |
+| POST | `/v1/admin/environment-config/validate` | 校验目录和插件配置，不落盘 |
+| PUT/PATCH | `/v1/admin/environment-config` | If-Match/revision 原子更新目录 |
+| POST | `/v1/admin/plugin-instances/{id}/check` | 检查插件实例健康 |
 | POST | `/v1/admin/config/validate` | 校验配置但不落盘 |
 | PUT/PATCH | `/v1/admin/config` | 按 revision 原子更新配置 |
 | GET | `/v1/admin/runs` | 分页查询运行记录；损坏行会被跳过并通过 `degraded_count` 标记 |
@@ -114,6 +125,8 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/runs/{run_id}/tools` | 查询脱敏工具调用审计 |
 
 配置更新必须发送 `expected_revision`。后端返回 409 时，前端重新读取配置并显示差异；API key 等 secret 只允许写入或清除，永远不会在响应中返回原值。SDK 审批检查点只在后端使用 `BUGLENS_RUN_STATE_KEY` 加密保存，HTTP/SSE 不返回序列化 RunState。
+
+环境目录更新同样使用 opaque `expected_revision`/`If-Match`。`secret_updates` 明确声明 `username`、`password` 或 `token` 的 `set`/`clear`；遗漏表示保留。已创建 Run 使用目标确认时的无凭据环境快照，凭据轮换对下一次插件调用生效。
 
 当设置 `BUGLENS_ADMIN_TOKEN` 时，Admin 请求必须发送 `Authorization: Bearer <token>`；未设置时按部署环境决定是否允许可信内网访问。独立域名部署必须配置精确的 `BUGLENS_CORS_ORIGIN`。
 

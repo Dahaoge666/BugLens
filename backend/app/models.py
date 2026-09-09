@@ -43,6 +43,7 @@ class LifecycleStatus(StrEnum):
     WAITING_USER = "waiting_user"
     WAITING_TOOL = "waiting_tool"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_TARGET_CONFIRMATION = "waiting_for_target_confirmation"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
@@ -51,6 +52,48 @@ class LifecycleStatus(StrEnum):
 class DiagnosisOutcome(StrEnum):
     CONFIRMED = "confirmed"
     INCONCLUSIVE = "inconclusive"
+
+
+class TargetSpec(StrictModel):
+    """User-supplied target selection or deterministic inference hint."""
+
+    mode: Literal["explicit", "infer"] = "infer"
+    environment_id: str | None = Field(default=None, max_length=128)
+    primary_service_id: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_explicit_target(self) -> TargetSpec:
+        if self.mode == "explicit" and not self.environment_id:
+            raise ValueError("explicit target requires environment_id")
+        return self
+
+
+class ResolvedTarget(StrictModel):
+    """A target accepted by the environment directory."""
+
+    mode: Literal["explicit"] = "explicit"
+    environment_id: str = Field(min_length=1, max_length=128)
+    primary_service_id: str | None = Field(default=None, max_length=128)
+
+
+class EnvironmentTargetCandidate(StrictModel):
+    """A backend-generated, safe-to-display inference candidate."""
+
+    environment_id: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=256)
+    aliases: list[str] = Field(default_factory=list, max_length=30)
+    level: str = Field(default="unknown", max_length=64)
+    region: str | None = Field(default=None, max_length=128)
+    timezone: str = Field(default="UTC", max_length=128)
+    matched_by: list[str] = Field(default_factory=list, max_length=10)
+
+
+class PendingTargetConfirmation(StrictModel):
+    """Durable target-confirmation checkpoint; it contains no credentials."""
+
+    request_id: str = Field(min_length=1, max_length=128)
+    requested_target: TargetSpec
+    candidates: list[EnvironmentTargetCandidate] = Field(min_length=1, max_length=20)
 
 
 class GraphNode(StrEnum):
@@ -459,8 +502,13 @@ class DiagnosisState(StrictModel):
     pending_interaction: UserInteractionRequest | None = None
     pending_tool: PendingToolRequest | None = None
     pending_approval: PendingApproval | None = None
+    target: TargetSpec = Field(default_factory=TargetSpec)
+    pending_target_confirmation: PendingTargetConfirmation | None = None
+    # This ID points to ``run_environment_snapshots``.  It is intentionally
+    # nullable so legacy runs never gain access to external data sources.
+    environment_snapshot_id: str | None = Field(default=None, max_length=128)
     revision: int = Field(default=0, ge=0)
-    schema_version: int = Field(default=2, ge=1)
+    schema_version: int = Field(default=3, ge=1)
     config_snapshot_id: str = Field(default="pending", min_length=1, max_length=128)
     config_profile: str = Field(default="default", min_length=1, max_length=128)
     config_version: str = Field(default="default-v1", min_length=1, max_length=128)
@@ -516,13 +564,19 @@ class DiagnosisState(StrictModel):
         object.__setattr__(self, "clarification_rounds", rounds)
         object.__setattr__(self, "clarification_round", sum(rounds.values()))
 
-        pending = [self.pending_interaction, self.pending_tool, self.pending_approval]
+        pending = [
+            self.pending_interaction,
+            self.pending_tool,
+            self.pending_approval,
+            self.pending_target_confirmation,
+        ]
         if sum(item is not None for item in pending) > 1:
             raise ValueError("at most one pending interaction/tool/approval is allowed")
         waiting_map = {
             LifecycleStatus.WAITING_USER: self.pending_interaction,
             LifecycleStatus.WAITING_TOOL: self.pending_tool,
             LifecycleStatus.WAITING_APPROVAL: self.pending_approval,
+            LifecycleStatus.WAITING_TARGET_CONFIRMATION: self.pending_target_confirmation,
         }
         if (
             self.lifecycle_status in waiting_map
@@ -559,6 +613,8 @@ class DiagnosisState(StrictModel):
             actions = ["submit_answers", "skip_input", "cancel"]
         elif self.lifecycle_status == LifecycleStatus.WAITING_APPROVAL:
             actions = ["approve", "reject", "cancel"]
+        elif self.lifecycle_status == LifecycleStatus.WAITING_TARGET_CONFIRMATION:
+            actions = ["confirm_target", "cancel"]
         elif self.lifecycle_status == LifecycleStatus.FAILED and self.resume_available:
             actions = ["resume"]
         elif self.lifecycle_status == LifecycleStatus.RUNNING:
@@ -598,6 +654,7 @@ class DiagnosisState(StrictModel):
         config_snapshot_id: str = "pending",
         profile: str = "default",
         config_version: str = "default-v1",
+        target: TargetSpec | None = None,
     ) -> DiagnosisState:
         """Validate and redact all user data before it enters graph state."""
         raw_context = (
@@ -633,7 +690,8 @@ class DiagnosisState(StrictModel):
                 "config_snapshot_id": config_snapshot_id,
                 "config_profile": profile,
                 "config_version": config_version,
-                "schema_version": 2,
+                "schema_version": 3,
+                "target": target or TargetSpec(),
             }
         )
         return cls.model_validate(clean)

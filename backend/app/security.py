@@ -11,13 +11,14 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"(?i)(cookie\s*[:=]\s*)[^\r\n]+"),
-    re.compile(r"(?i)((?:password|token|secret)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:username|password|token|secret)\s*[:=]\s*)[^\s,;]+"),
 )
 _SECRET_KEYS = {
     "api_key",
     "apikey",
     "authorization",
     "cookie",
+    "username",
     "password",
     "secret",
     "secret_key",

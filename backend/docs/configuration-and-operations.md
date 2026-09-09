@@ -10,6 +10,7 @@
 | 运行策略 | loop/兼容 Graph 上限、评测阈值、Agent model/max turns/prompt、工具限制 | 创建 run 时快照 |
 | 请求输入 | 问题、上下文、证据、允许的 profile | 每个 Command |
 | 展示选项 | JSON、输出文件、颜色、远程地址 | Adapter 本地 |
+| 环境目录 | 插件实例、环境、服务、节点、数据库/日志 source | 目录 API 热更新；run 确认时生成环境快照 |
 
 普通 CLI/Web 请求只能选择 profile，不能逐项覆盖固定策略。优先级为代码安全上限 > profile > 环境变量选择的默认 profile > 内置默认值。
 
@@ -37,7 +38,7 @@ profiles:
       investigate: {model: default, max_turns: 6, prompt_version: investigator-v1}
       evaluate: {model: default, max_turns: 6, prompt_version: rubric-v1}
       summarize: {model: default, max_turns: 6, prompt_version: summary-v1}
-    tools: {enabled: false, allowed_nodes: [investigate], max_results: 20, timeout_seconds: 30, max_result_bytes: 65536}
+    tools: {enabled: false, allowed_nodes: [investigate], max_results: 20, max_result_rows: 200, timeout_seconds: 30, max_result_bytes: 65536}
     retry: {max_retries: 5, initial_delay_seconds: 1, max_delay_seconds: 16, multiplier: 2, jitter: true}
     sessions: {history_item_limit: 100}
     lease_seconds: 60
@@ -47,6 +48,8 @@ profiles:
 `ConfigRepository` 使用严格 Pydantic Schema 解析全部 profile。未知字段、越界值、缺失节点或重复 config version 必须在启动、校验或创建 run 前失败。节点的 `model` 优先引用 `models` 中的命名端点；为兼容旧配置，不匹配注册表时按直接模型名解析。
 
 如果注册的只读工具设置 `needs_approval: true`，运行进程必须配置 `BUGLENS_RUN_STATE_KEY`。该密钥需要在可能接手审批恢复的进程间保持一致；它只用于加密 SDK RunState，不会写入 profile、run 快照或 Admin 响应。
+
+多环境工具 profile 另有 `max_result_rows`（默认 200，硬上限 1000）；`max_results` 仍表示一次向 Agent 暴露的工具数。环境目录由 `BUGLENS_ENVIRONMENTS_CONFIG` 指定，参考 `config/environments.example.yaml`。外部工具默认关闭，只有目标确认完成且 profile `tools.enabled=true` 时才向 InvestigateAgent 暴露。
 
 模型端点与节点策略分离：节点只引用命名模型；endpoint、model ID、timeout、streaming 和凭据回退由模型配置解析。API key 等 secret 不属于 profile 的公开视图，也不进入诊断状态、Event 或配置快照。
 
@@ -61,6 +64,7 @@ Application Service 在创建 run 时解析 profile，生成规范化、无 secr
 - 恢复只读取原快照，不重新解析当前 YAML；
 - 配置更新只影响之后创建的 run；
 - trace/Event 记录 snapshot ID 和版本，不记录完整 prompt 或 secret。
+- 目标确认后的 `ResolvedEnvironmentSnapshot` 只保存环境元数据和非敏感 source 配置；凭据不进入 run state、SQLite、Event、Session、Evidence 或工具审计。每次插件调用读取当前凭据，所以显式轮换立即生效。
 - state history、node execution、tool execution 和 evidence 记录与状态 revision 关联；工具只在允许的 node/profile/tenant/capability 范围内暴露。
 - `retry.max_retries` 表示首次调用后的重试次数，默认 5；底层 OpenAI client 使用 `max_retries=0`，由 Agents SDK runner-managed retry 负责模型传输重试。
 
@@ -74,6 +78,7 @@ Admin 控制面只访问 `ConfigRepository`、CheckpointStore 和安装能力信
 | --- | --- |
 | 启动与健康 | 初始化状态、组件健康、版本、能力开关 |
 | 配置 | 读取公开配置、校验候选 profile、按 revision 原子应用 |
+| 环境与插件 | 列出环境、发现插件、校验目录、原子应用目录、检查实例健康 |
 | 运维查询 | 分页查询 run、SDK Session、节点尝试和脱敏工具审计 |
 
 健康检查至少区分 checkpoint store、配置解析和模型凭据状态；只返回状态与说明，不返回凭据。能力开关控制前端是否展示操作；浏览器不能执行 shell、容器更新或其他未实现的运维动作。Admin 列表遇到单条损坏快照时跳过该行，并通过 `degraded_count` 暴露降级数量。
@@ -93,6 +98,8 @@ Admin 控制面只访问 `ConfigRepository`、CheckpointStore 和安装能力信
 revision 冲突返回 `config_revision_conflict`；没有配置文件路径时，内置默认配置只读并返回 `config_not_writable`。任一步失败都不能留下部分写入。
 
 ## 安全与部署
+
+环境配置 API 返回 opaque revision；PUT/PATCH 使用 `If-Match` 或 `expected_revision`。配置先写同目录临时文件并原子替换，失败继续使用旧目录。secret 使用 `username`、`password`、`token` 独立字段，响应只返回 `is_set`，更新通过 `secret_updates` 的 `set`/`clear` 明确执行。插件代码仍由运维安装和重启发布。
 
 - 设置 `BUGLENS_ADMIN_TOKEN` 后，所有 Admin 请求必须使用 Bearer token；比较使用常量时间。
 - token、API key 和其他 secret 不写入业务状态、Event、日志或前端可读响应。若私有 profile 配置了 `api_key`，配置文件必须按凭据文件保护，Admin 视图只能返回掩码值；空值或掩码值更新会保留原 key。

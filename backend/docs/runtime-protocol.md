@@ -18,7 +18,8 @@ Command 是请求，Event 是已提交事实。CLI 参数和 HTTP DTO 必须先�
 
 Command 公共字段为 `protocol_version`、`command_id`、`run_id`、`expected_revision` 和 `submitted_at`。当前新命令使用协议 v2；服务端在迁移窗口仍可解析 v1：
 
-- `StartDiagnosis`：问题、上下文、证据和 profile；固定策略参数不属于请求。
+- `StartDiagnosis`：问题、上下文、证据、profile 和 `target={mode: explicit|infer, environment_id?, primary_service_id?}`；固定策略参数不属于请求。
+- `ConfirmDiagnosisTarget`：目标推断后的确认命令，携带 `request_id`、环境 ID、可选主服务 ID 和期望 state revision；不占用澄清轮次。
 - `SubmitUserAnswers`：当前 pending request ID 和结构化答案。
 - `SkipUserInteraction`：当前 pending request ID、跳过原因和信息不可用标记。
 - `ResumeDiagnosis`：从可恢复的 failed 检查点开启新的 retry cycle。
@@ -31,6 +32,7 @@ Event v2 在上述字段之外提供 CloudEvents 1.0 envelope（`specversion`、
 - `ToolCallStarted` / `ToolCallCompleted` / `ToolCallFailed`；
 - `ToolApprovalRequired` / `ToolApprovalResolved`；
 - `InputRequired`、`InputSkipped`、`RunWaiting`、`RunResumeAvailable`、`RunResumed`；
+- `TargetConfirmationRequired`、`TargetConfirmed`；
 - `RunCancelRequested`、`UserInputSubmitted`、`RunCompleted`、`RunFailed`、`RunCanceled`。
 
 瞬时进度事件可以丢失，不能参与恢复判断。持久化 Event 必须与对应状态转换在同一事务提交，且不得包含 SDK 对象、完整模型消息或 secret。
@@ -42,7 +44,8 @@ Event v2 在上述字段之外提供 CloudEvents 1.0 envelope（`specversion`、
 ```text
 created → running ─┬→ waiting_user ─→ running
                   ├→ waiting_tool ─→ running
-                  ├→ waiting_approval → running
+                   ├→ waiting_approval → running
+                   ├→ waiting_for_target_confirmation → running
                   ├→ completed
                   ├→ failed
                   └→ canceled
@@ -55,6 +58,8 @@ created → running ─┬→ waiting_user ─→ running
 - 基础设施或节点执行失败：`failed`，没有诊断 outcome。
 
 执行游标仍为 `analyze | investigate | evaluate | summarize | done`，用于兼容事件和恢复；生产原生 loop 通常在一个 `analyze` 或 `investigate` 游标内完成分诊、handoff 和评测。任意时刻最多有一个 `pending_*`；等待态必须有对应 pending，running 和终态不得有 pending；`completed` 必须有 outcome；`done` 只用于终态。
+
+目标确认是独立的等待态：推断只使用后端目录候选，确认成功才保存无凭据 `ResolvedEnvironmentSnapshot` 并向 InvestigateAgent 注册环境工具。确认前工具列表为空；恢复时读取原快照，不读取新目录的 source 集合。
 
 ## 应用层 turn
 
@@ -92,6 +97,7 @@ created → running ─┬→ waiting_user ─→ running
 - 状态、Command 幂等记录和 Event 同事务提交。
 - revision 提供乐观锁；短租约防止两个执行者同时推进同一 run。
 - 每次 run 保存配置 snapshot ID；恢复不读取已变化的当前配置。
+- 目录确认后的 run 额外保存 environment snapshot ID；当前目录热更新不改变已有 run 的环境边界，凭据则按调用从当前实例配置读取以支持轮换。
 
 稳定错误至少包括 `run_not_found`、`revision_conflict`、`invalid_run_status`、`pending_request_mismatch` 和 `validation_failed`。`RunFailed` 只公开稳定 code、脱敏 message、node、retryable 和时间。
 

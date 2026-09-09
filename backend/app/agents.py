@@ -103,10 +103,16 @@ class NodeRuntimeContext:
     tool_allowed_nodes: frozenset[str] = frozenset({"investigate"})
     tool_allowed_profiles: frozenset[str] = frozenset()
     tool_max_results: int = 20
+    tool_max_result_rows: int = 200
     tool_timeout_seconds: float = 30.0
+    tool_max_calls: int = 20
+    tool_max_concurrent: int = 2
     execution_id: str | None = None
     tool_registry: object | None = None
     execution_observer: object | None = None
+    environment_snapshot_id: str | None = None
+    environment_snapshot: object | None = None
+    environment_tool_manager: object | None = None
     # Native orchestration fields.  ``resolved_config`` and ``native_tracker``
     # are live process objects and are deliberately excluded from RunState
     # serialization below.
@@ -266,6 +272,8 @@ def _serialize_runtime_context(value: Any) -> dict[str, Any]:
             "execution_observer",
             "resolved_config",
             "native_tracker",
+            "environment_snapshot",
+            "environment_tool_manager",
         }:
             continue
         field_value = getattr(value, field_name)
@@ -700,6 +708,7 @@ class OpenAINodeRunner:
                 allowed_profiles=set(runtime.tool_allowed_profiles),
                 max_results=runtime.tool_max_results,
                 timeout_seconds=runtime.tool_timeout_seconds,
+                environment_snapshot_id=runtime.environment_snapshot_id,
             )
         except TypeError:
             # Keep custom registries written against the small pre-v2 method

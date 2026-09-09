@@ -4,6 +4,7 @@ export type LifecycleStatus =
   | 'waiting_user'
   | 'waiting_tool'
   | 'waiting_approval'
+  | 'waiting_for_target_confirmation'
   | 'completed'
   | 'failed'
   | 'canceled'
@@ -11,6 +12,63 @@ export type LifecycleStatus =
 export type Outcome = 'confirmed' | 'inconclusive'
 export type NodeName = 'analyze' | 'investigate' | 'evaluate' | 'summarize'
 export type ContextValue = string | number | boolean | string[] | null
+
+export type TargetSpec = {
+  mode: 'explicit' | 'infer'
+  environment_id?: string | null
+  primary_service_id?: string | null
+}
+
+export type TargetCandidate = {
+  environment_id: string
+  display_name: string
+  aliases: string[]
+  level: string
+  region?: string | null
+  timezone: string
+  matched_by: string[]
+}
+
+export type PendingTargetConfirmation = {
+  request_id: string
+  requested_target: TargetSpec
+  candidates: TargetCandidate[]
+}
+
+export type EnvironmentSummary = {
+  environment_id: string
+  display_name: string
+  aliases: string[]
+  level: string
+  region?: string | null
+  timezone: string
+  tags: Record<string, string>
+}
+
+export type EnvironmentList = {
+  revision: string
+  items: EnvironmentSummary[]
+}
+
+export type PluginView = {
+  plugin_id: string
+  implementation_version: string
+  api_major: number
+  capabilities: string[]
+  health_check: boolean
+  instance_ids: string[]
+  instance_status: Record<string, string>
+  instance_config_schema: Record<string, unknown>
+  source_config_schema: Record<string, unknown>
+}
+
+export type PluginList = { items: PluginView[] }
+
+export type EnvironmentConfig = {
+  revision: string
+  writable: boolean
+  config: Record<string, unknown>
+}
 
 export type Evidence = {
   evidence_id?: string
@@ -111,6 +169,9 @@ export type Run = {
   current_node: NodeName | 'done'
   pending_interaction?: InteractionRequest | null
   pending_approval?: PendingApproval | null
+  target: TargetSpec
+  pending_target_confirmation?: PendingTargetConfirmation | null
+  environment_snapshot_id?: string | null
   revision: number
   attempt: number
   clarification_round: number
@@ -175,6 +236,9 @@ export type AdminRun = {
   cancel_requested?: boolean
   pending_input: boolean
   pending_approval?: boolean
+  environment_id?: string | null
+  environment_snapshot_id?: string | null
+  pending_target_confirmation?: boolean
   created_at: string
   updated_at: string
   last_error: string | null

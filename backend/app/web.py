@@ -8,9 +8,17 @@ from urllib.parse import parse_qs
 
 from pydantic import TypeAdapter
 
-from .admin import AdminApplicationService, ConfigMutation
+from .admin import (
+    AdminApplicationService,
+    ConfigMutation,
+    EnvironmentConfigMutation,
+)
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
+from .environment import (
+    EnvironmentConfigNotWritableError,
+    EnvironmentRevisionConflictError,
+)
 from .infra import (
     FencingTokenError,
     InvalidRunStatusError,
@@ -94,6 +102,46 @@ class BugLensASGI:
                 return await self._json(
                     send, 200, self.admin.config().model_dump(mode="json")
                 )
+            if method == "GET" and path == "/v1/environments":
+                return await self._json(
+                    send, 200, self.admin.environment_list().model_dump(mode="json")
+                )
+            if method == "GET" and path == "/v1/admin/plugins":
+                return await self._json(
+                    send, 200, self.admin.plugins().model_dump(mode="json")
+                )
+            if method == "GET" and path == "/v1/admin/environment-config":
+                return await self._json(
+                    send, 200, self.admin.environment_config().model_dump(mode="json")
+                )
+            if method == "POST" and path == "/v1/admin/environment-config/validate":
+                payload = self._json_body_with_if_match(scope, body)
+                mutation = EnvironmentConfigMutation.model_validate(payload)
+                return await self._json(
+                    send,
+                    200,
+                    self.admin.validate_environment_config(mutation).model_dump(
+                        mode="json"
+                    ),
+                )
+            if method in {"PUT", "PATCH"} and path == "/v1/admin/environment-config":
+                payload = self._json_body_with_if_match(scope, body)
+                mutation = EnvironmentConfigMutation.model_validate(payload)
+                return await self._json(
+                    send,
+                    200,
+                    self.admin.apply_environment_config(mutation).model_dump(
+                        mode="json"
+                    ),
+                )
+            if (
+                method == "POST"
+                and len(parts) == 6
+                and parts[1:4] == ["v1", "admin", "plugin-instances"]
+                and parts[5] == "check"
+            ):
+                checked = await self.admin.check_plugin_instance(parts[4])
+                return await self._json(send, 200, checked.model_dump(mode="json"))
             if method == "POST" and path == "/v1/admin/config/validate":
                 mutation = ConfigMutation.model_validate_json(body)
                 return await self._json(
@@ -217,6 +265,8 @@ class BugLensASGI:
                 (
                     ConfigRevisionConflictError,
                     ConfigNotWritableError,
+                    EnvironmentRevisionConflictError,
+                    EnvironmentConfigNotWritableError,
                     RevisionConflictError,
                     InvalidRunStatusError,
                     PendingRequestMismatchError,
@@ -323,6 +373,25 @@ class BugLensASGI:
                 ]
             )
         return headers
+
+    @staticmethod
+    def _json_body_with_if_match(scope, body: bytes) -> dict:
+        payload = json.loads(body or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        if "expected_revision" not in payload:
+            value = BugLensASGI._header(scope, "if-match")
+            if value:
+                payload["expected_revision"] = value.strip('"')
+        return payload
+
+    @staticmethod
+    def _header(scope, name: str) -> str | None:
+        wanted = name.lower().encode()
+        for key, value in scope.get("headers", []):
+            if key.lower() == wanted:
+                return value.decode("latin-1")
+        return None
 
     @staticmethod
     def _authorization(scope) -> str | None:

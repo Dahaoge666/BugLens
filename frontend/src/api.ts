@@ -1,4 +1,4 @@
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, Run } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, PluginList, Run } from './types'
 
 const baseUrl = (import.meta.env.VITE_BUGLENS_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 const adminToken = (import.meta.env.VITE_BUGLENS_ADMIN_TOKEN as string | undefined)?.trim()
@@ -77,6 +77,18 @@ export function getAdminVersion() {
   return getJson<AdminVersion>('/v1/admin/version')
 }
 
+export function getEnvironments() {
+  return getJson<EnvironmentList>('/v1/environments')
+}
+
+export function getAdminPlugins() {
+  return getJson<PluginList>('/v1/admin/plugins')
+}
+
+export function getAdminEnvironmentConfig() {
+  return getJson<EnvironmentConfig>('/v1/admin/environment-config')
+}
+
 export function validateAdminConfig(payload: { profile: string; config: Record<string, unknown>; expected_revision: string }) {
   return fetch(`${baseUrl}/v1/admin/config/validate`, {
     method: 'POST',
@@ -96,6 +108,28 @@ export function applyAdminConfig(payload: { profile: string; config: Record<stri
   }).then(async (response) => {
     if (!response.ok) throw new Error(`保存失败（${response.status}）`)
     return response.json() as Promise<AdminConfig>
+  })
+}
+
+export function validateAdminEnvironmentConfig(payload: { config: Record<string, unknown>; expected_revision: string; secret_updates?: Record<string, Record<string, { action: 'set' | 'clear'; value?: string }>> }) {
+  return fetch(`${baseUrl}/v1/admin/environment-config/validate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(`环境配置校验失败（${response.status}）`)
+    return response.json() as Promise<{ valid: boolean; errors: string[]; warnings: string[]; revision: string }>
+  })
+}
+
+export function applyAdminEnvironmentConfig(payload: { config: Record<string, unknown>; expected_revision: string; secret_updates?: Record<string, Record<string, { action: 'set' | 'clear'; value?: string }>> }) {
+  return fetch(`${baseUrl}/v1/admin/environment-config`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(`环境配置保存失败（${response.status}）`)
+    return response.json() as Promise<EnvironmentConfig>
   })
 }
 

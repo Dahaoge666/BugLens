@@ -216,12 +216,13 @@ class ToolRegistry:
             "error_as_result", "raise_exception"
         ] = "error_as_result",
         needs_approval: bool | None = None,
+        strict_mode: bool = True,
     ) -> Any:
         if not hasattr(tool, "name") or not hasattr(tool, "on_invoke_tool"):
             options: dict[str, Any] = {
                 "name_override": name,
                 "failure_error_function": None,
-                "strict_mode": True,
+                "strict_mode": strict_mode,
                 "tool_input_guardrails": _sdk_tool_input_guardrails(),
                 "tool_output_guardrails": _sdk_tool_output_guardrails(),
             }
@@ -395,11 +396,32 @@ def _instrument_tool(tool: Any, version: str) -> Any:
             raw_arguments = json.loads(arguments_json)
         except (TypeError, ValueError):
             raw_arguments = arguments_json
-        clean_arguments = bounded_tool_result(raw_arguments, max_bytes=16_384)
+        started = time.monotonic()
+        audit_metadata: dict[str, Any] = {}
+        registry = getattr(runtime, "tool_registry", None)
+        metadata_builder = getattr(registry, "audit_metadata", None)
+        if callable(metadata_builder):
+            try:
+                candidate = metadata_builder(
+                    getattr(tool, "name", "unknown"), runtime, raw_arguments
+                )
+                if isinstance(candidate, dict):
+                    audit_metadata = candidate
+            except Exception:
+                # Audit enrichment must never make a safe tool unavailable.
+                audit_metadata = {}
+        audit_arguments = raw_arguments
+        if audit_metadata.get("redacted_query") and isinstance(raw_arguments, dict):
+            audit_arguments = dict(raw_arguments)
+            audit_arguments["sql"] = audit_metadata["redacted_query"]
+            if isinstance(audit_arguments.get("parameters"), dict):
+                audit_arguments["parameters"] = {
+                    key: "[REDACTED]" for key in audit_arguments["parameters"]
+                }
+        clean_arguments = bounded_tool_result(audit_arguments, max_bytes=16_384)
         encoded_arguments = json.dumps(
             clean_arguments, ensure_ascii=False, default=str, separators=(",", ":")
         )
-        started = time.monotonic()
         if observer is not None:
             observer.tool_started(
                 tool_execution_id=tool_execution_id,
@@ -411,6 +433,7 @@ def _instrument_tool(tool: Any, version: str) -> Any:
                 retry_index=getattr(runtime, "retry_index", 0),
                 arguments_json=encoded_arguments,
                 arguments_hash=sha256(encoded_arguments.encode()).hexdigest(),
+                **audit_metadata,
             )
         try:
             result = await original(context, arguments_json)
@@ -418,13 +441,7 @@ def _instrument_tool(tool: Any, version: str) -> Any:
                 result,
                 max_bytes=getattr(runtime, "tool_result_bytes", 65_536),
             )
-            evidence_items: list[EvidenceRecord] = []
-            if isinstance(result, EvidenceRecord):
-                evidence_items = [result]
-            elif isinstance(result, list):
-                evidence_items = [
-                    item for item in result if isinstance(item, EvidenceRecord)
-                ][:50]
+            evidence_items = _extract_evidence_items(result)
             register = getattr(observer, "evidence_registered", None)
             if register is not None:
                 for index, item in enumerate(evidence_items):
@@ -435,16 +452,29 @@ def _instrument_tool(tool: Any, version: str) -> Any:
                         evidence_items[index] = item
                     register(item)
             evidence_ids = [item.evidence_id for item in evidence_items]
+            audit_status = "succeeded"
+            audit_updates: dict[str, Any] = {}
+            if isinstance(result, dict):
+                plugin_status = str(result.get("status", ""))
+                if plugin_status in {"partial", "rejected", "unavailable"}:
+                    audit_status = plugin_status
+                if plugin_status in {"rejected", "unavailable"}:
+                    warnings = result.get("warnings")
+                    if isinstance(warnings, list) and warnings:
+                        audit_updates["error_code"] = str(warnings[0])[:128]
+                    audit_updates["retryable"] = plugin_status == "unavailable"
+                audit_updates["truncated"] = bool(result.get("truncated", False))
             if observer is not None:
                 observer.tool_finished(
                     tool_execution_id,
-                    status="succeeded",
+                    status=audit_status,
                     result_summary_json=json.dumps(
                         bounded, ensure_ascii=False, default=str, separators=(",", ":")
                     ),
                     evidence_ids_json=json.dumps(evidence_ids),
                     completed_at=datetime_now_iso(),
                     duration_ms=int((time.monotonic() - started) * 1000),
+                    **audit_updates,
                 )
             return bounded
         except ToolTimeoutError:
@@ -571,6 +601,35 @@ def datetime_now_iso() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).isoformat()
+
+
+def _extract_evidence_items(value: Any) -> list[EvidenceRecord]:
+    """Extract core evidence envelopes from a plugin tool response.
+
+    External tools return JSON mappings so the model can inspect structured
+    results.  The optional ``evidence`` member is also converted into the
+    normal EvidenceRecord ledger entry; arbitrary nested connector output is
+    never treated as evidence implicitly.
+    """
+    candidates: list[Any] = []
+    if isinstance(value, EvidenceRecord):
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = value
+    elif isinstance(value, dict) and isinstance(value.get("evidence"), list):
+        candidates = value["evidence"]
+    result: list[EvidenceRecord] = []
+    for item in candidates[:50]:
+        if isinstance(item, EvidenceRecord):
+            result.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        try:
+            result.append(EvidenceRecord.model_validate(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 __all__ = [

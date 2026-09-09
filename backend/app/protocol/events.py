@@ -15,10 +15,12 @@ from pydantic import Field, model_validator
 
 from ..models import (
     DiagnosisOutcome,
+    EnvironmentTargetCandidate,
     ExecutionFailure,
     FailureRecord,
     PendingApproval,
     StrictModel,
+    TargetSpec,
     UserInteractionRequest,
 )
 
@@ -170,6 +172,21 @@ class ToolCallFailed(EventEnvelope):
     failure: ExecutionFailure
 
 
+class TargetConfirmationRequired(EventEnvelope):
+    event_type: Literal["target_confirmation_required"] = "target_confirmation_required"
+    request_id: str = Field(min_length=1, max_length=128)
+    requested_target: TargetSpec
+    candidates: list[EnvironmentTargetCandidate] = Field(min_length=1, max_length=20)
+
+
+class TargetConfirmed(EventEnvelope):
+    event_type: Literal["target_confirmed"] = "target_confirmed"
+    request_id: str | None = Field(default=None, max_length=128)
+    environment_id: str = Field(min_length=1, max_length=128)
+    primary_service_id: str | None = Field(default=None, max_length=128)
+    environment_snapshot_id: str = Field(min_length=1, max_length=128)
+
+
 class ToolApprovalRequired(EventEnvelope):
     event_type: Literal["tool_approval_required"] = "tool_approval_required"
     request: PendingApproval
@@ -196,7 +213,7 @@ class InputSkipped(EventEnvelope):
 
 class RunWaiting(EventEnvelope):
     event_type: Literal["run_waiting"] = "run_waiting"
-    waiting_for: Literal["user", "tool", "approval"]
+    waiting_for: Literal["user", "tool", "approval", "target"]
 
 
 class RunResumeAvailable(EventEnvelope):
@@ -250,6 +267,8 @@ AgentEvent = (
     | ToolCallStarted
     | ToolCallCompleted
     | ToolCallFailed
+    | TargetConfirmationRequired
+    | TargetConfirmed
     | ToolApprovalRequired
     | ToolApprovalResolved
     | InputRequired

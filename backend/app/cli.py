@@ -12,15 +12,26 @@ from .application import ModelCredentialsError
 from .bootstrap import build_local_client
 from .client import AgentClient, RemoteAgentClient
 from .config import Settings
-from .models import Evidence, LifecycleStatus, UserAnswer, UserInteractionRequest
+from .models import (
+    Evidence,
+    LifecycleStatus,
+    TargetSpec,
+    UserAnswer,
+    UserInteractionRequest,
+)
 from .protocol.commands import (
     CancelDiagnosis,
+    ConfirmDiagnosisTarget,
     ResumeDiagnosis,
     SkipUserInteraction,
     StartDiagnosis,
     SubmitUserAnswers,
 )
-from .protocol.events import InputRequired, RunWaiting
+from .protocol.events import (
+    InputRequired,
+    RunWaiting,
+    TargetConfirmationRequired,
+)
 
 
 class NonInteractiveClarifierError(RuntimeError):
@@ -58,6 +69,29 @@ class ConsoleClarifier:
             )
         return answers
 
+    def choose_target(self, request: TargetConfirmationRequired) -> str:
+        if not self._stream.isatty():
+            raise NonInteractiveClarifierError(
+                "diagnosis requires environment confirmation but stdin is not a TTY; "
+                "use the Web adapter or re-run in an interactive terminal"
+            )
+        print("\n请确认本次诊断的环境：")
+        for index, candidate in enumerate(request.candidates, start=1):
+            detail = f"{candidate.level} · {candidate.timezone}"
+            if candidate.region:
+                detail += f" · {candidate.region}"
+            print(
+                f"{index}. {candidate.display_name} ({candidate.environment_id}) [{detail}]"
+            )
+        while True:
+            answer = input("选择编号：").strip()
+            try:
+                selected = request.candidates[int(answer) - 1]
+            except (ValueError, IndexError):
+                print("请输入候选项编号。")
+                continue
+            return selected.environment_id
+
 
 def _pairs(values: list[str], option: str) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
@@ -86,6 +120,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--evidence", action="append", default=[], metavar="SOURCE=TEXT"
     )
     parser.add_argument("--tenant", help="tenant prompt configuration key")
+    parser.add_argument(
+        "--environment",
+        dest="environment_id",
+        help="明确选择环境 ID；不传时使用 context 提示并请求确认",
+    )
+    parser.add_argument("--service", dest="service_id", help="主服务 ID 或名称提示")
+    parser.add_argument(
+        "--infer-environment",
+        action="store_true",
+        help="显式要求按环境/服务提示推断并确认",
+    )
     parser.add_argument("--profile", default=None, help="versioned runtime profile")
     parser.add_argument(
         "--config", type=Path, help="local administrator runtime config"
@@ -129,18 +174,31 @@ async def _client(
 
 async def _send_interactively(
     client: AgentClient,
-    command: StartDiagnosis | SubmitUserAnswers,
+    command: StartDiagnosis | SubmitUserAnswers | ConfirmDiagnosisTarget,
     clarifier: ConsoleClarifier,
 ) -> None:
     current = command
     while True:
         pending: InputRequired | None = None
+        target_pending: TargetConfirmationRequired | None = None
         waiting: RunWaiting | None = None
         async for event in client.send(current):
             if isinstance(event, InputRequired):
                 pending = event
+            if isinstance(event, TargetConfirmationRequired):
+                target_pending = event
             if isinstance(event, RunWaiting):
                 waiting = event
+        if target_pending is not None:
+            current = ConfirmDiagnosisTarget(
+                run_id=target_pending.run_id,
+                expected_revision=(
+                    waiting.revision if waiting else target_pending.revision
+                ),
+                request_id=target_pending.request_id,
+                environment_id=clarifier.choose_target(target_pending),
+            )
+            continue
         if pending is None:
             return
         answers = await clarifier.ask(pending.request)
@@ -238,6 +296,15 @@ async def run_cli(
                 context=context,
                 evidence=evidence,
                 profile=args.profile or settings.default_profile,
+                target=TargetSpec(
+                    mode=(
+                        "infer"
+                        if args.infer_environment
+                        else ("explicit" if args.environment_id else "infer")
+                    ),
+                    environment_id=args.environment_id,
+                    primary_service_id=args.service_id,
+                ),
             )
             await _send_interactively(client, start, clarifier or ConsoleClarifier())
             state = await client.get_run(start.run_id)

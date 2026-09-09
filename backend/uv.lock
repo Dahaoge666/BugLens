@@ -43,7 +43,9 @@ name = "buglens"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "buglens-plugin-api" },
     { name = "cryptography" },
+    { name = "jsonschema" },
     { name = "openai-agents" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -62,8 +64,10 @@ web = [
 
 [package.metadata]
 requires-dist = [
+    { name = "buglens-plugin-api", directory = "../plugin-api" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
     { name = "cryptography", specifier = ">=42,<47" },
+    { name = "jsonschema", specifier = ">=4.20,<5" },
     { name = "openai-agents", specifier = ">=0.22,<0.23" },
     { name = "pydantic", specifier = ">=2.8,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
@@ -73,6 +77,17 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.30,<1" },
 ]
 provides-extras = ["web", "dev"]
+
+[[package]]
+name = "buglens-plugin-api"
+version = "1.0.0"
+source = { directory = "../plugin-api" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.8,<3" }]
 
 [[package]]
 name = "build"

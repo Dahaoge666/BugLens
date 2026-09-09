@@ -64,8 +64,13 @@ class ToolPolicy(StrictModel):
     allowed_nodes: list[str] = Field(default_factory=lambda: ["investigate"])
     allowed_profiles: list[str] = Field(default_factory=list)
     max_results: int = Field(default=20, ge=0, le=100)
+    # ``max_results`` limits the number of registered tools exposed to an
+    # Agent.  Connector rows have their own, larger default and hard ceiling.
+    max_result_rows: int = Field(default=200, ge=1, le=1_000)
     timeout_seconds: int = Field(default=30, ge=1, le=120)
     max_result_bytes: int = Field(default=65_536, ge=1_024, le=1_048_576)
+    max_calls_per_run: int = Field(default=20, ge=0, le=100)
+    max_concurrent_calls: int = Field(default=2, ge=1, le=16)
 
 
 class RetryPolicy(StrictModel):
@@ -172,7 +177,10 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "enabled": False,
         "allowed_nodes": ["investigate"],
         "max_results": 20,
+        "max_result_rows": 200,
         "timeout_seconds": 30,
+        "max_calls_per_run": 20,
+        "max_concurrent_calls": 2,
     },
     "retry": {
         "max_retries": 5,
@@ -350,6 +358,7 @@ class Settings(StrictModel):
     session_db: Path = Path("data/buglens.db")
     prompt_config: Path | None = None
     config_path: Path | None = None
+    environments_config_path: Path | None = None
     tracing_enabled: bool = True
     default_profile: str = "default"
     remote: str | None = None
@@ -369,10 +378,14 @@ class Settings(StrictModel):
             raise ValueError("BUGLENS_TRACING must be true or false")
         prompt_config = os.getenv("BUGLENS_PROMPT_CONFIG")
         config = os.getenv("BUGLENS_CONFIG")
+        environments_config = os.getenv("BUGLENS_ENVIRONMENTS_CONFIG")
         return cls(
             session_db=Path(os.getenv("BUGLENS_SESSION_DB", "data/buglens.db")),
             prompt_config=Path(prompt_config) if prompt_config else None,
             config_path=Path(config) if config else None,
+            environments_config_path=(
+                Path(environments_config) if environments_config else None
+            ),
             tracing_enabled=tracing == "true",
             default_profile=os.getenv("BUGLENS_PROFILE", "default"),
             remote=os.getenv("BUGLENS_REMOTE"),

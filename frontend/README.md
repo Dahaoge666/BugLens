@@ -8,6 +8,7 @@
 - [产品与前端架构设计](docs/product-and-architecture.md)
 - [安装、配置与任务管理交互设计](docs/operations-and-management-ux.md)
 - [Admin API 对接契约](docs/admin-api-contract.md)
+- 多环境选择、目标确认和插件管理的稳定字段见根目录的[前后端对接契约](../frontend-backend-contract.md)及后端的[多环境插件规范](../backend/docs/environment-plugin-spec.md)。
 
 本地运行：
 

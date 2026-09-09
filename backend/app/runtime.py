@@ -17,6 +17,11 @@ from pydantic import ValidationError
 
 from .agents import NodeApprovalRequired, NodeExecutionError
 from .config import ConfigRepository, ResolvedRunConfig
+from .environment import (
+    EnvironmentConfigError,
+    EnvironmentRepository,
+    ResolvedEnvironmentSnapshot,
+)
 from .graph import DiagnosisGraph
 from .infra import (
     FencingTokenError,
@@ -36,12 +41,15 @@ from .models import (
     GraphNode,
     LifecycleStatus,
     PendingApproval,
+    PendingTargetConfirmation,
+    TargetSpec,
     replace_state,
 )
 from .protocol.commands import (
     AgentCommand,
     ApproveTool,
     CancelDiagnosis,
+    ConfirmDiagnosisTarget,
     RejectTool,
     ResumeDiagnosis,
     SkipUserInteraction,
@@ -64,6 +72,8 @@ from .protocol.events import (
     RunResumed,
     RunStarted,
     RunWaiting,
+    TargetConfirmationRequired,
+    TargetConfirmed,
     ToolApprovalRequired,
     ToolApprovalResolved,
     ToolCallCompleted,
@@ -140,7 +150,7 @@ class _StoreToolObserver:
             "sdk_tool_call_id": str(record.get("sdk_tool_call_id", "unknown")),
             "tool_name": str(record.get("tool_name", "unknown")),
         }
-        if updates.get("status") == "succeeded":
+        if updates.get("status") in {"succeeded", "partial"}:
             evidence_ids = json.loads(updates.get("evidence_ids_json", "[]"))
             event = ToolCallCompleted(
                 **base,
@@ -183,6 +193,8 @@ class DiagnosisRuntime:
         tracing_enabled: bool = True,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         run_state_cipher: SDKRunStateCipher | None = None,
+        environment_repository: EnvironmentRepository | None = None,
+        environment_tools: object | None = None,
     ) -> None:
         self.graph = graph
         self.store = store
@@ -190,6 +202,8 @@ class DiagnosisRuntime:
         self.tracing_enabled = tracing_enabled
         self._sleep = sleep or asyncio.sleep
         self.run_state_cipher = run_state_cipher
+        self.environment_repository = environment_repository
+        self.environment_tools = environment_tools
         # Keep the resolved credential-bearing object in memory for waiting and
         # Resume commands in this process. The SQLite snapshot remains
         # credential-free; a new process must obtain credentials from its
@@ -260,6 +274,7 @@ class DiagnosisRuntime:
             config = resolved_config or self.configs.resolve(command.profile)
             self.store.save_config_snapshot(config)
             self._config_cache[config.snapshot_id] = config
+            target_snapshot, pending_target = self._resolve_start_target(command)
             state = DiagnosisState.create(
                 command.question,
                 command.context,
@@ -269,21 +284,71 @@ class DiagnosisRuntime:
                 config_snapshot_id=config.snapshot_id,
                 profile=config.profile,
                 config_version=config.config_version,
+                target=command.target,
             )
-            state = replace_state(
-                state,
-                run_id=command.run_id,
-                lifecycle_status=LifecycleStatus.RUNNING,
-            )
+            if target_snapshot is not None:
+                self.store.save_environment_snapshot(target_snapshot)
+                state = replace_state(
+                    state,
+                    run_id=command.run_id,
+                    target=TargetSpec(
+                        mode="explicit",
+                        environment_id=target_snapshot.environment_id,
+                        primary_service_id=target_snapshot.primary_service_id,
+                    ),
+                    environment_snapshot_id=target_snapshot.snapshot_id,
+                    lifecycle_status=LifecycleStatus.RUNNING,
+                    revision=1,
+                )
+            elif pending_target is not None:
+                state = replace_state(
+                    state,
+                    run_id=command.run_id,
+                    pending_target_confirmation=pending_target,
+                    lifecycle_status=LifecycleStatus.WAITING_TARGET_CONFIRMATION,
+                    revision=1,
+                )
+            else:
+                state = replace_state(
+                    state,
+                    run_id=command.run_id,
+                    lifecycle_status=LifecycleStatus.RUNNING,
+                )
+            initial_state = replace_state(state, revision=0)
             started = self._event(
                 RunStarted,
-                state,
+                initial_state,
                 profile=config.profile,
                 config_snapshot_id=config.snapshot_id,
                 config_version=config.config_version,
-                revision=state.revision,
+                revision=0,
             )
-            initial_events = self.store.create_run(state, [started], command)
+            initial_events = [started]
+            if pending_target is not None:
+                initial_events.extend(
+                    [
+                        self._event(
+                            TargetConfirmationRequired,
+                            state,
+                            request_id=pending_target.request_id,
+                            requested_target=pending_target.requested_target,
+                            candidates=pending_target.candidates,
+                        ),
+                        self._event(RunWaiting, state, waiting_for="target"),
+                    ]
+                )
+            elif target_snapshot is not None:
+                initial_events.append(
+                    self._event(
+                        TargetConfirmed,
+                        state,
+                        request_id=None,
+                        environment_id=target_snapshot.environment_id,
+                        primary_service_id=target_snapshot.primary_service_id,
+                        environment_snapshot_id=target_snapshot.snapshot_id,
+                    )
+                )
+            initial_events = self.store.create_run(state, initial_events, command)
             command_already_committed = True
         else:
             state = self.store.get_state(command.run_id)
@@ -324,6 +389,42 @@ class DiagnosisRuntime:
                     lease_owner=owner,
                     fencing_token=token,
                 )
+                for event in committed:
+                    yield event
+                command_already_committed = True
+            elif (
+                isinstance(command, ConfirmDiagnosisTarget)
+                and not replaying_committed_command
+            ):
+                target, snapshot = self._confirm_target(command, state)
+                self.store.save_environment_snapshot(snapshot)
+                confirmed_state = replace_state(
+                    state,
+                    target=target,
+                    pending_target_confirmation=None,
+                    environment_snapshot_id=snapshot.snapshot_id,
+                    lifecycle_status=LifecycleStatus.RUNNING,
+                    current_node=GraphNode.ANALYZE,
+                    revision=state.revision + 1,
+                    updated_at=datetime.now(UTC),
+                )
+                confirmed = self._event(
+                    TargetConfirmed,
+                    confirmed_state,
+                    request_id=command.request_id,
+                    environment_id=snapshot.environment_id,
+                    primary_service_id=snapshot.primary_service_id,
+                    environment_snapshot_id=snapshot.snapshot_id,
+                )
+                committed = self.store.commit(
+                    confirmed_state,
+                    state.revision,
+                    [confirmed],
+                    command,
+                    lease_owner=owner,
+                    fencing_token=token,
+                )
+                state = confirmed_state
                 for event in committed:
                     yield event
                 command_already_committed = True
@@ -573,11 +674,32 @@ class DiagnosisRuntime:
 
                 runtime = self.graph._runtime_for_config(state, plan.node, config)
                 observer = _StoreToolObserver(self.store, state.run_id, command)
+                environment_snapshot = self._environment_snapshot(state)
+                environment_registry = getattr(self.environment_tools, "registry", None)
                 runtime = replace(
                     runtime,
                     execution_id=plan.execution_id,
-                    tool_registry=getattr(self.graph.runner, "tool_registry", None),
+                    tool_registry=(
+                        environment_registry
+                        if environment_registry is not None
+                        else getattr(self.graph.runner, "tool_registry", None)
+                    ),
                     execution_observer=observer,
+                    environment_snapshot_id=(
+                        environment_snapshot.snapshot_id
+                        if environment_snapshot is not None
+                        else None
+                    ),
+                    environment_snapshot=environment_snapshot,
+                    environment_tool_manager=self.environment_tools,
+                    tools_enabled=(
+                        runtime.tools_enabled
+                        and (
+                            environment_snapshot is not None
+                            if environment_registry is not None
+                            else True
+                        )
+                    ),
                 )
                 renewal_stop = asyncio.Event()
                 renewal_failure: list[Exception] = []
@@ -1083,6 +1205,80 @@ class DiagnosisRuntime:
             if token is not None:
                 self.store.release_lease(command.run_id, owner, token)
 
+    def _resolve_start_target(
+        self, command: StartDiagnosis
+    ) -> tuple[ResolvedEnvironmentSnapshot | None, PendingTargetConfirmation | None]:
+        """Resolve a new run's target before any Agent or external tool exists."""
+        repository = self.environment_repository
+        if repository is None or not repository.configured:
+            # Compatibility mode: old callers without a catalog keep their
+            # original no-external-tools behavior. An explicitly requested
+            # target, however, must fail closed instead of being ignored.
+            if command.target.mode == "explicit" or command.target.environment_id:
+                raise ValidationFailedError(
+                    "environment config is required for an explicit target"
+                )
+            return None, None
+        if command.target.mode == "explicit":
+            try:
+                resolved = repository.resolved_target(command.target)
+                return repository.snapshot(
+                    resolved.environment_id, resolved.primary_service_id
+                ), None
+            except EnvironmentConfigError as exc:
+                raise ValidationFailedError(str(exc)) from exc
+        candidates = repository.infer_candidates(command.target, command.context)
+        if not candidates:
+            raise ValidationFailedError(
+                "no environment target matched the supplied hints"
+            )
+        return (
+            None,
+            PendingTargetConfirmation(
+                request_id=f"target_{uuid4().hex}",
+                requested_target=command.target,
+                candidates=candidates,
+            ),
+        )
+
+    def _confirm_target(
+        self, command: ConfirmDiagnosisTarget, state: DiagnosisState
+    ) -> tuple[TargetSpec, ResolvedEnvironmentSnapshot]:
+        repository = self.environment_repository
+        pending = state.pending_target_confirmation
+        if repository is None or not repository.configured or pending is None:
+            raise ValidationFailedError(
+                "environment target confirmation is unavailable"
+            )
+        target = TargetSpec(
+            mode="explicit",
+            environment_id=command.environment_id,
+            primary_service_id=command.primary_service_id,
+        )
+        try:
+            resolved = repository.resolved_target(
+                target,
+                candidate_ids={item.environment_id for item in pending.candidates},
+            )
+            snapshot = repository.snapshot(
+                resolved.environment_id, resolved.primary_service_id
+            )
+        except EnvironmentConfigError as exc:
+            raise ValidationFailedError(str(exc)) from exc
+        return target, snapshot
+
+    def _environment_snapshot(
+        self, state: DiagnosisState
+    ) -> ResolvedEnvironmentSnapshot | None:
+        if not state.environment_snapshot_id:
+            return None
+        try:
+            return self.store.get_environment_snapshot(state.environment_snapshot_id)
+        except RunNotFoundError as exc:
+            raise ValidationFailedError(
+                "the run's environment snapshot is unavailable"
+            ) from exc
+
     @staticmethod
     def _cancel_at_boundary(
         state: DiagnosisState, reason: str
@@ -1095,6 +1291,7 @@ class DiagnosisRuntime:
             pending_interaction=None,
             pending_tool=None,
             pending_approval=None,
+            pending_target_confirmation=None,
             outcome=None,
             active_execution_id=None,
             revision=state.revision + 1,
@@ -1173,6 +1370,25 @@ class DiagnosisRuntime:
                 raise InvalidRunStatusError("run is not waiting for user input")
             if state.pending_interaction.request_id != command.request_id:
                 raise PendingRequestMismatchError("pending request_id does not match")
+        elif isinstance(command, ConfirmDiagnosisTarget):
+            if (
+                state.lifecycle_status != LifecycleStatus.WAITING_TARGET_CONFIRMATION
+                or state.pending_target_confirmation is None
+            ):
+                raise InvalidRunStatusError(
+                    "run is not waiting for target confirmation"
+                )
+            pending = state.pending_target_confirmation
+            if pending.request_id != command.request_id:
+                raise PendingRequestMismatchError(
+                    "pending target request_id does not match"
+                )
+            if command.environment_id not in {
+                item.environment_id for item in pending.candidates
+            }:
+                raise ValidationFailedError(
+                    "target is not one of the pending candidates"
+                )
         elif isinstance(command, ResumeDiagnosis):
             if (
                 state.lifecycle_status != LifecycleStatus.FAILED

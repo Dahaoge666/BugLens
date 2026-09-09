@@ -107,6 +107,7 @@ CLI、Web 和远程客户端都使用同一个 Application Service 与 Runtime�
 | `BUGLENS_PROFILE` | 默认运行 profile，默认 `default` |
 | `BUGLENS_TRACING` | 是否启用 SDK tracing |
 | `BUGLENS_PROMPT_CONFIG` | 可选租户提示词配置路径 |
+| `BUGLENS_ENVIRONMENTS_CONFIG` | 可选多环境/插件目录 YAML 路径；未设置时外部工具不可用 |
 | `BUGLENS_CORS_ORIGIN` | 独立前端域名部署时允许的精确 origin |
 | `BUGLENS_ADMIN_TOKEN` | 可选 Admin API Bearer Token |
 | `BUGLENS_RUN_STATE_KEY` | 需要审批的只读工具使用的加密恢复密钥；必须在接手恢复的进程间一致 |
@@ -119,6 +120,7 @@ CLI、Web 和远程客户端都使用同一个 Application Service 与 Runtime�
 - [后端架构与 SDK 边界](backend/docs/architecture.md)
 - [Runtime、协议与恢复](backend/docs/runtime-protocol.md)
 - [配置、Admin 与运维](backend/docs/configuration-and-operations.md)
+- [多环境插件规范](backend/docs/environment-plugin-spec.md)
 - [后端开发与测试](backend/README.md)
 - [前端开发与交互文档](frontend/README.md)
 - [安装与发布层](distribution/README.md)

@@ -17,11 +17,12 @@ flowchart LR
     ADMINAPP --> CONFIG[ConfigRepository]
     ADMINAPP --> STORE
     GRAPH --> CONTEXT[ContextAssembler]
-    GRAPH --> TOOLS[ToolRegistry]
+    GRAPH --> TOOLS[ToolRegistry / EnvironmentToolRegistry]
     GRAPH --> NODES[Native SDK loop]
     NODES --> TRIAGE[Triage / Analyze]
     TRIAGE -->|handoff| INVESTIGATE[Category Investigator]
     INVESTIGATE -->|as_tool| EVALUATE[Independent Evaluator]
+    TOOLS --> PLUGINS[buglens.tool_plugins]
 ```
 
 依赖方向为 Adapter → Application Service → Runtime → Graph/Domain。Infra 实现 Runtime 需要的持久化、Session 和配置端口。`bootstrap.py` 是依赖组装入口。任何下层模块都不能反向导入 Adapter。
@@ -38,6 +39,8 @@ flowchart LR
 | NodeRunner | 用 Agents SDK loop 执行分诊、handoff、只读工具和独立评测，并返回严格输出 | 生命周期提交和持久化状态 |
 | ContextAssembler | 按节点显式组装上下文、证据 ID、回答、历史结果和版本 | 读取 SDK 消息或执行外部查询 |
 | ToolRegistry | 用 SDK `function_tool` 注册只读工具，按 node/profile/tenant/capability 过滤并交给审计 observer；显式工具可声明 `needs_approval` | 业务路由、写操作和权限越权 |
+| EnvironmentToolRegistry | 目标确认后把 source ID 解析到无凭据环境快照，执行 run 级预算/并发/限制，调用独立 Python 插件并登记 Evidence/审计 | 让 Agent 传连接地址、凭据或任意路径；执行模型推理 |
+| Tool plugin | 在 `buglens.tool_plugins` entry point 下实现确定性的健康检查和只读查询 | Agent、Runner、模型密钥、CheckpointStore、Shell/SSH、修复 |
 | Store | 原子保存业务状态、state history、Command、Event、节点/工具审计、证据、租约和配置快照 | 保存或解释模型对话 |
 | SDK Session | 保存一次原生 loop（或兼容 Graph 节点）的模型消息历史 | 业务状态、恢复游标和前端会话 |
 | Admin Service | 健康、能力、配置和只读运维查询 | 调用 Graph 或触发诊断节点 |
@@ -109,6 +112,8 @@ backend/app/
 ├── web.py                # ASGI Adapter
 ├── server.py             # Uvicorn 入口
 └── bootstrap.py          # 依赖组装
+plugin-api/               # buglens-plugin-api 独立协议包
+plugins/                  # SQLite 与 file-logs 参考插件，每个目录可独立构建
 ```
 
 只有在模块职责已经混杂时才继续拆包；不要为每个类单独建文件，也不要为了目录形式复制现有逻辑。
