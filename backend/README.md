@@ -73,6 +73,7 @@ uv run buglens-web --host 127.0.0.1 --port 8000
 - [Runtime、协议与恢复](docs/runtime-protocol.md)：Command/Event、状态机、检查点、幂等与并发；
 - [配置、Admin 与运维](docs/configuration-and-operations.md)：配置分层、快照、控制面和部署安全；
 - [多环境插件规范](docs/environment-plugin-spec.md)：插件 API、环境目录、目标确认、只读查询、热更新和验收矩阵；
+- [两套环境端到端验证计划](docs/two-environment-e2e-validation-plan.md)：使用独立日志和数据库模拟两类故障，并验证定位成功与跨环境隔离；
 - [前后端对接契约](../frontend-backend-contract.md)：前端可依赖的 HTTP/SSE 与 Admin 公共接口。
 
 ## 测试与打包
@@ -85,3 +86,12 @@ uv build
 ```
 
 测试使用假的 `NodeRunner`，不会调用真实模型。
+
+两套环境端到端验证使用真实的 SQLite/file-logs 连接器和临时数据，但用确定性 runner 替代模型：
+
+```powershell
+uv run python scripts/prepare_two_environment_e2e.py --output .e2e
+uv run pytest -q tests/e2e/test_two_environment_diagnosis.py
+```
+
+脚本默认拒绝覆盖已有 fixture；重复执行时请使用新的输出目录，或显式添加 `--force`。完整门槛和可选真实模型冒烟见 [两套环境端到端验证计划](docs/two-environment-e2e-validation-plan.md)。
