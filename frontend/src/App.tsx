@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { applyAdminConfig, applyAdminEnvironmentConfig, checkAdminPluginInstance, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig, validateAdminEnvironmentConfig } from './api'
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
+import { applyAdminConfig, applyAdminEnvironmentConfig, checkAdminPluginInstance, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getNodeExecutions, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig, validateAdminEnvironmentConfig } from './api'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, NodeExecution, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
 
 type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'environments' | 'system' | 'run'
 
@@ -58,6 +58,153 @@ const stageLabels = [
   ['analyze', '理解问题'], ['investigate', '定位原因'], ['evaluate', '检查结论'], ['summarize', '生成报告'],
 ] as const
 
+const NODE_LABELS: Record<string, string> = {
+  analyze: '理解问题',
+  investigate: '定位原因',
+  evaluate: '检查结论',
+  summarize: '生成报告',
+  done: '已完成',
+}
+
+// 后端健康组件：技术名 → 中文名 → 作用说明
+const HEALTH_COMPONENTS: Array<[string, string, string]> = [
+  ['checkpoint_store', '检查点存储', '持久化诊断状态与检查点，断线可恢复'],
+  ['configuration', '配置文件', 'Profile 与节点策略可用且有效'],
+  ['model_credentials', '模型凭据', '模型 API Key 与 Base URL 已配置'],
+]
+
+// 将后端英文 detail 翻译为中文
+function translateHealthDetail(key: string, raw: string): string {
+  if (!raw) return ''
+  const map: Record<string, string> = {
+    'SQLite checkpoint store is reachable': '检查点存储可正常读写',
+    'SQLite checkpoint store is unavailable': '检查点存储不可用，诊断无法持久化',
+    'default profile is valid': '默认配置文件校验通过',
+    'default profile is invalid': '默认配置文件校验失败',
+    'model credentials are configured': '模型凭据已配置',
+    'no model credentials; set OPENAI_API_KEY/OPENAI_BASE_URL or define api_key/base_url on a model in the config profile': '未配置模型凭据：请设置 OPENAI_API_KEY/OPENAI_BASE_URL，或在配置 profile 的模型上定义 api_key/base_url',
+  }
+  return map[raw] ?? raw
+}
+
+// 诊断任务中文摘要：阶段 + 进度 + 尝试/澄清次数
+function runSummaryText(run: { lifecycle_status: string; current_node: string; outcome?: string | null; attempt?: number; clarification_rounds?: Record<string, number> | null; last_error?: string | null }): string {
+  const node = NODE_LABELS[run.current_node] ?? run.current_node
+  const clarif = run.clarification_rounds ?? {}
+  const clarifTotal = Object.values(clarif).reduce((a: number, b) => a + (b as number), 0)
+  if (run.lifecycle_status === 'completed') return run.outcome === 'confirmed' ? '诊断完成 · 已确认根因' : '诊断完成 · 证据不足，未决'
+  if (run.lifecycle_status === 'failed') return `诊断失败 · ${translateError(run.last_error)}`
+  if (run.lifecycle_status === 'canceled') return '已取消'
+  if (run.lifecycle_status === 'waiting_user') return `${node} · 等待补充信息${clarifTotal > 0 ? ` · 已澄清 ${clarifTotal} 次` : ''}`
+  if (run.lifecycle_status === 'waiting_tool') return `${node} · 等待工具数据`
+  if (run.lifecycle_status === 'waiting_approval') return `${node} · 等待工具审批`
+  if (run.lifecycle_status === 'waiting_for_target_confirmation') return `${node} · 等待确认环境`
+  if (run.current_node === 'investigate' && (run.attempt ?? 0) > 0) return `重新定位原因 · 第 ${(run.attempt ?? 0) + 1} 次尝试`
+  if (run.lifecycle_status === 'running') return `${node} · 推进中`
+  return node
+}
+
+function translateError(message?: string | null): string {
+  if (!message) return '执行出错'
+  const map: Record<string, string> = {
+    'analyze: execution failed': 'analyze 节点执行失败',
+    'investigate: execution failed': 'investigate 节点执行失败',
+    'evaluate: execution failed': 'evaluate 节点执行失败',
+    'summarize: execution failed': 'summarize 节点执行失败',
+  }
+  return map[message] ?? message
+}
+
+// 事件类型标签 / 图标 / 色调映射（用于执行时间线）
+const EVENT_LABELS: Record<string, string> = {
+  run_started: '诊断已启动',
+  run_completed: '诊断已完成',
+  run_failed: '诊断失败',
+  run_canceled: '已取消',
+  node_attempt_started: '节点开始执行',
+  node_completed: '节点完成',
+  node_failed: '节点失败',
+  input_required: '需要补充',
+  input_submitted: '已提交补充',
+  input_skipped: '已跳过补充',
+  tool_call_started: '工具调用开始',
+  tool_call_completed: '工具调用完成',
+  tool_call_failed: '工具调用失败',
+  tool_approval_required: '工具待审批',
+  tool_approval_resolved: '工具审批已处理',
+  run_waiting: '运行等待',
+  run_resumed: '已恢复运行',
+  target_confirmation_required: '需要确认环境',
+  target_confirmed: '环境已确认',
+}
+const EVENT_ICONS: Record<string, string> = {
+  run_started: '▶',
+  run_completed: '✓',
+  run_failed: '✕',
+  run_canceled: '⊘',
+  node_attempt_started: '◐',
+  node_completed: '●',
+  node_failed: '✕',
+  input_required: '?',
+  input_submitted: '↵',
+  input_skipped: '⤳',
+  tool_call_started: '⚙',
+  tool_call_completed: '✓',
+  tool_call_failed: '✕',
+  tool_approval_required: '!',
+  tool_approval_resolved: '✓',
+  run_waiting: '⏸',
+  run_resumed: '▶',
+  target_confirmation_required: '?',
+  target_confirmed: '✓',
+}
+const EVENT_TONES: Record<string, string> = {
+  run_started: 'blue',
+  run_completed: 'green',
+  run_failed: 'red',
+  run_canceled: 'gray',
+  node_attempt_started: 'blue',
+  node_completed: 'green',
+  node_failed: 'red',
+  input_required: 'orange',
+  input_submitted: 'blue',
+  input_skipped: 'orange',
+  tool_call_started: 'blue',
+  tool_call_completed: 'green',
+  tool_call_failed: 'red',
+  tool_approval_required: 'orange',
+  tool_approval_resolved: 'green',
+  run_waiting: 'orange',
+  run_resumed: 'blue',
+  target_confirmation_required: 'orange',
+  target_confirmed: 'green',
+}
+
+// 诊断 Graph 节点状态推导
+function deriveNodeStates(run: { lifecycle_status: string; current_node: string; outcome?: string | null; attempt?: number }): Record<string, 'pending' | 'running' | 'waiting' | 'completed' | 'failed'> {
+  const order = ['analyze', 'investigate', 'evaluate', 'summarize']
+  const states: Record<string, 'pending' | 'running' | 'waiting' | 'completed' | 'failed'> = {}
+  const cur = run.current_node
+  const curIdx = order.indexOf(cur)
+  const completed = run.lifecycle_status === 'completed'
+  const failed = run.lifecycle_status === 'failed'
+  const waiting = run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval' || run.lifecycle_status === 'waiting_tool' || run.lifecycle_status === 'waiting_for_target_confirmation'
+  order.forEach((node, idx) => {
+    if (completed || (curIdx >= 0 && idx < curIdx)) states[node] = 'completed'
+    else if (failed && node === cur) states[node] = 'failed'
+    else if (node === cur) states[node] = waiting ? 'waiting' : 'running'
+    else states[node] = 'pending'
+  })
+  return states
+}
+
+function deriveFlowStatus(run: { lifecycle_status: string; current_node: string; attempt?: number }): 'idle' | 'forward' | 'retry' | 'completed' | 'failed' {
+  if (run.lifecycle_status === 'completed') return 'completed'
+  if (run.lifecycle_status === 'failed') return 'failed'
+  if (run.current_node === 'investigate' && (run.attempt ?? 0) > 0) return 'retry'
+  return 'forward'
+}
+
 function appendEvent(current: DomainEvent[], event: DomainEvent): DomainEvent[] {
   if (current.some((item) => item.event_id === event.event_id || item.sequence === event.sequence)) return current
   return [...current, event].sort((left, right) => left.sequence - right.sequence)
@@ -83,7 +230,8 @@ function App() {
   const [run, setRun] = useState<Run>(demoRun)
   const [events, setEvents] = useState<DomainEvent[]>(demoEvents)
   const [toolExecutions, setToolExecutions] = useState<ToolExecution[]>([])
-  const [view, setView] = useState<'overview' | 'evidence' | 'events'>('overview')
+  const [nodeExecutions, setNodeExecutions] = useState<NodeExecution[]>([])
+  const [view, setView] = useState<'timeline' | 'overview' | 'evidence'>('timeline')
   const [showNew, setShowNew] = useState(false)
   const [notice, setNotice] = useState('演示数据 · 可连接本地 BugLens API')
   const [adminRuns, setAdminRuns] = useState<AdminRun[]>(demoRuns)
@@ -158,7 +306,6 @@ function App() {
     window.location.hash = next
   }
 
-  const stageIndex = Math.max(0, stageLabels.findIndex(([node]) => node === run.current_node))
   const statusText = runStatusLabel(run)
   const latestEvent = events.at(-1)
 
@@ -174,6 +321,7 @@ function App() {
       const nextRun = await getRun(runId)
       setRun(nextRun)
       getRunTools(runId).then((result) => setToolExecutions(result.items)).catch(() => setToolExecutions([]))
+      getNodeExecutions(runId).then((result) => setNodeExecutions(result.items)).catch(() => setNodeExecutions([]))
       getAdminRuns().then((result) => setAdminRuns(result.items)).catch(() => undefined)
       setNotice('已连接到 BugLens API，正在同步运行状态')
     } catch {
@@ -187,12 +335,14 @@ function App() {
     navigate('run')
     setNotice('正在加载诊断运行…')
     try {
-      const [nextRun, tools] = await Promise.all([
+      const [nextRun, tools, nodes] = await Promise.all([
         getRun(runId),
         getRunTools(runId).catch(() => ({ items: [] as ToolExecution[], total: 0 })),
+        getNodeExecutions(runId).catch(() => ({ items: [] as NodeExecution[], total: 0 })),
       ])
       setRun(nextRun)
       setToolExecutions(tools.items)
+      setNodeExecutions(nodes.items)
       setEvents([])
       await readEvents(runId, 0, (event) => setEvents((current) => [...current, event]))
       setNotice('已连接 BugLens API · 运行状态已同步')
@@ -336,11 +486,9 @@ function App() {
         <div><div className="eyebrow">诊断运行 <span className="mono">/ {run.run_id}</span></div><h1>{run.user_question}</h1></div>
         <div className="run-meta"><StatusPill status={run.lifecycle_status} label={statusText} /><span>更新于 {run.updated_at.includes('T') ? run.updated_at.slice(11, 16) : run.updated_at}</span>{run.available_actions?.includes('resume') && <button className="quiet-button" onClick={resumeDiagnosis}>恢复诊断</button>}{run.available_actions?.includes('approve') && <button className="primary-button" onClick={() => resolveToolApproval('approve')}>批准工具</button>}{run.available_actions?.includes('reject') && <button className="quiet-button" onClick={() => resolveToolApproval('reject')}>拒绝工具</button>}{(run.available_actions?.includes('cancel') ?? (run.lifecycle_status === 'running' || run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval')) && <button className="danger-button" onClick={cancelDiagnosis} disabled={Boolean(run.cancel_requested_at)}>{run.cancel_requested_at ? '取消中…' : '取消运行'}</button>}</div>
       </section>
-      <section className="stage-track" aria-label="诊断阶段">
-        {stageLabels.map(([node, label], index) => <div className={`stage ${index < stageIndex || run.lifecycle_status === 'completed' ? 'done' : ''} ${node === run.current_node ? 'active' : ''}`} key={node}><span className="stage-number">{index < stageIndex || run.lifecycle_status === 'completed' ? '✓' : `0${index + 1}`}</span><span>{label}</span>{index < stageLabels.length - 1 && <span className="stage-line" />}</div>)}
-      </section>
-      <nav className="view-tabs" aria-label="诊断视图">{[['overview', '概览'], ['evidence', '证据与假设'], ['events', '事件记录']].map(([key, label]) => <button className={view === key ? 'selected' : ''} onClick={() => setView(key as typeof view)} key={key}>{label}</button>)}</nav>
-      {view === 'events' ? <EventsPanel events={events} /> : view === 'evidence' ? <EvidenceView run={run} toolExecutions={toolExecutions} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} onSkip={skipClarification} onApproval={resolveToolApproval} onConfirmTarget={confirmTarget} />}
+      <DiagnosisGraph run={run} />
+      <nav className="view-tabs" aria-label="诊断视图">{[['timeline', '执行过程'], ['overview', '概览'], ['evidence', '证据与假设']].map(([key, label]) => <button className={view === key ? 'selected' : ''} onClick={() => setView(key as typeof view)} key={key}>{label}</button>)}</nav>
+      {view === 'evidence' ? <EvidenceView run={run} toolExecutions={toolExecutions} /> : view === 'timeline' ? <ExecutionTimeline events={events} nodeExecutions={nodeExecutions} toolExecutions={toolExecutions} /> : <Overview run={run} latestEvent={latestEvent} onNew={() => setShowNew(true)} onClarification={submitClarification} onSkip={skipClarification} onApproval={resolveToolApproval} onConfirmTarget={confirmTarget} />}
       </>}
     </main>
     </div>
@@ -391,7 +539,7 @@ function DashboardPage({ runs, sessions, health, onNew, onOpenRun }: { runs: Adm
   return <div className="management-content">
     <PageHeading eyebrow="控制台 / 总览" title="早上好，Dahaoge" description="这里是 BugLens 的运行概况与最近活动。" action={<button className="primary-button" onClick={onNew}>＋ 新建诊断</button>} />
     <div className="metric-grid"><MetricCard label="运行中" value={String(running)} detail="当前正在推进" tone="teal" /><MetricCard label="等待补充" value={String(waiting)} detail="需要用户输入" tone="amber" /><MetricCard label="已完成" value={String(completed + 14)} detail="过去 30 天" tone="blue" /><MetricCard label="平均评测分" value="84" detail="↑ 6% 对比上月" tone="violet" /></div>
-    <div className="dashboard-grid"><section className={`panel health-panel ${healthOk ? '' : 'health-degraded'}`}><PanelHeader title="后端健康" meta={health ? '刚刚检查' : '演示'} /><div className="health-summary"><span className="health-ring">{healthOk ? '✓' : '!'}</span><div><strong>{healthLabel}</strong><p>{health ? '核心组件状态来自 Admin API' : '连接后显示真实健康状态'}</p></div><span className="health-latency">{health ? 'API' : '—'}</span></div>{[['checkpoint_store', '检查点存储'], ['configuration', '配置 profile'], ['model_credentials', '模型凭据']].map(([key, label]) => { const component = health?.components.find((item) => item.name === key); const status = component?.status ?? 'ok'; return <div className="health-row" key={key}><span className={`health-dot ${status}`} /><span>{label}</span><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}<button className="text-button" onClick={() => window.location.hash = 'system'}>查看系统详情 →</button></section><section className="panel activity-chart"><PanelHeader title="诊断活动" meta="最近 7 天" /><div className="chart-placeholder"><div className="chart-bars">{[38, 52, 45, 72, 58, 84, 67].map((height, index) => <span key={index} style={{ height: `${height}%` }}><i /></span>)}</div><div className="chart-labels"><span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>今天</span></div></div><div className="chart-legend"><span><i className="legend-teal" />完成 18</span><span><i className="legend-amber" />未决 4</span><span className="chart-total">22 次运行</span></div></section></div>
+    <div className="dashboard-grid"><section className={`panel health-panel ${healthOk ? '' : 'health-degraded'}`}><PanelHeader title="后端健康" meta={health ? '刚刚检查' : '演示'} /><div className="health-summary"><span className="health-ring">{healthOk ? '✓' : '!'}</span><div><strong>{healthLabel}</strong><p>{health ? '核心组件状态来自 Admin API' : '连接后显示真实健康状态'}</p></div><span className="health-latency">{health ? 'API' : '—'}</span></div>{HEALTH_COMPONENTS.map(([key, label, desc]) => { const component = health?.components.find((item) => item.name === key); const status = component?.status ?? 'ok'; return <div className="health-row" key={key}><span className={`health-dot ${status}`} /><div className="health-info"><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(key, component?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}<button className="text-button" onClick={() => window.location.hash = 'system'}>查看系统详情 →</button></section><section className="panel activity-chart"><PanelHeader title="诊断活动" meta="最近 7 天" /><div className="chart-placeholder"><div className="chart-bars">{[38, 52, 45, 72, 58, 84, 67].map((height, index) => <span key={index} style={{ height: `${height}%` }}><i /></span>)}</div><div className="chart-labels"><span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>今天</span></div></div><div className="chart-legend"><span><i className="legend-teal" />完成 18</span><span><i className="legend-amber" />未决 4</span><span className="chart-total">22 次运行</span></div></section></div>
     <section className="panel recent-panel"><PanelHeader title="最近诊断" meta="查看全部 →" /><RunTable runs={runs.slice(0, 4)} onOpenRun={onOpenRun} /></section>
     <section className="panel quick-panel"><div><span className="section-kicker">快速开始</span><h2>从一个现象开始定位</h2><p>提交问题、环境和一小段证据，BugLens 会自动推进四阶段诊断。</p></div><button className="quiet-button" onClick={onNew}>创建任务 →</button></section>
   </div>
@@ -409,7 +557,7 @@ function TasksPage({ runs, onNew, onOpenRun }: { runs: AdminRun[]; onNew: () => 
 }
 
 function RunTable({ runs, onOpenRun }: { runs: AdminRun[]; onOpenRun: (runId: string) => void }) {
-  return <div className="run-table"><div className="run-table-header"><span>任务</span><span>状态</span><span>阶段</span><span>Profile</span><span>更新时间</span><span /></div>{runs.map((run) => <button className="run-table-row" key={run.run_id} onClick={() => onOpenRun(run.run_id)}><span className="task-cell"><strong>{run.question}</strong><small className="mono">{run.run_id}</small></span><span><AdminStatusPill run={run} /></span><span className="node-cell"><span className="mini-node">{run.current_node === 'done' ? '✓' : '◌'}</span>{nodeLabel(run.current_node)}</span><span className="mono muted">{run.profile}</span><span className="muted">{formatTime(run.updated_at)}</span><span className="row-arrow">→</span></button>)}</div>
+  return <div className="run-table"><div className="run-table-header"><span>任务</span><span>状态</span><span>进度</span><span>Profile</span><span>更新</span><span /></div>{runs.map((run) => <button className="run-table-row" key={run.run_id} onClick={() => onOpenRun(run.run_id)}><span className="task-cell"><strong>{run.question}</strong><span className="task-summary">{runSummaryText(run)}</span><small className="mono">{run.run_id}</small></span><span><AdminStatusPill run={run} /></span><span className="node-cell"><span className="mini-node">{run.current_node === 'done' ? '✓' : '◌'}</span>{nodeLabel(run.current_node)}</span><span className="mono muted">{run.profile}</span><span className="muted">{formatTime(run.updated_at)}</span><span className="row-arrow">→</span></button>)}</div>
 }
 
 function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpenRun: (runId: string) => void }) {
@@ -834,7 +982,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function SystemPage({ health, version }: { health: AdminHealth | null; version: string }) {
   const healthy = health?.status === 'ok' || health === null
   const componentStatus = (name: string) => health?.components.find((component) => component.name === name)?.status ?? 'ok'
-  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{[['HTTP / SSE Adapter', '协议 v2', 'configuration'], ['Application Service', '已连接', 'checkpoint_store'], ['Checkpoint Store', 'SQLite WAL', 'checkpoint_store'], ['Agent Runtime', '可恢复', 'model_credentials']].map(([name, detail, key]) => { const status = componentStatus(key); return <div className="component-row" key={name}><i className={`component-dot ${status}`} /><div><strong>{name}</strong><small>{detail}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>.\install.ps1 -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>根目录脚本一键启动</p><code>.\install.ps1</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与数据库</p><code>.\distribution\buglensctl.ps1 update</code></div></div></section></div>
+  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{HEALTH_COMPONENTS.map(([key, label, desc]) => { const status = componentStatus(key); return <div className="component-row" key={key}><i className={`component-dot ${status}`} /><div><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(key, health?.components.find((c) => c.name === key)?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>.\install.ps1 -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>根目录脚本一键启动</p><code>.\install.ps1</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与数据库</p><code>.\distribution\buglensctl.ps1 update</code></div></div></section></div>
 }
 
 function AdminStatusPill({ run }: { run: AdminRun }) {
@@ -870,6 +1018,106 @@ function EvidenceView({ run, toolExecutions }: { run: Run; toolExecutions: ToolE
   </div>
 }
 
+function DiagnosisGraph({ run }: { run: { lifecycle_status: string; current_node: string; outcome?: string | null; attempt?: number } }) {
+  const order = ['analyze', 'investigate', 'evaluate', 'summarize'] as const
+  const states = deriveNodeStates(run)
+  const flow = deriveFlowStatus(run)
+  const positions: Record<string, { x: number; y: number }> = {
+    analyze: { x: 80, y: 60 },
+    investigate: { x: 260, y: 60 },
+    evaluate: { x: 440, y: 60 },
+    summarize: { x: 620, y: 60 },
+  }
+  const flowText = flow === 'retry' ? `重试定位 · 第 ${(run.attempt ?? 0) + 1} 次` : flow === 'completed' ? '诊断完成' : flow === 'failed' ? '诊断失败' : flow === 'forward' ? '推进中' : '等待中'
+  return <section className="diagnosis-graph" aria-label="诊断流程图">
+    <div className="graph-header"><span className={`graph-flow ${flow}`}>{flowText}</span><span className="graph-legend"><span><i className="pending" />未开始</span><span><i className="running" />执行中</span><span><i className="waiting" />等待</span><span><i className="completed" />完成</span><span><i className="failed" />失败</span></span></div>
+    <svg viewBox="0 0 720 130" className="graph-svg" preserveAspectRatio="xMidYMid meet">
+      {order.slice(0, -1).map((node, idx) => {
+        const next = order[idx + 1]
+        const from = positions[node]
+        const to = positions[next]
+        return <line key={`f-${node}`} x1={from.x + 36} y1={from.y} x2={to.x - 36} y2={to.y} className={`graph-edge ${states[node] === 'completed' ? 'active' : ''}`} markerEnd="url(#arrow)" />
+      })}
+      {/* 回环弧：evaluate 未通过 → investigate 重试 */}
+      {(flow === 'retry' || states.evaluate === 'completed') && (
+        <path d={`M ${positions.evaluate.x} ${positions.evaluate.y + 36} C ${positions.evaluate.x} 130, ${positions.investigate.x} 130, ${positions.investigate.x} ${positions.investigate.y + 36}`} className={`graph-loop ${flow === 'retry' ? 'active' : ''}`} fill="none" markerEnd="url(#arrow-loop)" />
+      )}
+      {order.map((node) => {
+        const pos = positions[node]
+        const state = states[node]
+        const label = NODE_LABELS[node]
+        return <g key={node} transform={`translate(${pos.x}, ${pos.y})`}>
+          <circle r="36" className={`graph-node ${state}`} />
+          {state === 'running' && <circle r="46" className="graph-pulse" />}
+          <text textAnchor="middle" dy="-2" className="graph-node-label">{label}</text>
+          <text textAnchor="middle" dy="14" className="graph-node-sub">{node}</text>
+        </g>
+      })}
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" /></marker>
+        <marker id="arrow-loop" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" /></marker>
+      </defs>
+    </svg>
+  </section>
+}
+
+function ExecutionTimeline({ events, nodeExecutions, toolExecutions }: { events: DomainEvent[]; nodeExecutions: NodeExecution[]; toolExecutions: ToolExecution[] }) {
+  // 按节点分组事件
+  const groups: Array<{ node: string; label: string; events: DomainEvent[] }> = []
+  let current: { node: string; label: string; events: DomainEvent[] } | null = null
+  for (const event of events) {
+    const node = event.node ?? (event.event_type.startsWith('run_') ? 'runtime' : 'runtime')
+    if (!current || current.node !== node) {
+      current = { node, label: NODE_LABELS[node] ?? node, events: [] }
+      groups.push(current)
+    }
+    current.events.push(event)
+  }
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  function toggle(key: string) { setExpanded((current) => { const next = new Set(current); next.has(key) ? next.delete(key) : next.add(key); return next }) }
+  return <section className="panel execution-timeline"><PanelHeader title="执行过程" meta={`${events.length} 个事件`} /><div className="timeline-list">{groups.length === 0 && <div className="empty-state">暂无执行事件</div>}{groups.map((group, gIdx) => {
+    const nodeExec = nodeExecutions.filter((n) => n.node === group.node)
+    const tools = toolExecutions.filter((t) => nodeExec.some((n) => n.execution_id === t.node_execution_id))
+    return <div className="timeline-group" key={`g-${gIdx}`}>
+      <div className="timeline-group-head"><span className="timeline-node-dot" /><strong>{group.label}</strong><small className="muted">{group.events.length} 个事件{tools.length > 0 ? ` · ${tools.length} 次工具调用` : ''}</small></div>
+      <div className="timeline-events">{group.events.map((event) => {
+        const tone = EVENT_TONES[event.event_type] ?? 'gray'
+        const label = EVENT_LABELS[event.event_type] ?? event.event_type
+        const icon = EVENT_ICONS[event.event_type] ?? '•'
+        const hasDetail = Boolean(event.summary || event.reason || event.tool_name)
+        const key = `${event.event_id}-${event.sequence}`
+        return <div className={`timeline-event ${tone}`} key={key}>
+          <span className="timeline-event-icon">{icon}</span>
+          <div className="timeline-event-body">
+            <span className="timeline-event-type">{label}</span>
+            {event.summary && <span className="timeline-event-summary">{event.summary}</span>}
+            {event.reason && <span className="timeline-event-detail">原因：{event.reason}</span>}
+            {event.tool_name && <span className="timeline-event-detail">工具：{event.tool_name}</span>}
+            {event.failure && <span className="timeline-event-detail failure">{event.failure.code}：{event.failure.message}</span>}
+            <span className="timeline-event-time mono">{event.occurred_at}</span>
+          </div>
+        </div>
+      })}
+      {tools.length > 0 && <div className="timeline-tools">{tools.map((tool) => {
+        const toolKey = `tool-${tool.tool_execution_id}`
+        const isOpen = expanded.has(toolKey)
+        return <div className="timeline-tool" key={toolKey}>
+          <button className="timeline-tool-head" onClick={() => toggle(toolKey)}><span className={`tool-status ${tool.status}`}><i />{tool.status}</span><strong>{tool.operation ?? tool.tool_name}</strong><small className="muted">{tool.duration_ms != null ? `${tool.duration_ms}ms` : ''}{tool.truncated ? ' · 已截断' : ''}</small><span className="tool-chevron">{isOpen ? '▾' : '▸'}</span></button>
+          {isOpen && <div className="timeline-tool-body">
+            <div><label>工具</label><code>{tool.tool_name}</code></div>
+            {tool.plugin_id && <div><label>插件</label><code>{tool.plugin_id}{tool.plugin_implementation_version ? `@${tool.plugin_implementation_version}` : ''}</code></div>}
+            {tool.redacted_query && <div><label>查询</label><code>{tool.redacted_query}</code></div>}
+            {tool.source_id && <div><label>数据源</label><code>{tool.source_id}</code></div>}
+            {parseEvidenceIds(tool.evidence_ids_json).length > 0 && <div><label>证据 ID</label><code>{parseEvidenceIds(tool.evidence_ids_json).join(', ')}</code></div>}
+            {tool.error_code && <div className="failure"><label>错误</label><code>{tool.error_code}</code></div>}
+          </div>}
+        </div>
+      })}</div>}
+    </div>
+    </div>
+  })}</div></section>
+}
+
 function parseEvidenceIds(value: string): string[] {
   try {
     const parsed = JSON.parse(value) as unknown
@@ -878,8 +1126,6 @@ function parseEvidenceIds(value: string): string[] {
     return []
   }
 }
-
-function EventsPanel({ events }: { events: DomainEvent[] }) { return <section className="panel events-panel"><PanelHeader title="事件记录" meta={`${events.length} 个已提交事件`} /><div className="event-table"><div className="event-header"><span>序号</span><span>事件</span><span>详情</span><span>时间</span></div>{events.map((event) => <div className="event-row" key={event.event_id}><span className="mono">{String(event.sequence).padStart(2, '0')}</span><span className="event-type"><i />{event.event_type}</span><span>{event.summary ?? event.node ?? '—'}</span><span className="muted">{event.occurred_at}</span></div>)}</div></section> }
 
 function HypothesisCard({ hypothesis }: { hypothesis: Hypothesis }) { return <article className="hypothesis-card"><div className="hypothesis-rank">0{hypothesis.rank}</div><div className="hypothesis-main"><div className="hypothesis-title"><h3>{hypothesis.cause}</h3><span>{Math.round(hypothesis.confidence * 100)}%</span></div><p>{hypothesis.rationale}</p><div className="evidence-columns"><div><label>支持证据</label>{hypothesis.supporting_evidence.map((item) => <span className="evidence-line positive" key={item}>＋ {item}</span>)}</div><div><label>验证步骤</label>{hypothesis.verification_steps.map((item) => <span className="evidence-line" key={item}>◷ {item}</span>)}</div></div></div></article> }
 
@@ -937,6 +1183,7 @@ function NewDiagnosis({ profiles, environments, onClose, onSubmit }: { profiles:
   const [service, setService] = useState('')
   const [log, setLog] = useState('')
   const [profile, setProfile] = useState(profiles[0] ?? 'default')
+  const [autoExplore, setAutoExplore] = useState(false)
   useEffect(() => {
     if (!environment && environments[0]) setEnvironment(environments[0].environment_id)
   }, [environment, environments])
@@ -944,9 +1191,10 @@ function NewDiagnosis({ profiles, environments, onClose, onSubmit }: { profiles:
     event.preventDefault()
     if (!question.trim() || (mode === 'explicit' && !environment)) return
     const hint = mode === 'infer' ? environmentHint.trim() : environment
-    onSubmit(question, { ...(hint ? { environment: hint } : {}), ...(service ? { service } : {}) }, log.trim() ? [{ source: 'log', content: log }] : [], profile, { mode, environment_id: hint || null, primary_service_id: service || null })
+    const context: Record<string, string> = { ...(hint ? { environment: hint } : {}), ...(service ? { service } : {}), ...(autoExplore ? { auto_explore: 'true' } : {}) }
+    onSubmit(question, context, log.trim() ? [{ source: 'log', content: log }] : [], profile, { mode, environment_id: hint || null, primary_service_id: service || null })
   }
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>目标方式<select value={mode} onChange={(event) => setMode(event.target.value as 'explicit' | 'infer')}><option value="infer">自动推断后确认</option><option value="explicit">明确选择环境</option></select></label>{mode === 'explicit' ? <label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option value="" disabled>请选择已配置环境</option>{environments.map((item) => <option key={item.environment_id} value={item.environment_id}>{item.display_name} · {item.environment_id}</option>)}</select></label> : <label>环境/别名提示<input value={environmentHint} onChange={(event) => setEnvironmentHint(event.target.value)} placeholder="production、prod 或线上" /></label>}</div><label>主服务提示<span className="optional">可选</span><input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label></div><div className="modal-footer"><span>确认后会生成不可变环境快照</span><button type="submit" className="primary-button" disabled={!question.trim() || (mode === 'explicit' && !environment)}>开始诊断 →</button></div></form></div>
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>目标方式<select value={mode} onChange={(event) => setMode(event.target.value as 'explicit' | 'infer')}><option value="infer">自动推断后确认</option><option value="explicit">明确选择环境</option></select></label>{mode === 'explicit' ? <label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option value="" disabled>请选择已配置环境</option>{environments.map((item) => <option key={item.environment_id} value={item.environment_id}>{item.display_name} · {item.environment_id}</option>)}</select></label> : <label>环境/别名提示<input value={environmentHint} onChange={(event) => setEnvironmentHint(event.target.value)} placeholder="production、prod 或线上" /></label>}</div><label>主服务提示<span className="optional">可选</span><input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label><label className="auto-explore-toggle"><input type="checkbox" checked={autoExplore} onChange={(event) => setAutoExplore(event.target.checked)} /><span><strong>自主探索模式</strong><small>自动跳过澄清，不等用户补充</small></span></label></div><div className="modal-footer"><span>确认后会生成不可变环境快照</span><button type="submit" className="primary-button" disabled={!question.trim() || (mode === 'explicit' && !environment)}>开始诊断 →</button></div></form></div>
 }
 
 function PanelHeader({ title, meta }: { title: string; meta?: string }) { return <div className="panel-header"><h2>{title}</h2>{meta && <span>{meta}</span>}</div> }

@@ -996,16 +996,43 @@ class DiagnosisRuntime:
                     new_state.lifecycle_status == LifecycleStatus.WAITING_USER
                     and new_state.pending_interaction is not None
                 ):
-                    events.extend(
-                        [
+                    if bool(new_state.context.attributes.get("auto_explore")):
+                        # Autonomous exploration mode: never block on the user.
+                        # Skip the clarification and keep driving the graph. The
+                        # skip increments the clarification round, so the graph's
+                        # per-node budget still terminates the run deterministically.
+                        skipped = DiagnosisGraph.skip_interaction(
+                            new_state,
+                            new_state.pending_interaction.request_id,
+                            reason="auto_explore: skipping clarification in autonomous mode",
+                        )
+                        new_state = replace_state(
+                            skipped,
+                            revision=state.revision + 1,
+                            updated_at=datetime.now(UTC),
+                        )
+                        skipped_record = new_state.skipped_interactions[-1]
+                        events.append(
                             self._event(
-                                InputRequired,
+                                InputSkipped,
                                 new_state,
-                                request=new_state.pending_interaction,
-                            ),
-                            self._event(RunWaiting, new_state, waiting_for="user"),
-                        ]
-                    )
+                                request_id=skipped_record.request_id,
+                                source_node=skipped_record.source_node,
+                                question_ids=skipped_record.question_ids,
+                                reason=skipped_record.reason,
+                            )
+                        )
+                    else:
+                        events.extend(
+                            [
+                                self._event(
+                                    InputRequired,
+                                    new_state,
+                                    request=new_state.pending_interaction,
+                                ),
+                                self._event(RunWaiting, new_state, waiting_for="user"),
+                            ]
+                        )
                 elif new_state.lifecycle_status == LifecycleStatus.COMPLETED:
                     summary = (
                         new_state.report.executive_summary

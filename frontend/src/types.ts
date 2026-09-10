@@ -80,7 +80,12 @@ export type EnvironmentConfig = {
 
 export type ToolExecution = {
   tool_execution_id: string
+  node_execution_id: string
+  sdk_tool_call_id: string
   tool_name: string
+  tool_version: string
+  retry_index: number
+  arguments_json?: string | null
   plugin_id?: string | null
   plugin_implementation_version?: string | null
   plugin_instance_id?: string | null
@@ -96,6 +101,27 @@ export type ToolExecution = {
   started_at: string
   completed_at?: string | null
   duration_ms?: number | null
+}
+
+export type NodeExecution = {
+  execution_id: string
+  run_id: string
+  node: string
+  session_id: string
+  investigation_attempt: number
+  clarification_round: number
+  retry_cycle: number
+  retry_index: number
+  status: string
+  input_context_json?: string | null
+  output_json?: string | null
+  error_code?: string | null
+  error_message?: string | null
+  retryable: boolean
+  reasoning_summary_json?: string | null
+  trace_id?: string | null
+  started_at: string
+  completed_at?: string | null
 }
 
 export type Evidence = {
@@ -237,6 +263,13 @@ export type ProgressDelta = {
   discarded_hypothesis_ids: string[]
 }
 
+export type EventFailure = {
+  code: string
+  message: string
+  retryable: boolean
+  node?: string
+}
+
 export type DomainEvent = {
   protocol_version?: string
   event_id: string
@@ -255,8 +288,29 @@ export type DomainEvent = {
   data?: Record<string, unknown>
   node?: NodeName
   next_node?: string
-  summary?: string
+  execution_id?: string
+  session_id?: string
+  investigation_attempt?: number
+  clarification_round?: number
+  retry_cycle?: number
+  retry_index?: number
+  delay_seconds?: number
+  reason?: string
+  waiting_for?: 'user' | 'tool' | 'approval'
   outcome?: Outcome
+  summary?: string
+  node_execution_id?: string
+  tool_execution_id?: string
+  sdk_tool_call_id?: string
+  tool_name?: string
+  evidence_ids?: string[]
+  duration_ms?: number | null
+  request?: InteractionRequest
+  source_node?: string
+  question_ids?: string[]
+  request_id?: string
+  decision?: 'approved' | 'rejected'
+  failure?: EventFailure
 }
 
 export type AdminRun = {

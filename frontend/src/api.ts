@@ -1,4 +1,4 @@
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, PluginHealth, PluginList, Run, ToolExecution } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, NodeExecution, PluginHealth, PluginList, Run, ToolExecution } from './types'
 
 const baseUrl = (import.meta.env.VITE_BUGLENS_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 const adminToken = (import.meta.env.VITE_BUGLENS_ADMIN_TOKEN as string | undefined)?.trim()
@@ -68,6 +68,12 @@ export function getAdminSessions() {
 export function getRunTools(runId: string) {
   return getJson<{ items: ToolExecution[]; total: number }>(
     `/v1/admin/runs/${encodeURIComponent(runId)}/tools?limit=100`,
+  )
+}
+
+export function getNodeExecutions(runId: string) {
+  return getJson<{ items: NodeExecution[]; total: number }>(
+    `/v1/admin/runs/${encodeURIComponent(runId)}/executions?limit=100`,
   )
 }
 
