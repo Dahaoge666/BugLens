@@ -1,0 +1,68 @@
+config_version: environments-v1
+
+plugin_instances:
+  sqlite-local:
+    plugin_id: sqlite
+    enabled: true
+    config:
+      root_path: data/environments
+      health_path: staging.sqlite
+    default_limits:
+      max_results: 200
+      timeout_seconds: 10
+      max_bytes: 65536
+  file-logs-local:
+    plugin_id: file_logs
+    enabled: true
+    config:
+      root_path: data/logs
+      encodings: [utf-8, utf-8-sig, latin-1]
+    default_limits:
+      max_results: 200
+      timeout_seconds: 10
+      max_bytes: 65536
+      max_scan_files: 100
+      max_scan_bytes: 16777216
+
+environments:
+  staging:
+    display_name: 预发布环境
+    aliases: [stage, staging, 预发布]
+    level: non-production
+    region: cn-east-1
+    timezone: Asia/Shanghai
+    tags: {deployment.environment.name: staging}
+
+services:
+  order-api-staging:
+    name: order-api
+    aliases: [orders, 订单服务]
+    version: 2.4.1
+    environment_id: staging
+
+nodes:
+  order-staging-1:
+    hostname: order-staging-1
+    instance_id: order-api-staging-1
+    environment_id: staging
+
+sources:
+  staging-orders-db:
+    kind: database
+    capabilities: [database.describe.v1, database.query.v1]
+    plugin_instance_id: sqlite-local
+    environment_id: staging
+    service_ids: [order-api-staging]
+    config:
+      path: staging.sqlite
+      allowed_tables: [orders, order_events]
+      denied_columns: [payment_token]
+  staging-order-logs:
+    kind: logs
+    capabilities: [logs.search.v1]
+    plugin_instance_id: file-logs-local
+    environment_id: staging
+    service_ids: [order-api-staging]
+    node_ids: [order-staging-1]
+    config:
+      paths: [staging/order-api.log]
