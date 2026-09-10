@@ -22,7 +22,9 @@ flowchart LR
     NODES --> TRIAGE[Triage / Analyze]
     TRIAGE -->|handoff| INVESTIGATE[Category Investigator]
     INVESTIGATE -->|as_tool| EVALUATE[Independent Evaluator]
-    TOOLS --> PLUGINS[buglens.tool_plugins]
+    TOOLS --> CAPABILITIES[CapabilityRegistry]
+    CAPABILITIES --> CONNECTORS[ConnectorTransport]
+    CONNECTORS --> PLUGINS[driver / MCP / CLI / SSH]
 ```
 
 依赖方向为 Adapter → Application Service → Runtime → Graph/Domain。Infra 实现 Runtime 需要的持久化、Session 和配置端口。`bootstrap.py` 是依赖组装入口。任何下层模块都不能反向导入 Adapter。
@@ -39,8 +41,10 @@ flowchart LR
 | NodeRunner | 用 Agents SDK loop 执行分诊、handoff、只读工具和独立评测，并返回严格输出 | 生命周期提交和持久化状态 |
 | ContextAssembler | 按节点显式组装上下文、证据 ID、回答、历史结果和版本 | 读取 SDK 消息或执行外部查询 |
 | ToolRegistry | 用 SDK `function_tool` 注册只读工具，按 node/profile/tenant/capability 过滤并交给审计 observer；显式工具可声明 `needs_approval` | 业务路由、写操作和权限越权 |
-| EnvironmentToolRegistry | 目标确认后把 source ID 解析到无凭据环境快照，执行 run 级预算/并发/限制，调用独立 Python 插件并登记 Evidence/审计 | 让 Agent 传连接地址、凭据或任意路径；执行模型推理 |
-| Tool plugin | 在 `buglens.tool_plugins` entry point 下实现确定性的健康检查和只读查询 | Agent、Runner、模型密钥、CheckpointStore、Shell/SSH、修复 |
+| CapabilityRegistry | 把稳定的 `*.v1` 能力 ID 映射到 Agent 工具、source kind、只读/采集/变更效果；拒绝未注册或需审批的能力 | 供应商连接、模型推理和生命周期提交 |
+| EnvironmentToolRegistry | 目标确认后把 source ID 解析到无凭据环境快照，执行 run 级预算/并发/限制，调用统一连接器并登记 Evidence/审计 | 让 Agent 传连接地址、凭据或任意路径；执行模型推理 |
+| ConnectorTransport | 用同一个 async `execute/check_health/close` 边界承载 driver、MCP、CLI JSON-over-stdio 和固定 SSH 探针 | 暴露任意 MCP tool、Shell 命令或写操作 |
+| Tool plugin / driver | 在 `buglens.tool_plugins` entry point 下实现确定性的健康检查和只读查询；仅在需要本地 SDK 时使用 | Agent、Runner、模型密钥、CheckpointStore、Shell/SSH、修复 |
 | Store | 原子保存业务状态、state history、Command、Event、节点/工具审计、证据、租约和配置快照 | 保存或解释模型对话 |
 | SDK Session | 保存一次原生 loop（或兼容 Graph 节点）的模型消息历史 | 业务状态、恢复游标和前端会话 |
 | Admin Service | 健康、能力、配置和只读运维查询 | 调用 Graph 或触发诊断节点 |
@@ -108,6 +112,8 @@ backend/app/
 ├── config.py             # profile 与快照解析
 ├── context.py            # 节点上下文组装
 ├── tools.py              # 只读工具注册与审计桥接
+├── capabilities.py       # Agent-facing 能力 ID 与 source family 映射
+├── transports.py         # driver/MCP/CLI/SSH 统一连接器边界
 ├── cli.py                # CLI Adapter
 ├── web.py                # ASGI Adapter
 ├── server.py             # Uvicorn 入口
@@ -122,6 +128,6 @@ plugins/                  # SQLite 与 file-logs 参考插件，每个目录可�
 
 - CLI 和 Web 不导入或构造 `DiagnosisGraph`。
 - 相同 Command 序列产生等价状态和持久化 Event。
-- Graph 测试不启动 transport；Adapter 测试使用 fake Service/Runner。
+- Graph 测试不启动 transport；Adapter 测试使用 fake Service/Runner；transport 使用 fake connector 或本地 JSON probe 测试。
 - SDK Session 不承担业务恢复，Store 不保存模型消息。
 - 删除前端后，CLI、HTTP/SSE API 和 backend-only 部署仍可工作。

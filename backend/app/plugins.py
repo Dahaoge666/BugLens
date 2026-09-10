@@ -26,6 +26,7 @@ from buglens_plugin_api import (
     ToolResultStatus,
 )
 
+from .capabilities import CapabilityRegistry
 from .environment import (
     EnvironmentDirectory,
     EnvironmentRepository,
@@ -34,10 +35,16 @@ from .environment import (
     SnapshotPluginInstance,
     SnapshotSource,
     ToolLimits,
+    TransportConfig,
 )
 from .models import EvidenceRecord
 from .security import sanitize_data
 from .tools import ToolRegistry
+from .transports import (
+    TransportError,
+    TransportTimeout,
+    build_transport,
+)
 
 
 class PluginError(RuntimeError):
@@ -54,6 +61,9 @@ class PluginCompatibilityError(PluginError):
 
 class PluginConfigError(PluginError):
     code = "plugin_config_invalid"
+
+
+_TRANSPORT_PLUGIN_IDS = frozenset({"mcp", "cli", "ssh"})
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,32 @@ def _call_factory(factory: Any, config: dict[str, Any]) -> Any:
         # than mistaking it for an arity mismatch.
         pass
     return factory(config)
+
+
+def _manifest_supports_source(
+    source_kind: str, requested_capabilities: list[str], manifest_capabilities: set[str]
+) -> bool:
+    """Match legacy family capabilities and newer versioned capability IDs.
+
+    Existing drivers advertise a family such as ``database`` while new
+    connectors can advertise IDs such as ``database.query.v1``.  A source may
+    explicitly list either form; a legacy family declaration is allowed to
+    satisfy versioned IDs from that same family, but never an unrelated one.
+    """
+
+    if "*" in manifest_capabilities:
+        return True
+    required = set(requested_capabilities or [source_kind])
+    if source_kind in manifest_capabilities:
+        if "*" in required:
+            return True
+        return all(
+            item in manifest_capabilities
+            or item == source_kind
+            or item.startswith(f"{source_kind}.")
+            for item in required
+        )
+    return required.issubset(manifest_capabilities)
 
 
 class PluginManager:
@@ -179,11 +215,29 @@ class PluginManager:
     def manifests(self) -> list[PluginManifest]:
         return [registration.manifest for registration in self._registrations.values()]
 
+    @staticmethod
+    def _transport_manifest(plugin_id: str) -> PluginManifest:
+        """Return an internal manifest for a declarative transport instance."""
+
+        return PluginManifest(
+            plugin_id=plugin_id,
+            implementation_version="builtin-transport-v1",
+            capabilities=["*"],
+            health_check=True,
+        )
+
     def manifest(self, plugin_id: str) -> PluginManifest:
         registration = self._registrations.get(plugin_id)
         if registration is None:
+            if plugin_id in _TRANSPORT_PLUGIN_IDS:
+                return self._transport_manifest(plugin_id)
             raise PluginConfigError(f"plugin is not installed: {plugin_id}")
         return registration.manifest
+
+    def manifest_for_instance(self, instance: PluginInstanceConfig) -> PluginManifest:
+        if instance.transport.type != "driver":
+            return self._transport_manifest(instance.plugin_id)
+        return self.manifest(instance.plugin_id)
 
     def _validate_schema(self, schema: dict[str, Any], value: Any, label: str) -> None:
         if not schema:
@@ -211,6 +265,17 @@ class PluginManager:
         instance: PluginInstanceConfig,
         source_configs: list[dict[str, Any]] | None = None,
     ) -> None:
+        if instance.transport.type != "driver":
+            # Declarative MCP/CLI/SSH instances do not require a Python wheel.
+            # The transport config is already strictly validated by Pydantic;
+            # its endpoint is checked lazily by health or the first call.
+            try:
+                build_transport(instance.transport).close()
+            except (TypeError, ValueError) as exc:
+                raise PluginConfigError(
+                    f"plugin instance {instance.id} transport is invalid"
+                ) from exc
+            return
         registration = self._registrations.get(instance.plugin_id)
         if registration is None:
             if instance.enabled:
@@ -265,10 +330,18 @@ class PluginManager:
                     f"enabled source {source.id} uses disabled plugin instance "
                     f"{instance.id}"
                 )
+            if instance.transport.type != "driver":
+                continue
             capabilities = set(self.manifest(instance.plugin_id).capabilities)
-            if source.kind not in capabilities:
+            required = source.capabilities or [source.kind]
+            if not _manifest_supports_source(source.kind, required, capabilities):
+                detail = (
+                    next(iter(required))
+                    if len(required) == 1
+                    else str(sorted(required))
+                )
                 raise PluginConfigError(
-                    f"plugin {instance.plugin_id} does not support {source.kind} "
+                    f"plugin {instance.plugin_id} does not support {detail} "
                     f"source {source.id}"
                 )
 
@@ -289,6 +362,43 @@ class PluginManager:
     def instance(self, instance: PluginInstanceConfig) -> Any:
         if not instance.enabled:
             raise PluginConfigError(f"plugin instance is disabled: {instance.id}")
+        if instance.transport.type != "driver":
+            with self._instance_lock:
+                config = instance.transport.model_dump(mode="json")
+                credentials = {
+                    "username": instance.username,
+                    "password": instance.password,
+                    "token": instance.token,
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "plugin_id": instance.plugin_id,
+                            "transport": config,
+                            # The digest lets credential rotation replace a
+                            # live client without persisting the secret.
+                            "credentials": credentials,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+                if self._instance_fingerprints.get(instance.id) != fingerprint:
+                    old = self._instances.pop(instance.id, None)
+                    self._instance_fingerprints.pop(instance.id, None)
+                    if old is not None and callable(getattr(old, "close", None)):
+                        old.close()
+                    try:
+                        transport = build_transport(
+                            instance.transport, credentials=credentials
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise PluginConfigError(
+                            f"plugin instance {instance.id} transport is invalid"
+                        ) from exc
+                    self._instances[instance.id] = transport
+                    self._instance_fingerprints[instance.id] = fingerprint
+                return self._instances[instance.id]
         registration = self._registrations.get(instance.plugin_id)
         if registration is None:
             raise PluginConfigError(f"plugin is not installed: {instance.plugin_id}")
@@ -330,7 +440,7 @@ class PluginManager:
     async def check_health(self, instance: PluginInstanceConfig) -> PluginHealth:
         try:
             plugin = self.instance(instance)
-            manifest = self.manifest(instance.plugin_id)
+            manifest = self.manifest_for_instance(instance)
             checker = getattr(plugin, "check_health", None)
             if not callable(checker):
                 return PluginHealth(
@@ -440,10 +550,14 @@ class EnvironmentToolService:
     """Resolve catalog sources and turn plugin results into safe tool output."""
 
     def __init__(
-        self, repository: EnvironmentRepository, plugins: PluginManager
+        self,
+        repository: EnvironmentRepository,
+        plugins: PluginManager,
+        capabilities: CapabilityRegistry | None = None,
     ) -> None:
         self.repository = repository
         self.plugins = plugins
+        self.capabilities = capabilities or CapabilityRegistry.default()
         self._budgets: dict[str, _RunBudget] = {}
 
     def _budget(self, runtime: Any) -> _RunBudget:
@@ -521,13 +635,8 @@ class EnvironmentToolService:
         release_deferred = False
         execution_task: asyncio.Task[Any] | None = None
         try:
-            if operation == "describe_database":
-                kind = "database"
-            elif operation == "query_database":
-                kind = "database"
-            elif operation == "search_logs":
-                kind = "logs"
-            else:
+            spec = self.capabilities.for_operation(operation)
+            if spec is None or operation == "describe_environment":
                 return _tool_result(
                     ToolResult(
                         status=ToolResultStatus.REJECTED,
@@ -536,11 +645,31 @@ class EnvironmentToolService:
                 )
             source_id = request.get("source_id")
             source = snapshot.source(str(source_id)) if source_id else None
-            if source is None or source.kind != kind:
+            if source is None or not spec.accepts_source_kind(source.kind):
                 return _tool_result(
                     ToolResult(
                         status=ToolResultStatus.REJECTED,
                         warnings=["source_not_allowed"],
+                    )
+                )
+            allowed_capabilities = set(source.capabilities)
+            if source.capabilities and not (
+                "*" in allowed_capabilities
+                or spec.id in allowed_capabilities
+                or operation in allowed_capabilities
+                or source.kind in allowed_capabilities
+            ):
+                return _tool_result(
+                    ToolResult(
+                        status=ToolResultStatus.REJECTED,
+                        warnings=["capability_not_allowed"],
+                    )
+                )
+            if spec.effect != "read_only":
+                return _tool_result(
+                    ToolResult(
+                        status=ToolResultStatus.REJECTED,
+                        warnings=["capability_requires_approval"],
                     )
                 )
             if operation == "search_logs":
@@ -550,6 +679,25 @@ class EnvironmentToolService:
                         ToolResult(
                             status=ToolResultStatus.REJECTED,
                             warnings=[filter_error],
+                        )
+                    )
+            elif operation == "search_knowledge":
+                request_error = self._validate_knowledge_request(request)
+                if request_error is not None:
+                    return _tool_result(
+                        ToolResult(
+                            status=ToolResultStatus.REJECTED,
+                            warnings=[request_error],
+                        )
+                    )
+            elif operation == "search_traffic":
+                filter_error = self._validate_log_filters(snapshot, source, request)
+                request_error = filter_error or self._validate_traffic_request(request)
+                if request_error is not None:
+                    return _tool_result(
+                        ToolResult(
+                            status=ToolResultStatus.REJECTED,
+                            warnings=[request_error],
                         )
                     )
             try:
@@ -631,7 +779,12 @@ class EnvironmentToolService:
                             )
                         )
                     raise
-            except PluginError:
+            except TransportTimeout:
+                result = ToolResult(
+                    status=ToolResultStatus.UNAVAILABLE,
+                    warnings=["tool_timeout"],
+                )
+            except (PluginError, TransportError):
                 result = ToolResult(
                     status=ToolResultStatus.UNAVAILABLE,
                     warnings=["plugin_unavailable"],
@@ -811,6 +964,66 @@ class EnvironmentToolService:
         return None
 
     @staticmethod
+    def _validate_knowledge_request(request: dict[str, Any]) -> str | None:
+        query = request.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return "knowledge_query_required"
+        if len(query) > 4_096:
+            return "knowledge_query_too_large"
+        top_k = request.get("top_k", 10)
+        if (
+            not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or not 1 <= top_k <= 100
+        ):
+            return "knowledge_top_k_invalid"
+        filters = request.get("filters")
+        if filters is not None and not isinstance(filters, dict):
+            return "knowledge_filters_invalid"
+        if filters is not None:
+            try:
+                encoded = json.dumps(
+                    filters, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                )
+            except (TypeError, ValueError):
+                return "knowledge_filters_invalid"
+            if len(encoded.encode("utf-8")) > 16_384:
+                return "knowledge_filters_too_large"
+        return None
+
+    @staticmethod
+    def _validate_traffic_request(request: dict[str, Any]) -> str | None:
+        start = request.get("start_time")
+        end = request.get("end_time")
+        if not isinstance(start, str) or not isinstance(end, str):
+            return "absolute_time_required"
+        try:
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except ValueError:
+            return "absolute_time_required"
+        if start_at.tzinfo is None or end_at.tzinfo is None:
+            return "absolute_time_required"
+        if end_at <= start_at:
+            return "invalid_time_window"
+        if (end_at - start_at).total_seconds() > 24 * 60 * 60:
+            return "time_window_too_large"
+        text_query = request.get("text_query", "")
+        if text_query is not None and (
+            not isinstance(text_query, str) or len(text_query) > 4_096
+        ):
+            return "traffic_query_too_large"
+        for field_name in ("service_ids", "node_ids", "correlation_ids"):
+            value = request.get(field_name, [])
+            if value is not None and (
+                not isinstance(value, list)
+                or len(value) > 100
+                or any(not isinstance(item, str) or len(item) > 256 for item in value)
+            ):
+                return f"{field_name.removesuffix('_ids')}_filter_invalid"
+        return None
+
+    @staticmethod
     def _filter_ids(value: Any) -> tuple[set[str], bool]:
         if value is None:
             return set(), False
@@ -852,6 +1065,7 @@ class EnvironmentToolService:
             plugin_id=pinned.plugin_id,
             enabled=True,
             config=copy.deepcopy(pinned.config),
+            transport=pinned.transport,
             username=current.username,
             password=current.password,
             token=current.token,
@@ -866,6 +1080,8 @@ class EnvironmentToolService:
             "describe_database": "describe_database",
             "query_database": "query_database",
             "search_logs": "search_logs",
+            "search_knowledge": "search_knowledge",
+            "search_traffic": "search_traffic",
         }
         operation = operation_by_tool.get(tool_name)
         if operation is None or not isinstance(arguments, dict):
@@ -881,7 +1097,20 @@ class EnvironmentToolService:
                 "source_id": str(source_id) if source_id else None,
                 "operation": operation,
             }
-        manifest = self.plugins.manifest(source.plugin_id)
+        instance = (
+            snapshot.plugin_instance(source.plugin_instance_id) if snapshot else None
+        )
+        manifest = (
+            self.plugins.manifest_for_instance(
+                PluginInstanceConfig(
+                    id=source.plugin_instance_id,
+                    plugin_id=source.plugin_id,
+                    transport=instance.transport if instance else TransportConfig(),
+                )
+            )
+            if instance is not None
+            else self.plugins.manifest(source.plugin_id)
+        )
         metadata: dict[str, Any] = {
             "plugin_id": source.plugin_id,
             "plugin_implementation_version": manifest.implementation_version,
@@ -896,6 +1125,13 @@ class EnvironmentToolService:
             metadata["query_fingerprint"] = hashlib.sha256(
                 redacted.encode("utf-8")
             ).hexdigest()
+        elif operation in {"search_knowledge", "search_traffic"}:
+            query_key = "query" if operation == "search_knowledge" else "text_query"
+            query = arguments.get(query_key)
+            if isinstance(query, str) and query:
+                metadata["query_fingerprint"] = hashlib.sha256(
+                    query.strip().encode("utf-8")
+                ).hexdigest()
         return metadata
 
     def _evidence_for(
@@ -997,17 +1233,22 @@ def _redact_query(value: str) -> str:
 
 
 class EnvironmentToolRegistry(ToolRegistry):
-    """Expose only the four stable environment tools to InvestigateAgent."""
+    """Expose stable read-only capability tools to InvestigateAgent."""
 
-    def __init__(self, service: EnvironmentToolService) -> None:
+    def __init__(
+        self,
+        service: EnvironmentToolService,
+        capabilities: CapabilityRegistry | None = None,
+    ) -> None:
         super().__init__(
             enabled=True,
             allowed_nodes={"investigate"},
-            max_results=4,
+            max_results=6,
             max_result_bytes=65_536,
             timeout_seconds=30,
         )
         self.service = service
+        self.capabilities = capabilities or service.capabilities
         self.register(
             self._describe_environment,
             name="describe_environment",
@@ -1032,6 +1273,20 @@ class EnvironmentToolRegistry(ToolRegistry):
         self.register(
             self._search_logs,
             name="search_logs",
+            version="environment-tools-v1",
+            nodes={"investigate"},
+            strict_mode=False,
+        )
+        self.register(
+            self._search_knowledge,
+            name="search_knowledge",
+            version="environment-tools-v1",
+            nodes={"investigate"},
+            strict_mode=False,
+        )
+        self.register(
+            self._search_traffic,
+            name="search_traffic",
             version="environment-tools-v1",
             nodes={"investigate"},
             strict_mode=False,
@@ -1115,16 +1370,66 @@ class EnvironmentToolRegistry(ToolRegistry):
             },
         )
 
+    async def _search_knowledge(
+        self,
+        context: RunContextWrapper[Any],
+        source_id: str,
+        query: str,
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.service.call(
+            "search_knowledge",
+            context.context,
+            {
+                "source_id": source_id,
+                "query": query,
+                "top_k": top_k,
+                "filters": filters or {},
+                "cursor": cursor,
+            },
+        )
+
+    async def _search_traffic(
+        self,
+        context: RunContextWrapper[Any],
+        source_id: str,
+        start_time: str,
+        end_time: str,
+        text_query: str = "",
+        service_ids: list[str] | None = None,
+        node_ids: list[str] | None = None,
+        correlation_ids: list[str] | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.service.call(
+            "search_traffic",
+            context.context,
+            {
+                "source_id": source_id,
+                "start_time": start_time,
+                "end_time": end_time,
+                "text_query": text_query,
+                "service_ids": service_ids or [],
+                "node_ids": node_ids or [],
+                "correlation_ids": correlation_ids or [],
+                "cursor": cursor,
+            },
+        )
+
 
 def build_plugin_runtime(
     repository: EnvironmentRepository,
     manager: PluginManager | None = None,
+    capabilities: CapabilityRegistry | None = None,
 ) -> tuple[PluginManager, EnvironmentToolService, EnvironmentToolRegistry]:
     manager = manager or PluginManager.discover()
     if repository.configured:
         manager.validate_directory(repository.directory())
-    service = EnvironmentToolService(repository, manager)
-    return manager, service, EnvironmentToolRegistry(service)
+    registry = capabilities or CapabilityRegistry.default()
+    service = EnvironmentToolService(repository, manager, registry)
+    return manager, service, EnvironmentToolRegistry(service, registry)
 
 
 __all__ = [

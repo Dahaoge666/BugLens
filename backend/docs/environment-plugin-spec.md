@@ -2,7 +2,7 @@
 
 状态：`v1`，与当前实现同步。
 
-本文是 BugLens 多环境、数据库和节点日志能力的后端规范。它定义核心与插件之间的稳定边界；前端只依赖根目录的 [前后端对接契约](../../frontend-backend-contract.md)，插件包不依赖 BugLens Agent 或运行时。
+本文是 BugLens 多环境、数据库、日志、知识库和流量检索能力的后端规范。它定义核心与连接器之间的稳定边界；前端只依赖根目录的 [前后端对接契约](../../frontend-backend-contract.md)，连接器包不依赖 BugLens Agent 或运行时。
 
 ## 1. 目标与边界
 
@@ -34,7 +34,7 @@ BugLens 核心拥有模型、Agent、工具 Schema、目标确认、调用预算
 
 当前部署假设是可信内网：不提供用户身份、角色、RBAC、环境授权或 API 鉴权。环境确认、只读事务、查询限制和跨环境拒绝是安全边界与资源控制，不是用户权限系统。若将来接入不可信租户，必须在此规范之外增加鉴权和授权层。
 
-非目标：插件执行写操作、Shell/SSH、修复、发布、重启、任意文件浏览、任意数据库连接串、在 Web UI 中安装或升级插件。
+非目标：模型直接执行写操作、任意 Shell/SSH、修复、发布、重启、任意文件浏览、任意数据库连接串、在 Web UI 中安装或升级连接器。SSH 只允许配置好的只读探针命令，不能由模型拼接。
 
 ## 2. 独立包与发现
 
@@ -54,7 +54,7 @@ backend/app/plugins.py      # 核心发现、注册、调用和审计桥接
 sqlite = "buglens_sqlite_plugin:plugin_factory"
 ```
 
-核心启动时发现全部已安装 entry point，按 `plugin_id` 去重，并拒绝不兼容的 `api_major`。安装、升级和删除插件由运维发布完成，需要重启；环境 YAML 和 Admin API 只管理实例配置。
+核心启动时发现全部已安装 entry point，按 `plugin_id` 去重，并拒绝不兼容的 `api_major`。安装、升级和删除驱动插件由运维发布完成，需要重启；环境 YAML 和 Admin API 只管理实例配置。MCP、CLI、SSH 实例是内置连接器，不要求为每个供应商编写 Python wheel。
 
 ### 2.1 `buglens-plugin-api`
 
@@ -78,6 +78,39 @@ API 主版本当前为 `1`。协议类型位于 `buglens_plugin_api.protocol`：
 插件实现必须接受 JSON 对象并返回 JSON-safe 数据。插件不得把凭据放入 `ToolResult`、`SourceReference`、警告、异常文本或 locator。
 
 Manifest 中的 `instance_config_schema` 和 `source_config_schema` 使用 JSON Schema Draft 2020-12；核心在注册和配置校验时调用 `Draft202012Validator`。核心环境模型的凭据字段 `username`、`password`、`token` 均声明 `writeOnly: true` 和 `x-buglens-secret: true`。
+
+### 2.2 能力与连接器传输
+
+Agent 依赖的是稳定的能力 ID，而不是供应商插件 ID。内置能力当前包括：
+
+| 能力 ID | Agent 工具 | source kind |
+| --- | --- | --- |
+| `database.describe.v1` | `describe_database` | `database` |
+| `database.query.v1` | `query_database` | `database` |
+| `logs.search.v1` | `search_logs` | `logs` |
+| `knowledge.search.v1` | `search_knowledge` | `knowledge` |
+| `traffic.search.v1` | `search_traffic` | `traffic` |
+
+`SourceConfig.kind` 是可扩展字符串；`capabilities` 可显式限制该 source 允许的能力。接入新的供应商只需配置已有能力和连接器，核心不需要再增加一个“插件类型”分支。真正新增语义时才增加一个 `CapabilitySpec`、参数校验和 Agent adapter。
+
+连接器由 `PluginInstanceConfig.transport` 选择：
+
+| transport | 用途与边界 |
+| --- | --- |
+| `driver` | 兼容现有 `buglens.tool_plugins` Python 驱动；适合需要本地 SDK 的连接器。 |
+| `mcp` | 远程 Streamable HTTP 或本地 MCP stdio；通过 `tool_map` 做 allowlist 映射，MCP server 不直接挂到 Agent。 |
+| `cli` | 启动固定可执行文件，以 `buglens-tool/v1` JSON-over-stdio 传递 operation、source config、request 和有界 context；不经过 shell。 |
+| `ssh` | 调用本机 `ssh` 客户端执行固定的远端只读探针；强制 `BatchMode`、严格 host key 校验，远端命令来自配置而不是模型。 |
+
+三种非 `driver` transport 不要求 Python wheel。所有 transport 都在同一个 capability gateway 后执行目标快照、超时、结果大小、Evidence 和审计检查。`credentials_ref` 只保存外部 secret 的不透明引用；凭据不得放入 URL、header、命令参数、source 配置或模型上下文。
+
+CLI/MCP connector 返回 `ToolResult` JSON；最小 CLI 响应示例：
+
+```json
+{"status":"succeeded","result":{"items":[]},"cursor":null,"truncated":false}
+```
+
+连接器只能做只读查询。流量“检索”属于 `traffic.search.v1`；抓包、启动采集或修改远端状态属于 acquisition/mutating capability，当前不会注册为 Agent 工具，后续必须走独立的审批/异步作业流程。
 
 ## 3. 环境目录
 
@@ -113,6 +146,23 @@ plugin_instances:
       max_bytes: 65536
       max_scan_files: 100
       max_scan_bytes: 16777216
+  # A vendor connector can use an existing capability without a Python wheel.
+  # kb-mcp:
+  #   plugin_id: vendor-knowledge
+  #   transport:
+  #     type: mcp
+  #     url: https://knowledge.example/mcp
+  #     tool_map: {search_knowledge: search}
+  #     credentials_ref: secret://buglens/knowledge
+  # traffic-probe:
+  #   plugin_id: vendor-traffic
+  #   transport:
+  #     type: ssh
+  #     host: probe-01.example
+  #     user: buglens
+  #     known_hosts: /etc/buglens/known_hosts
+  #     identity_file: /etc/buglens/probe_ed25519
+  #     remote_command: /opt/buglens/bin/traffic-probe
 environments:
   staging:
     display_name: Staging
@@ -135,7 +185,8 @@ nodes:
 sources:
   order-db:
     kind: database
-    plugin_instance: sqlite-local
+    capabilities: [database.describe.v1, database.query.v1]
+    plugin_instance_id: sqlite-local
     environment_id: staging
     service_ids: [order-api]
     config:
@@ -191,6 +242,9 @@ describe_database(source_id, schema?, table_pattern?)
 query_database(source_id, sql, parameters, purpose)
 search_logs(source_id, service_ids?, node_ids?, start_time, end_time,
             text_query, levels?, correlation_ids?, cursor?)
+search_knowledge(source_id, query, top_k?, filters?, cursor?)
+search_traffic(source_id, start_time, end_time, text_query?,
+               service_ids?, node_ids?, correlation_ids?, cursor?)
 ```
 
 `table_pattern` 使用大小写不敏感的 glob 匹配，不是正则表达式。
@@ -237,7 +291,13 @@ Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名�
 - 返回相对路径和行号 locator，不返回任意主机绝对路径；
 - 普通文本按行解析为 message，JSON Lines 提取 timestamp、level、service、node、correlation ID 等安全字段。
 
-Loki、Elastic、远程日志代理等后续接入仍实现同一个 `ToolPlugin` 协议，不改变 Agent 工具 Schema 或 run 生命周期。
+Loki、Elastic、远程日志代理、向量检索和流量平台等后续接入优先复用 `mcp`/`cli`/`ssh` transport，不改变 Agent 工具 Schema 或 run 生命周期；只有需要本地 SDK 的实现才新增 `ToolPlugin` 驱动。
+
+### 6.3 知识库与流量
+
+`search_knowledge` 只接受有限长度的 query、`top_k`（1–100）和结构化 filters；返回结果应包含文档/段落级可引用 ID，不返回连接凭据或任意管理链接。`search_traffic` 必须使用绝对时间，窗口不超过 24 小时，各类 service/node/correlation filter 最多 100 项。原始报文、PCAP 或大字段必须由连接器按 `max_bytes` 截断并返回引用，不应直接灌入模型上下文。
+
+流量采集、抓包、回放、索引构建和任何远端写入不属于这两个查询能力。它们需要单独的 acquisition/mutating capability、审批和可恢复作业，不得通过 `remote_command` 或任意 MCP tool 暗中绕过只读网关。
 
 ## 7. 配置热更新与 secret
 
@@ -310,6 +370,8 @@ Checkpoint Schema 为 v3：
 | 目录 | 重复 ID、未知引用、服务依赖、source 跨环境、secret schema |
 | 目标 | explicit、ID/别名推断、最多 20 候选、确认前无工具、确认幂等、跨环境拒绝 |
 | 快照 | 不含凭据；目录更新不改变已有 run；凭据轮换立即对新调用生效 |
+| 连接器 | driver、MCP、CLI JSON-over-stdio、固定 SSH argv；超时/退出码/非法 JSON 映射为稳定不可用结果 |
+| 能力 | versioned capability ID、source kind/capability allowlist、未知/需审批能力 fail closed |
 | 预算 | 每 run 20 次、并发 2、超时、行数/字节截断、错误映射和 Evidence 注册 |
 | SQLite | DML/DDL/ATTACH/危险 PRAGMA/多语句/锁/超时/表列白名单 |
 | 日志 | 目录穿越、符号链接、轮转、编码、时间窗口和扫描限制 |

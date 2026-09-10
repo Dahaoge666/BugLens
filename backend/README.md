@@ -54,6 +54,8 @@ CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。
 
 多环境插件规范见 [environment-plugin-spec.md](docs/environment-plugin-spec.md)。参考插件分别位于 `../plugins/sqlite` 和 `../plugins/file-logs`，需要独立构建/安装 wheel；设置 `BUGLENS_ENVIRONMENTS_CONFIG` 后，配置目录仍默认不向 Agent 暴露，必须在 profile 中显式打开只读工具。
 
+新增数据源优先复用 `CapabilityRegistry` 的稳定能力 ID，并在实例的 `transport` 中选择 `driver`、MCP、CLI JSON-over-stdio 或固定 SSH 探针。这样知识库、日志、数据库、流量查询只需增加 source 配置或连接器映射；抓包等采集动作不属于当前只读工具面，必须另走审批作业。
+
 本地试用 SQLite 插件可以使用仓库内的演示 profile 和环境目录：
 
 ```powershell

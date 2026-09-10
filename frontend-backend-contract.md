@@ -97,7 +97,7 @@ data: {"protocol_version":"2","event_id":"evt_123","run_id":"diag_123","sequence
 - SSE 断线后，前端先读取快照，再使用最后一个已确认的 `sequence` 追赶事件；
 - 合法但没有新事件的追赶请求返回空的 200 SSE 流；Run 不存在返回 404。
 
-Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。确认过环境的 Run 还可包含无凭据的 `environment_snapshot` 展示投影（环境、服务、节点和 source 摘要）；其中不包含连接配置或插件实例凭据。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
+Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。确认过环境的 Run 还可包含无凭据的 `environment_snapshot` 展示投影（环境、服务、节点和 source 摘要）；source 的 `kind` 是可扩展字符串，`capabilities` 是可选的稳定能力 ID 列表，其中不包含连接配置或插件实例凭据。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
 
 ## Admin JSON API
 
@@ -111,7 +111,7 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/capabilities` | 能力与可用操作 |
 | GET | `/v1/admin/config` | 当前非敏感配置 |
 | GET | `/v1/environments` | 可选择环境摘要和目录 revision；不返回凭据 |
-| GET | `/v1/admin/plugins` | entry point 发现的插件、版本、能力、Schema 和实例状态 |
+| GET | `/v1/admin/plugins` | 已发现的驱动插件和已配置的 MCP/CLI/SSH 连接器、版本、能力、Schema 和实例状态 |
 | GET | `/v1/admin/environment-config` | 非敏感环境目录；凭据只返回 `is_set` |
 | POST | `/v1/admin/environment-config/validate` | 校验目录和插件配置，不落盘 |
 | PUT/PATCH | `/v1/admin/environment-config` | If-Match/revision 原子更新目录 |

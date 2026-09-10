@@ -210,7 +210,8 @@ export type Run = {
     primary_service_id?: string | null
     sources: Array<{
       id: string
-      kind: 'database' | 'logs'
+      kind: string
+      capabilities?: string[]
       service_ids: string[]
       node_ids: string[]
     }>

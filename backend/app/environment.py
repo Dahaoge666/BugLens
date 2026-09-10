@@ -52,6 +52,154 @@ class ToolLimits(StrictModel):
     max_scan_bytes: int = Field(default=16 * 1024 * 1024, ge=1_024, le=64 * 1024 * 1024)
 
 
+class TransportConfig(StrictModel):
+    """Declarative transport settings for a connector instance.
+
+    ``type=driver`` is the backwards-compatible default used by the existing
+    Python plugins.  MCP, CLI and SSH settings are intentionally declarative;
+    credentials are referenced indirectly and are never supplied by a model
+    tool call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["driver", "mcp", "cli", "ssh"] = "driver"
+    url: str | None = Field(default=None, max_length=2_048)
+    command: str | None = Field(default=None, max_length=512)
+    args: list[str] = Field(default_factory=list, max_length=64)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=50)
+    tool_map: dict[str, str] = Field(default_factory=dict, max_length=100)
+    host: str | None = Field(default=None, max_length=512)
+    user: str | None = Field(default=None, max_length=256)
+    port: int = Field(default=22, ge=1, le=65_535)
+    ssh_command: str | None = Field(default=None, max_length=512)
+    known_hosts: str | None = Field(default=None, max_length=4_096)
+    identity_file: str | None = Field(default=None, max_length=4_096)
+    remote_command: str | None = Field(default=None, max_length=1_024)
+    credentials_ref: str | None = Field(default=None, min_length=1, max_length=512)
+    timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    max_output_bytes: int = Field(default=1_114_112, ge=1_024, le=8 * 1024 * 1024)
+
+    @model_validator(mode="after")
+    def validate_transport(self) -> TransportConfig:
+        if self.url and self.command:
+            raise EnvironmentConfigError(
+                "transport cannot specify both url and command"
+            )
+        if self.type == "mcp" and not (self.url or self.command):
+            raise EnvironmentConfigError("MCP transport requires url or command")
+        if self.type == "cli" and not self.command:
+            raise EnvironmentConfigError("CLI transport requires command")
+        if self.type == "ssh":
+            if not self.host or not self.remote_command:
+                raise EnvironmentConfigError(
+                    "SSH transport requires host and remote_command"
+                )
+            if any(ch.isspace() for ch in self.host):
+                raise EnvironmentConfigError("SSH host must be a single hostname")
+        if self.type != "ssh" and self.remote_command:
+            raise EnvironmentConfigError(
+                "remote_command is only valid for SSH transport"
+            )
+        if self.type != "mcp" and (self.url or self.tool_map):
+            raise EnvironmentConfigError(
+                "url and tool_map are only valid for MCP transport"
+            )
+        if self.type in {"cli", "ssh"} and self.headers:
+            raise EnvironmentConfigError("headers are only valid for MCP transport")
+        if self.type == "mcp" and any(
+            value is not None
+            for value in (
+                self.host,
+                self.user,
+                self.known_hosts,
+                self.identity_file,
+                self.remote_command,
+                self.ssh_command,
+            )
+        ):
+            raise EnvironmentConfigError(
+                "MCP transport cannot specify SSH connection settings"
+            )
+        if self.type == "cli" and any(
+            value is not None
+            for value in (
+                self.host,
+                self.user,
+                self.known_hosts,
+                self.identity_file,
+                self.ssh_command,
+            )
+        ):
+            raise EnvironmentConfigError(
+                "CLI transport cannot specify SSH connection settings"
+            )
+        if self.type == "ssh" and self.args:
+            raise EnvironmentConfigError(
+                "SSH transport uses remote_command instead of args"
+            )
+        if self.type == "driver" and (
+            any(
+                value is not None
+                for value in (
+                    self.url,
+                    self.command,
+                    self.host,
+                    self.user,
+                    self.known_hosts,
+                    self.identity_file,
+                    self.remote_command,
+                    self.ssh_command,
+                )
+            )
+            or self.args
+            or self.headers
+            or self.tool_map
+        ):
+            raise EnvironmentConfigError(
+                "driver transport cannot specify process connection settings"
+            )
+        for item in (
+            self.url,
+            self.command,
+            self.ssh_command,
+            self.host,
+            self.user,
+            self.known_hosts,
+            self.identity_file,
+            self.remote_command,
+        ):
+            if item is not None and "\x00" in item:
+                raise EnvironmentConfigError("transport setting contains NUL")
+        for item in [
+            *self.args,
+            *self.headers,
+            *self.headers.values(),
+            *self.tool_map,
+            *self.tool_map.values(),
+        ]:
+            if "\x00" in str(item):
+                raise EnvironmentConfigError("transport setting contains NUL")
+        if any(
+            any(char in str(item) for char in "\r\n")
+            for item in [*self.headers, *self.headers.values()]
+        ):
+            raise EnvironmentConfigError("transport headers contain line breaks")
+        for key in self.headers:
+            if _is_secret_key(key):
+                raise EnvironmentConfigError(
+                    "transport headers must use credentials_ref for secrets"
+                )
+        for value, label in (
+            (self.url, "transport url"),
+            (self.known_hosts, "known_hosts"),
+            (self.identity_file, "identity_file"),
+            (self.credentials_ref, "credentials_ref"),
+        ):
+            if value is not None:
+                _reject_credential_uris(value, label)
+        return self
+
+
 class PluginInstanceConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -60,6 +208,7 @@ class PluginInstanceConfig(StrictModel):
     # Plugin-specific non-secret settings.  Credentials stay in separate
     # fields so the admin API can update them independently and redact them.
     config: dict[str, Any] = Field(default_factory=dict)
+    transport: TransportConfig = Field(default_factory=TransportConfig)
     username: str | None = Field(
         default=None,
         max_length=512,
@@ -112,11 +261,15 @@ class NodeConfig(StrictModel):
 class SourceConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
-    kind: Literal["database", "logs"]
+    # ``kind`` is a stable source family.  New families (knowledge, traffic,
+    # traces, ...) do not require changing this model; installed connectors and
+    # the capability registry validate whether they are supported.
+    kind: str = Field(min_length=1, max_length=128)
     plugin_instance_id: str = Field(min_length=1, max_length=128)
     environment_id: str | None = Field(default=None, max_length=128)
     service_ids: list[str] = Field(default_factory=list, max_length=100)
     node_ids: list[str] = Field(default_factory=list, max_length=100)
+    capabilities: list[str] = Field(default_factory=list, max_length=50)
     config: dict[str, Any] = Field(default_factory=dict)
     limits: ToolLimits = Field(default_factory=ToolLimits)
     enabled: bool = True
@@ -299,11 +452,12 @@ class SnapshotNode(StrictModel):
 
 class SnapshotSource(StrictModel):
     id: str
-    kind: Literal["database", "logs"]
+    kind: str = Field(min_length=1, max_length=128)
     plugin_instance_id: str
     plugin_id: str
     service_ids: list[str] = Field(default_factory=list)
     node_ids: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list, max_length=50)
     config: dict[str, Any] = Field(default_factory=dict)
     limits: ToolLimits = Field(default_factory=ToolLimits)
 
@@ -314,6 +468,7 @@ class SnapshotPluginInstance(StrictModel):
     id: str
     plugin_id: str
     config: dict[str, Any] = Field(default_factory=dict)
+    transport: TransportConfig = Field(default_factory=TransportConfig)
     default_limits: ToolLimits = Field(default_factory=ToolLimits)
 
 
@@ -360,6 +515,7 @@ class ResolvedEnvironmentSnapshot(StrictModel):
                 {
                     "id": item.id,
                     "kind": item.kind,
+                    "capabilities": list(item.capabilities),
                     "service_ids": list(item.service_ids),
                     "node_ids": list(item.node_ids),
                 }
@@ -773,6 +929,7 @@ class EnvironmentRepository:
                 plugin_id=instances[source.plugin_instance_id].plugin_id,
                 service_ids=source.service_ids,
                 node_ids=source.node_ids,
+                capabilities=list(source.capabilities),
                 config=_remove_secrets(copy.deepcopy(source.config)),
                 limits=source.limits,
             )
@@ -786,6 +943,7 @@ class EnvironmentRepository:
                 id=instance.id,
                 plugin_id=instance.plugin_id,
                 config=_remove_secrets(copy.deepcopy(instance.config)),
+                transport=instance.transport,
                 default_limits=instance.default_limits,
             )
             for instance in directory.plugin_instances
@@ -1026,4 +1184,5 @@ __all__ = [
     "SnapshotSource",
     "SourceConfig",
     "ToolLimits",
+    "TransportConfig",
 ]

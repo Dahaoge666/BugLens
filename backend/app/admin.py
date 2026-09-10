@@ -471,8 +471,27 @@ class AdminApplicationService:
             statuses.setdefault(instance.plugin_id, {})[instance.id] = (
                 "enabled" if instance.enabled else "disabled"
             )
+        manifests = list(manager.manifests())
+        known_plugin_ids = {manifest.plugin_id for manifest in manifests}
+        # Declarative MCP/CLI/SSH instances have no entry point to discover,
+        # but should still appear in the admin directory and support the same
+        # connection check UX as installed driver plugins.
+        manifest_for_instance = getattr(manager, "manifest_for_instance", None)
+        if callable(manifest_for_instance):
+            for instance in instances:
+                if (
+                    instance.transport.type == "driver"
+                    or instance.plugin_id in known_plugin_ids
+                ):
+                    continue
+                try:
+                    manifest = manifest_for_instance(instance)
+                except Exception:
+                    continue
+                manifests.append(manifest)
+                known_plugin_ids.add(manifest.plugin_id)
         result: list[PluginView] = []
-        for manifest in manager.manifests():
+        for manifest in manifests:
             result.append(
                 PluginView(
                     plugin_id=manifest.plugin_id,

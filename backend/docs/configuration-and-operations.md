@@ -10,7 +10,7 @@
 | 运行策略 | loop/兼容 Graph 上限、评测阈值、Agent model/max turns/prompt、工具限制 | 创建 run 时快照 |
 | 请求输入 | 问题、上下文、证据、允许的 profile | 每个 Command |
 | 展示选项 | JSON、输出文件、颜色、远程地址 | Adapter 本地 |
-| 环境目录 | 插件实例、环境、服务、节点、数据库/日志 source | 目录 API 热更新；run 确认时生成环境快照 |
+| 环境目录 | 连接器实例、环境、服务、节点和可扩展 source（数据库/日志/知识库/流量） | 目录 API 热更新；run 确认时生成环境快照 |
 
 普通 CLI/Web 请求只能选择 profile，不能逐项覆盖固定策略。优先级为代码安全上限 > profile > 环境变量选择的默认 profile > 内置默认值。
 
@@ -99,7 +99,7 @@ revision 冲突返回 `config_revision_conflict`；没有配置文件路径时�
 
 ## 安全与部署
 
-环境配置 API 返回 opaque revision；PUT/PATCH 使用 `If-Match` 或 `expected_revision`。配置先写同目录临时文件并原子替换，失败继续使用旧目录。secret 使用 `username`、`password`、`token` 独立字段，响应只返回 `is_set`，更新通过 `secret_updates` 的 `set`/`clear` 明确执行。插件代码仍由运维安装和重启发布。
+环境配置 API 返回 opaque revision；PUT/PATCH 使用 `If-Match` 或 `expected_revision`。配置先写同目录临时文件并原子替换，失败继续使用旧目录。secret 使用 `username`、`password`、`token` 独立字段，响应只返回 `is_set`，更新通过 `secret_updates` 的 `set`/`clear` 明确执行。驱动插件代码仍由运维安装和重启发布；MCP/CLI/SSH 连接器只需更新目录配置。
 
 - 设置 `BUGLENS_ADMIN_TOKEN` 后，所有 Admin 请求必须使用 Bearer token；比较使用常量时间。
 - token、API key 和其他 secret 不写入业务状态、Event、日志或前端可读响应。若私有 profile 配置了 `api_key`，配置文件必须按凭据文件保护，Admin 视图只能返回掩码值；空值或掩码值更新会保留原 key。

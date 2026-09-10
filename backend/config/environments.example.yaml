@@ -26,6 +26,31 @@ plugin_instances:
       max_scan_files: 100
       max_scan_bytes: 16777216
 
+  # Declarative connectors reuse the same Agent-facing capability tools and
+  # do not require a Python plugin wheel. Uncomment one and bind a source below.
+  # knowledge-mcp:
+  #   plugin_id: vendor-knowledge
+  #   transport:
+  #     type: mcp
+  #     url: https://knowledge.example/mcp
+  #     tool_map: {search_knowledge: search}
+  #     credentials_ref: secret://buglens/knowledge
+  # traffic-cli:
+  #   plugin_id: vendor-traffic
+  #   transport:
+  #     type: cli
+  #     command: /opt/buglens/bin/traffic-connector
+  #     args: [--stdio]
+  # traffic-ssh:
+  #   plugin_id: vendor-traffic-ssh
+  #   transport:
+  #     type: ssh
+  #     host: probe-01.example
+  #     user: buglens
+  #     known_hosts: /etc/buglens/known_hosts
+  #     identity_file: /etc/buglens/probe_ed25519
+  #     remote_command: /opt/buglens/bin/traffic-probe
+
 environments:
   staging:
     display_name: Staging
@@ -67,6 +92,7 @@ nodes:
 sources:
   staging-orders-db:
     kind: database
+    capabilities: [database.describe.v1, database.query.v1]
     plugin_instance_id: sqlite-local
     environment_id: staging
     service_ids: [order-api-staging]
@@ -76,6 +102,7 @@ sources:
       denied_columns: [payment_token]
   production-orders-db:
     kind: database
+    capabilities: [database.describe.v1, database.query.v1]
     plugin_instance_id: sqlite-local
     environment_id: production
     service_ids: [order-api-production]
@@ -85,6 +112,7 @@ sources:
       denied_columns: [payment_token]
   staging-order-logs:
     kind: logs
+    capabilities: [logs.search.v1]
     plugin_instance_id: file-logs-local
     environment_id: staging
     service_ids: [order-api-staging]
@@ -93,9 +121,23 @@ sources:
       paths: [staging/order-api.log]
   production-order-logs:
     kind: logs
+    capabilities: [logs.search.v1]
     plugin_instance_id: file-logs-local
     environment_id: production
     service_ids: [order-api-production]
     node_ids: [order-production-1]
     config:
       paths: [production/order-api.log]
+
+  # knowledge-handbook:
+  #   kind: knowledge
+  #   capabilities: [knowledge.search.v1]
+  #   plugin_instance_id: knowledge-mcp
+  #   environment_id: production
+  #   service_ids: [order-api-production]
+  # traffic-search:
+  #   kind: traffic
+  #   capabilities: [traffic.search.v1]
+  #   plugin_instance_id: traffic-cli
+  #   environment_id: production
+  #   service_ids: [order-api-production]
