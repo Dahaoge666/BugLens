@@ -2,6 +2,15 @@
 
 本目录记录 BugLens 的显著变更与已识别问题。每个文件为一个条目，编号递增。
 
+## 条目
+
+- [0006 — 代码与文档清理](0006-code-and-documentation-cleanup.md)
+- [0005 — 自主探索模式](0005-autonomous-exploration-mode.md)
+- [0004 — 生命周期与审批恢复](0004-graph-lifecycle-and-approval-recovery.md)
+- [0003 — 前端管理请求隔离与服务绑定](0003-frontend-admin-request-isolation-and-server-binding.md)
+- [0002 — 多模型策略解耦](0002-model-strategy-decoupling.md)
+- [0001 — 网关兼容与结构化输出](0001-provider-compat-and-structured-output-hardening.md)
+
 ## 约定
 
 - 文件名：`NNNN-简短英文-slug.md`（如 `0001-provider-compat-and-structured-output-hardening.md`）。

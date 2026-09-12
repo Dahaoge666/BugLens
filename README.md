@@ -122,6 +122,7 @@ CLI、Web 和远程客户端都使用同一个 Application Service 与 Runtime�
 - [配置、Admin 与运维](backend/docs/configuration-and-operations.md)
 - [多环境插件规范](backend/docs/environment-plugin-spec.md)
 - [后端开发与测试](backend/README.md)
+- [测试与端到端验证](backend/docs/testing.md)
 - [前端开发与交互文档](frontend/README.md)
 - [安装与发布层](distribution/README.md)
 
@@ -130,8 +131,8 @@ CLI、Web 和远程客户端都使用同一个 Application Service 与 Runtime�
 后端和前端分别验证，互不要求安装对方的依赖：
 
 ```powershell
-uv run --project backend ruff check app tests
-uv run --project backend ruff format --check app tests
+uv run --project backend ruff check backend/app backend/tests backend/scripts
+uv run --project backend ruff format --check backend/app backend/tests backend/scripts
 uv run --project backend pytest -q
 uv build --project backend
 

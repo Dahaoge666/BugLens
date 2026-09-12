@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator, Literal, Protocol
+from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
 from agents import trace
@@ -189,12 +189,6 @@ class RunView(DiagnosisState):
     """Read model returned to adapters; it contains no SDK session details."""
 
     environment_snapshot: dict[str, Any] | None = None
-
-
-class AgentRuntime(Protocol):
-    def run(self, command: AgentCommand) -> AsyncIterator[AgentEvent]: ...
-
-    async def get_run(self, run_id: str) -> RunView: ...
 
 
 class DiagnosisRuntime:

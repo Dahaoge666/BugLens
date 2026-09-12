@@ -237,11 +237,6 @@ class ToolExecutionView(StrictModel):
     duration_ms: int | None = None
 
 
-class AuditListView(StrictModel):
-    items: list[NodeExecutionView | ToolExecutionView]
-    total: int
-
-
 class BootstrapStatus(StrictModel):
     initialized: bool
     setup_required: bool

@@ -58,6 +58,7 @@ AnalyzeAgent → InvestigateAgent → EvaluateAgent
 | 修改 Command/Event、生命周期、恢复、并发或持久化 | `backend/docs/runtime-protocol.md` |
 | 修改 profile、配置快照、Admin 配置或运维安全 | `backend/docs/configuration-and-operations.md` |
 | 后端开发、测试、打包 | `backend/README.md` |
+| 端到端验证与真实模型冒烟 | `backend/docs/testing.md` |
 | 前端页面、状态模型和交互 | `frontend/README.md` 及 `frontend/docs/` |
 | 原生安装、进程管理与生产发布 | `distribution/README.md` |
 | 未完成事项与历史变更 | `TODO.md`、`changelog/` |
@@ -71,8 +72,8 @@ AnalyzeAgent → InvestigateAgent → EvaluateAgent
 ```bash
 cd backend
 uv sync --locked --extra dev --extra web
-uv run ruff check app tests
-uv run ruff format --check app tests
+uv run ruff check app tests scripts
+uv run ruff format --check app tests scripts
 uv run pytest -q
 uv build
 

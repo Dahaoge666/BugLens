@@ -20,9 +20,9 @@ jobs:
           cache-dependency-glob: backend/uv.lock
       - run: uv sync --locked --extra dev --extra web
         working-directory: backend
-      - run: uv run ruff check app tests
+      - run: uv run ruff check app tests scripts
         working-directory: backend
-      - run: uv run ruff format --check app tests
+      - run: uv run ruff format --check app tests scripts
         working-directory: backend
       - run: uv run pytest -q
         working-directory: backend

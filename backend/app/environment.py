@@ -709,14 +709,6 @@ class EnvironmentRepository:
                 if item.enabled
             ]
 
-    def get_environment(self, environment_id: str) -> EnvironmentConfig:
-        with self._write_lock:
-            self._refresh_from_disk()
-            for environment in self._directory.environments:
-                if environment.id == environment_id and environment.enabled:
-                    return environment.model_copy(deep=True)
-        raise EnvironmentConfigError(f"environment is unavailable: {environment_id}")
-
     def _service_matches(self, service: ServiceConfig, hint: str) -> bool:
         needle = _normalize(hint)
         return needle in {

@@ -741,13 +741,6 @@ class SQLiteCheckpointStore:
             self.db.rollback()
             raise
 
-    def get_evidence(self, run_id: str, evidence_id: str) -> dict[str, Any] | None:
-        row = self.db.execute(
-            "SELECT * FROM diagnosis_evidence WHERE run_id = ? AND evidence_id = ?",
-            (run_id, evidence_id),
-        ).fetchone()
-        return dict(row) if row else None
-
     def list_evidence(self, run_id: str, *, limit: int = 100) -> list[EvidenceRecord]:
         rows = self.db.execute(
             "SELECT * FROM diagnosis_evidence WHERE run_id = ? "
@@ -834,31 +827,6 @@ class SQLiteCheckpointStore:
         )
         self.db.commit()
 
-    def save_sdk_run_state(
-        self,
-        *,
-        run_id: str,
-        request_id: str,
-        encrypted_state: str,
-        sdk_version: str,
-        agent_definition_version: str,
-    ) -> None:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self._save_sdk_run_state_locked(
-                {
-                    "run_id": run_id,
-                    "request_id": request_id,
-                    "encrypted_state": encrypted_state,
-                    "sdk_version": sdk_version,
-                    "agent_definition_version": agent_definition_version,
-                }
-            )
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-
     def _save_sdk_run_state_locked(self, record: dict[str, Any]) -> None:
         self.db.execute(
             """INSERT INTO diagnosis_sdk_run_states
@@ -910,38 +878,6 @@ class SQLiteCheckpointStore:
             WHERE run_id = ? AND request_id = ? AND resolved_at IS NULL""",
             (datetime.now(UTC).isoformat(), run_id, request_id),
         )
-
-    def set_sdk_run_state_decision(
-        self,
-        *,
-        run_id: str,
-        request_id: str,
-        decision: str,
-        decision_reason: str | None = None,
-    ) -> None:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self._set_sdk_run_state_decision_locked(
-                {
-                    "run_id": run_id,
-                    "request_id": request_id,
-                    "decision": decision,
-                    "decision_reason": decision_reason,
-                }
-            )
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-
-    def resolve_sdk_run_state(self, run_id: str, request_id: str) -> None:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self._resolve_sdk_run_state_locked(run_id, request_id)
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
 
     def get_sdk_run_state(self, run_id: str, request_id: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -1062,15 +998,6 @@ class SQLiteCheckpointStore:
         if result.rowcount != 1:
             raise FencingTokenError("lease is no longer owned by this executor")
 
-    def verify_lease(self, run_id: str, owner: str, fencing_token: int) -> None:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self._verify_lease_locked(run_id, owner, fencing_token)
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-
     def _verify_lease_locked(self, run_id: str, owner: str, fencing_token: int) -> None:
         row = self.db.execute(
             "SELECT owner, fencing_token, expires_at FROM run_leases WHERE run_id = ?",
@@ -1140,15 +1067,6 @@ class SQLiteCheckpointStore:
         except Exception:
             self.db.rollback()
             raise
-
-    def session_exists(self, session_id: str) -> bool:
-        try:
-            row = self.db.execute(
-                "SELECT 1 FROM agent_sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-        except sqlite3.OperationalError:
-            return False
-        return row is not None
 
     def list_states(
         self,

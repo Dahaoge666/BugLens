@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Protocol
+from typing import AsyncIterator
 
 from pydantic import Field
 
@@ -101,7 +101,3 @@ class ApplicationService:
 
     def close(self) -> None:
         self.runtime.close()
-
-
-class RuntimeApplication(Protocol):
-    async def send(self, command: AgentCommand) -> AsyncIterator[AgentEvent]: ...

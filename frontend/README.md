@@ -3,17 +3,16 @@
 本目录用于 BugLens 的独立 Web 前端。前端源码、测试、构建配置和前端文档都只放在
 `frontend/` 下，不向仓库根目录或 `backend/` 写入前端依赖与生成文件。
 
-当前目录包含可执行的 React/Vite 前端 MVP，以及与后端隔离的前端设计文档：
+当前目录包含 React/Vite 静态 SPA。前端文档只维护当前架构与交互：
 
-- [产品与前端架构设计](docs/product-and-architecture.md)
-- [安装、配置与任务管理交互设计](docs/operations-and-management-ux.md)
-- [Admin API 对接契约](docs/admin-api-contract.md)
+- [产品与前端架构](docs/product-and-architecture.md)
+- [配置与管理交互](docs/operations-and-management-ux.md)
 - 多环境选择、目标确认和插件管理的稳定字段见根目录的[前后端对接契约](../frontend-backend-contract.md)及后端的[多环境插件规范](../backend/docs/environment-plugin-spec.md)。
 
 本地运行：
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev                 # http://localhost:5173，/v1 由 Vite 代理到 8000
 pnpm typecheck
 pnpm build
@@ -45,21 +44,4 @@ bash ./install.sh
 
 前后端 HTTP/SSE 与 Admin JSON 的稳定边界见根目录的[前后端对接契约](../frontend-backend-contract.md)。
 
-后续拆分组件时保持以下目录边界：
-
-```text
-frontend/
-├── docs/                 # 仅前端产品、交互和工程文档
-├── public/               # 静态资源
-├── src/
-│   ├── app/              # 路由、Provider、全局错误边界
-│   ├── features/         # 按诊断、澄清、报告等业务切片
-│   ├── components/       # 无业务含义的通用组件
-│   ├── api/              # HTTP/SSE 客户端和协议 Schema
-│   ├── styles/           # Token 与全局样式
-│   └── test/             # 测试基础设施
-├── e2e/                  # Playwright 端到端测试
-├── package.json
-├── vite.config.ts
-└── tsconfig.json
-```
+源码保持 `App.tsx`、`api.ts`、`types.ts`、`styles.css` 和 `main.tsx` 的扁平布局；按实际职责需要拆分。`pnpm typecheck` 同时检查未使用的变量和参数。前端测试待办见根目录 [TODO](../TODO.md)。

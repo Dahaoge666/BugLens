@@ -54,10 +54,6 @@ const demoEvents: DomainEvent[] = [
   { event_id: 'e5', event_type: 'run_completed', sequence: 9, revision: 7, occurred_at: '10:26:18', node: 'summarize', summary: '报告已生成', outcome: 'confirmed' },
 ]
 
-const stageLabels = [
-  ['analyze', '理解问题'], ['investigate', '定位原因'], ['evaluate', '检查结论'], ['summarize', '生成报告'],
-] as const
-
 const NODE_LABELS: Record<string, string> = {
   analyze: '理解问题',
   investigate: '定位原因',
@@ -74,7 +70,7 @@ const HEALTH_COMPONENTS: Array<[string, string, string]> = [
 ]
 
 // 将后端英文 detail 翻译为中文
-function translateHealthDetail(key: string, raw: string): string {
+function translateHealthDetail(raw: string): string {
   if (!raw) return ''
   const map: Record<string, string> = {
     'SQLite checkpoint store is reachable': '检查点存储可正常读写',
@@ -518,7 +514,7 @@ function Sidebar({ page, health, version, runCount, navigate }: { page: Workspac
 }
 
 function ManagementPage({ page, runs, sessions, config, environments, environmentConfig, plugins, health, version, onConfigChange, onEnvironmentConfigChange, fetchError, onNew, onOpenRun }: { page: Exclude<WorkspacePage, 'run'>; runs: AdminRun[]; sessions: AdminSession[]; config: AdminConfig | null; environments: EnvironmentList; environmentConfig: EnvironmentConfig | null; plugins: PluginList; health: AdminHealth | null; version: string; onConfigChange: (config: AdminConfig) => void; onEnvironmentConfigChange: (config: EnvironmentConfig | null) => void; fetchError: string | null; onNew: () => void; onOpenRun: (runId: string) => void }) {
-  if (page === 'dashboard') return <DashboardPage runs={runs} sessions={sessions} health={health} onNew={onNew} onOpenRun={onOpenRun} />
+  if (page === 'dashboard') return <DashboardPage runs={runs} health={health} onNew={onNew} onOpenRun={onOpenRun} />
   if (page === 'tasks') return <TasksPage runs={runs} onNew={onNew} onOpenRun={onOpenRun} />
   if (page === 'sessions') return <SessionsPage sessions={sessions} onOpenRun={onOpenRun} />
   if (page === 'settings') return <SettingsPage config={config} onConfigChange={onConfigChange} fetchError={fetchError} />
@@ -530,7 +526,7 @@ function PageHeading({ eyebrow, title, description, action }: { eyebrow: string;
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>
 }
 
-function DashboardPage({ runs, sessions, health, onNew, onOpenRun }: { runs: AdminRun[]; sessions: AdminSession[]; health: AdminHealth | null; onNew: () => void; onOpenRun: (runId: string) => void }) {
+function DashboardPage({ runs, health, onNew, onOpenRun }: { runs: AdminRun[]; health: AdminHealth | null; onNew: () => void; onOpenRun: (runId: string) => void }) {
   const waiting = runs.filter((run) => run.lifecycle_status === 'waiting_user' || run.lifecycle_status === 'waiting_approval' || run.lifecycle_status === 'waiting_for_target_confirmation').length
   const running = runs.filter((run) => run.lifecycle_status === 'running').length
   const completed = runs.filter((run) => run.lifecycle_status === 'completed').length
@@ -539,7 +535,7 @@ function DashboardPage({ runs, sessions, health, onNew, onOpenRun }: { runs: Adm
   return <div className="management-content">
     <PageHeading eyebrow="控制台 / 总览" title="早上好，Dahaoge" description="这里是 BugLens 的运行概况与最近活动。" action={<button className="primary-button" onClick={onNew}>＋ 新建诊断</button>} />
     <div className="metric-grid"><MetricCard label="运行中" value={String(running)} detail="当前正在推进" tone="teal" /><MetricCard label="等待补充" value={String(waiting)} detail="需要用户输入" tone="amber" /><MetricCard label="已完成" value={String(completed + 14)} detail="过去 30 天" tone="blue" /><MetricCard label="平均评测分" value="84" detail="↑ 6% 对比上月" tone="violet" /></div>
-    <div className="dashboard-grid"><section className={`panel health-panel ${healthOk ? '' : 'health-degraded'}`}><PanelHeader title="后端健康" meta={health ? '刚刚检查' : '演示'} /><div className="health-summary"><span className="health-ring">{healthOk ? '✓' : '!'}</span><div><strong>{healthLabel}</strong><p>{health ? '核心组件状态来自 Admin API' : '连接后显示真实健康状态'}</p></div><span className="health-latency">{health ? 'API' : '—'}</span></div>{HEALTH_COMPONENTS.map(([key, label, desc]) => { const component = health?.components.find((item) => item.name === key); const status = component?.status ?? 'ok'; return <div className="health-row" key={key}><span className={`health-dot ${status}`} /><div className="health-info"><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(key, component?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}<button className="text-button" onClick={() => window.location.hash = 'system'}>查看系统详情 →</button></section><section className="panel activity-chart"><PanelHeader title="诊断活动" meta="最近 7 天" /><div className="chart-placeholder"><div className="chart-bars">{[38, 52, 45, 72, 58, 84, 67].map((height, index) => <span key={index} style={{ height: `${height}%` }}><i /></span>)}</div><div className="chart-labels"><span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>今天</span></div></div><div className="chart-legend"><span><i className="legend-teal" />完成 18</span><span><i className="legend-amber" />未决 4</span><span className="chart-total">22 次运行</span></div></section></div>
+    <div className="dashboard-grid"><section className={`panel health-panel ${healthOk ? '' : 'health-degraded'}`}><PanelHeader title="后端健康" meta={health ? '刚刚检查' : '演示'} /><div className="health-summary"><span className="health-ring">{healthOk ? '✓' : '!'}</span><div><strong>{healthLabel}</strong><p>{health ? '核心组件状态来自 Admin API' : '连接后显示真实健康状态'}</p></div><span className="health-latency">{health ? 'API' : '—'}</span></div>{HEALTH_COMPONENTS.map(([key, label, desc]) => { const component = health?.components.find((item) => item.name === key); const status = component?.status ?? 'ok'; return <div className="health-row" key={key}><span className={`health-dot ${status}`} /><div className="health-info"><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(component?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}<button className="text-button" onClick={() => window.location.hash = 'system'}>查看系统详情 →</button></section><section className="panel activity-chart"><PanelHeader title="诊断活动" meta="最近 7 天" /><div className="chart-placeholder"><div className="chart-bars">{[38, 52, 45, 72, 58, 84, 67].map((height, index) => <span key={index} style={{ height: `${height}%` }}><i /></span>)}</div><div className="chart-labels"><span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>今天</span></div></div><div className="chart-legend"><span><i className="legend-teal" />完成 18</span><span><i className="legend-amber" />未决 4</span><span className="chart-total">22 次运行</span></div></section></div>
     <section className="panel recent-panel"><PanelHeader title="最近诊断" meta="查看全部 →" /><RunTable runs={runs.slice(0, 4)} onOpenRun={onOpenRun} /></section>
     <section className="panel quick-panel"><div><span className="section-kicker">快速开始</span><h2>从一个现象开始定位</h2><p>提交问题、环境和一小段证据，BugLens 会自动推进四阶段诊断。</p></div><button className="quiet-button" onClick={onNew}>创建任务 →</button></section>
   </div>
@@ -982,7 +978,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function SystemPage({ health, version }: { health: AdminHealth | null; version: string }) {
   const healthy = health?.status === 'ok' || health === null
   const componentStatus = (name: string) => health?.components.find((component) => component.name === name)?.status ?? 'ok'
-  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{HEALTH_COMPONENTS.map(([key, label, desc]) => { const status = componentStatus(key); return <div className="component-row" key={key}><i className={`component-dot ${status}`} /><div><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(key, health?.components.find((c) => c.name === key)?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>.\install.ps1 -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>根目录脚本一键启动</p><code>.\install.ps1</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与数据库</p><code>.\distribution\buglensctl.ps1 update</code></div></div></section></div>
+  return <div className="management-content"><PageHeading eyebrow="管理 / 系统与更新" title="系统与更新" description="检查后端状态、协议能力和前后端版本，更新不会影响已有 checkpoint。" action={<button className="quiet-button">检查更新</button>} /><section className={`system-hero ${healthy ? '' : 'system-degraded'}`}><div className="system-orb">{healthy ? '✓' : '!'}</div><div><span className="section-kicker">BugLens backend</span><h2>{healthy ? '系统运行正常' : '系统需要关注'}</h2><p>{health ? `最近检查于 ${formatTime(health.checked_at)}` : '尚未连接后端，当前显示演示状态。'}</p></div><span className="mono system-version">v{version}</span></section><div className="system-grid"><section className="panel"><PanelHeader title="组件状态" meta={health ? '刚刚' : '演示'} />{HEALTH_COMPONENTS.map(([key, label, desc]) => { const status = componentStatus(key); return <div className="component-row" key={key}><i className={`component-dot ${status}`} /><div><strong>{label}</strong><small>{status === 'ok' ? desc : translateHealthDetail(health?.components.find((c) => c.name === key)?.detail ?? '')}</small></div><span>{status === 'ok' ? '正常' : status === 'degraded' ? '需关注' : '异常'}</span></div> })}</section><section className="panel update-panel"><PanelHeader title="更新通道" meta="stable" /><div className="update-version"><span className="version-badge">v{version}</span><div><strong>当前版本</strong><small>2026-09-07 · 版本信息来自后端</small></div></div><div className="update-divider" /><p>更新时会先备份配置和数据库，并执行兼容性检查。前端静态资源与后端 wheel 可独立更新。</p><button className="quiet-button" disabled>暂无可用更新</button></section></div><section className="panel install-panel"><PanelHeader title="安装方式" meta="推荐" /><div className="install-options"><div><span className="install-icon">▣</span><strong>仅后端</strong><p>适合已有前端或 CLI 的环境</p><code>.\install.ps1 -Mode backend</code></div><div><span className="install-icon">◫</span><strong>前后端一体</strong><p>根目录脚本一键启动</p><code>.\install.ps1</code></div><div><span className="install-icon">↻</span><strong>安全更新</strong><p>保留 checkpoint 与数据库</p><code>.\distribution\buglensctl.ps1 update</code></div></div></section></div>
 }
 
 function AdminStatusPill({ run }: { run: AdminRun }) {
@@ -1066,7 +1062,7 @@ function ExecutionTimeline({ events, nodeExecutions, toolExecutions }: { events:
   const groups: Array<{ node: string; label: string; events: DomainEvent[] }> = []
   let current: { node: string; label: string; events: DomainEvent[] } | null = null
   for (const event of events) {
-    const node = event.node ?? (event.event_type.startsWith('run_') ? 'runtime' : 'runtime')
+    const node = event.node ?? 'runtime'
     if (!current || current.node !== node) {
       current = { node, label: NODE_LABELS[node] ?? node, events: [] }
       groups.push(current)
@@ -1084,7 +1080,6 @@ function ExecutionTimeline({ events, nodeExecutions, toolExecutions }: { events:
         const tone = EVENT_TONES[event.event_type] ?? 'gray'
         const label = EVENT_LABELS[event.event_type] ?? event.event_type
         const icon = EVENT_ICONS[event.event_type] ?? '•'
-        const hasDetail = Boolean(event.summary || event.reason || event.tool_name)
         const key = `${event.event_id}-${event.sequence}`
         return <div className={`timeline-event ${tone}`} key={key}>
           <span className="timeline-event-icon">{icon}</span>
