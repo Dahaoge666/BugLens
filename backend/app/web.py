@@ -6,16 +6,20 @@ import json
 import secrets
 from urllib.parse import parse_qs
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from .admin import (
     AdminApplicationService,
     ConfigMutation,
     EnvironmentConfigMutation,
+    PluginInstanceMutation,
+    PluginInstanceRevision,
+    ServiceMutation,
 )
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
 from .environment import (
+    EnvironmentConfigError,
     EnvironmentConfigNotWritableError,
     EnvironmentRevisionConflictError,
 )
@@ -143,6 +147,41 @@ class BugLensASGI:
                         mode="json"
                     ),
                 )
+            if method == "POST" and path == "/v1/admin/plugin-instances":
+                payload = self._json_body_with_if_match(scope, body)
+                mutation = PluginInstanceMutation.model_validate(payload)
+                saved = self.admin.save_plugin_instance(mutation)
+                return await self._json(send, 201, saved.model_dump(mode="json"))
+            if method == "POST" and path == "/v1/admin/services":
+                payload = self._json_body_with_if_match(scope, body)
+                saved = self.admin.save_service(ServiceMutation.model_validate(payload))
+                return await self._json(send, 201, saved.model_dump(mode="json"))
+            if (
+                method == "PUT"
+                and len(parts) == 5
+                and parts[1:4] == ["v1", "admin", "services"]
+            ):
+                payload = self._json_body_with_if_match(scope, body)
+                saved = self.admin.save_service(
+                    ServiceMutation.model_validate(payload), service_id=parts[4]
+                )
+                return await self._json(send, 200, saved.model_dump(mode="json"))
+            if (
+                method in {"PUT", "DELETE"}
+                and len(parts) == 5
+                and parts[1:4] == ["v1", "admin", "plugin-instances"]
+            ):
+                payload = self._json_body_with_if_match(scope, body)
+                if method == "PUT":
+                    saved = self.admin.save_plugin_instance(
+                        PluginInstanceMutation.model_validate(payload),
+                        instance_id=parts[4],
+                    )
+                else:
+                    saved = self.admin.delete_plugin_instance(
+                        parts[4], PluginInstanceRevision.model_validate(payload)
+                    )
+                return await self._json(send, 200, saved.model_dump(mode="json"))
             if (
                 method == "POST"
                 and len(parts) == 6
@@ -269,6 +308,10 @@ class BugLensASGI:
             status = 400
             if isinstance(exc, RunNotFoundError):
                 status = 404
+            elif path.startswith(
+                ("/v1/admin/plugin-instances", "/v1/admin/services")
+            ) and isinstance(exc, (EnvironmentConfigError, ValidationError)):
+                status = 422
             elif isinstance(
                 exc,
                 (

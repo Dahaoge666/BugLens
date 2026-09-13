@@ -1,0 +1,19 @@
+[project]
+name = "buglens-ssh-logs-plugin"
+version = "1.0.0"
+description = "Read-only remote log search over SSH/SFTP for BugLens"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = []
+dependencies = ["buglens-plugin-api>=1.1,<2", "buglens-ssh-plugin>=1,<2", "buglens-file-logs-plugin>=1.1,<2"]
+
+[project.entry-points."buglens.tool_plugins"]
+ssh_logs = "buglens_ssh_logs_plugin:plugin_factory"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["buglens_ssh_logs_plugin*"]

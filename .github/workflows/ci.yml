@@ -18,16 +18,20 @@ jobs:
           version: "0.11.15"
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
-      - run: uv sync --locked --extra dev --extra web
+      - run: uv sync --locked --extra dev --extra web --extra plugins
         working-directory: backend
-      - run: uv run ruff check app tests scripts
+      - run: uv run --extra dev --extra web --extra plugins ruff check app tests scripts ../plugin-api ../plugins
         working-directory: backend
-      - run: uv run ruff format --check app tests scripts
+      - run: uv run --extra dev --extra web --extra plugins ruff format --check app tests scripts ../plugin-api ../plugins
         working-directory: backend
-      - run: uv run pytest -q
+      - run: uv run --extra dev --extra web --extra plugins pytest -q
         working-directory: backend
       - run: uv build
         working-directory: backend
+      - run: |
+          for package in plugin-api plugins/sqlite plugins/file-logs plugins/postgresql plugins/ssh plugins/ssh-logs; do
+            uv build --directory "$package" --out-dir "$PWD/backend/dist"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: python-package
@@ -48,6 +52,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
         working-directory: frontend
       - run: pnpm typecheck
+        working-directory: frontend
+      - run: pnpm test
         working-directory: frontend
       - run: pnpm build
         working-directory: frontend

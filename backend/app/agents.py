@@ -833,6 +833,9 @@ class OpenAINodeRunner:
         runtime: NodeRuntimeContext,
         category: ProblemCategory | None = None,
     ) -> BaseModel:
+        from .connector_guidance import with_connector_guides
+
+        payload = with_connector_guides(payload, runtime)
         agent = self._agent(
             node_name,
             category,
@@ -1396,6 +1399,9 @@ class NativeDiagnosisRunner(OpenAINodeRunner):
         *,
         sdk_input: Any | None = None,
     ) -> DiagnosisTurnResult:
+        from .connector_guidance import with_connector_guides
+
+        payload = with_connector_guides(payload, runtime)
         run_config = self._run_config(runtime)
         hooks = AuditingRunHooks(runtime.execution_observer)
         input_value = sdk_input if sdk_input is not None else payload.model_dump_json()

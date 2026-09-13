@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { applyAdminConfig, applyAdminEnvironmentConfig, checkAdminPluginInstance, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getNodeExecutions, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig, validateAdminEnvironmentConfig } from './api'
+import { EnvironmentPage } from './EnvironmentPage'
+import { applyAdminConfig, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getNodeExecutions, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig } from './api'
+import { sourceDisplayName } from './pluginForm'
 import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, NodeExecution, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
 
 type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'environments' | 'system' | 'run'
@@ -472,7 +474,7 @@ function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><span className="brand-mark">⌁</span><span>BUGLENS</span><span className="brand-divider" /><span className="brand-product">诊断工作台</span></div>
-      <div className="top-actions"><span className="connection"><i />{notice}</span><button className="quiet-button" onClick={() => setShowNew(true)}>＋ 新建诊断</button><span className="avatar">DL</span></div>
+      <div className="top-actions"><span className="connection" aria-label={notice} title={notice}><i /><span className="connection-message">{notice}</span></span><button className="quiet-button" onClick={() => setShowNew(true)}>＋ 新建诊断</button><span className="avatar">DL</span></div>
     </header>
     <div className="app-body">
      <Sidebar page={page} health={adminHealth} version={adminVersion} runCount={adminRuns.length} navigate={navigate} />
@@ -560,175 +562,6 @@ function SessionsPage({ sessions, onOpenRun }: { sessions: AdminSession[]; onOpe
   const active = sessions.filter((session) => session.status === 'active').length
   const waiting = sessions.filter((session) => session.status === 'waiting').length
   return <div className="management-content"><PageHeading eyebrow="控制台 / Agent Sessions" title="Session 管理" description="每个 run_id + node 使用独立 SDK SQLiteSession；这里只展示生命周期元数据。" /><div className="session-summary"><MetricCard label="活跃 Session" value={String(active)} detail="正在执行" tone="teal" /><MetricCard label="等待输入" value={String(waiting)} detail="可恢复" tone="amber" /><MetricCard label="历史 Session" value={String(sessions.length)} detail="仅保留元数据" tone="blue" /></div><section className="panel sessions-panel"><PanelHeader title="Session 列表" meta={`${sessions.length} 个可见记录`} /><div className="session-table"><div className="session-header"><span>Session</span><span>节点</span><span>状态</span><span>消息数</span><span>更新时间</span><span /></div>{sessions.map((session) => <div className="session-row" key={session.session_id}><span><strong className="mono">{session.session_id}</strong><small>run {session.run_id}</small></span><span className="node-badge">{nodeLabel(session.node ?? 'unknown')}</span><span><span className={`session-status ${session.status}`}>{sessionStatusLabel(session.status)}</span></span><span className="mono">{session.message_count}</span><span className="muted">{session.updated_at}</span><button className="row-link" onClick={() => onOpenRun(session.run_id)}>查看运行 →</button></div>)}</div><div className="session-note">模型消息由 Agents SDK SQLiteSession 管理，业务状态和 checkpoint 不会复制消息内容。</div></section></div>
-}
-
-type EnvironmentPanel = 'overview' | 'plugins' | 'editor'
-type DirectoryRecord = Record<string, unknown>
-
-function directoryRecords(value: unknown): DirectoryRecord[] {
-  if (Array.isArray(value)) return value.filter(isRecord)
-  if (!isRecord(value)) return []
-  return Object.entries(value).flatMap(([id, item]) => isRecord(item) ? [{ ...item, id: item.id ?? id }] : [])
-}
-
-function textValue(value: unknown, fallback = ''): string {
-  return typeof value === 'string' && value.trim() ? value : fallback
-}
-
-function pluginDisplayName(pluginId: string): string {
-  return ({ sqlite: 'SQLite 数据库', file_logs: '文件日志' } as Record<string, string>)[pluginId] ?? pluginId
-}
-
-function capabilityDisplayName(capability: string): string {
-  return ({ database: '数据库', read_only_sql: '只读查询', schema_description: '表结构', logs: '日志检索', knowledge: '知识库检索', traffic: '流量查询', 'knowledge.search.v1': '知识库检索', 'traffic.search.v1': '流量查询', 'logs.search.v1': '日志检索', 'database.query.v1': '数据库查询', 'database.describe.v1': '数据库结构' } as Record<string, string>)[capability] ?? capability
-}
-
-function sourceDisplayName(kind: string): string {
-  return ({ database: '数据库', logs: '日志', knowledge: '知识库', traffic: '流量', traces: 'Trace' } as Record<string, string>)[kind] ?? kind
-}
-
-function sourceIcon(kind: string): string {
-  return kind === 'database' ? '▦' : kind === 'knowledge' ? '▤' : kind === 'traffic' || kind === 'traces' ? '⌁' : '≋'
-}
-
-function healthTone(status: string): string {
-  if (status === 'ok') return 'ok'
-  if (status === 'degraded') return 'degraded'
-  if (status === 'error') return 'error'
-  if (status === 'checking') return 'checking'
-  if (status === 'disabled') return 'disabled'
-  return 'neutral'
-}
-
-function healthLabel(status: string): string {
-  return ({ ok: '连接正常', degraded: '需要关注', error: '不可用', checking: '检查中…', disabled: '已停用', configured: '已配置', neutral: '尚未检查' } as Record<string, string>)[status] ?? status
-}
-
-function EnvironmentPage({ environments, config, plugins, onConfigChange }: { environments: EnvironmentList; config: EnvironmentConfig | null; plugins: PluginList; onConfigChange: (config: EnvironmentConfig | null) => void }) {
-  const [activePanel, setActivePanel] = useState<EnvironmentPanel>('overview')
-  const [jsonText, setJsonText] = useState('')
-  const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
-  const [secretClears, setSecretClears] = useState<Record<string, boolean>>({})
-  const [checkResults, setCheckResults] = useState<Record<string, { status: string; detail: string }>>({})
-  const [message, setMessage] = useState('')
-  const [messageTone, setMessageTone] = useState<'success' | 'error' | 'info'>('info')
-
-  useEffect(() => {
-    if (config) setJsonText(JSON.stringify(config.config, null, 2))
-  }, [config])
-
-  const payload = (() => {
-    try {
-      const value: unknown = JSON.parse(jsonText)
-      return isRecord(value) ? value : null
-    } catch {
-      return null
-    }
-  })()
-  const directory = config?.config ?? {}
-  const instances = directoryRecords(directory.plugin_instances)
-  const sourceRecords = directoryRecords(directory.sources)
-  const serviceRecords = directoryRecords(directory.services)
-  const nodeRecords = directoryRecords(directory.nodes)
-  const sqlitePlugin = plugins.items.find((plugin) => plugin.plugin_id === 'sqlite')
-  const enabledInstances = instances.filter((instance) => instance.enabled !== false)
-  const enabledSources = sourceRecords.filter((source) => source.enabled !== false)
-  const environmentCards = environments.items.map((item) => {
-    const inEnvironment = (record: DirectoryRecord) => textValue(record.environment_id) === item.environment_id
-    const sources = enabledSources.filter(inEnvironment)
-    return {
-      ...item,
-      serviceCount: serviceRecords.filter(inEnvironment).length,
-      nodeCount: nodeRecords.filter(inEnvironment).length,
-      sourceCount: sources.length,
-      databaseCount: sources.filter((source) => source.kind === 'database').length,
-    }
-  })
-
-  function showMessage(text: string, tone: 'success' | 'error' | 'info' = 'info') {
-    setMessage(text)
-    setMessageTone(tone)
-  }
-
-  async function validate() {
-    if (!config || !payload) { showMessage('请输入合法的 JSON 配置，或等待后端连接', 'error'); return }
-    try {
-      const result = await validateAdminEnvironmentConfig({ config: payload, expected_revision: config.revision, secret_updates: buildSecretUpdates() })
-      showMessage(result.valid ? '环境目录校验通过，尚未落盘' : result.errors.join('；'), result.valid ? 'success' : 'error')
-    } catch (error) {
-      showMessage(error instanceof Error ? error.message : '校验失败，请重试', 'error')
-    }
-  }
-
-  function buildSecretUpdates() {
-    const updates: Record<string, Record<string, { action: 'set' | 'clear'; value?: string }>> = {}
-    for (const [key, selected] of Object.entries(secretClears)) {
-      if (!selected) continue
-      const separator = key.indexOf(':')
-      const instanceId = key.slice(0, separator)
-      const field = key.slice(separator + 1)
-      if (!instanceId || !['username', 'password', 'token'].includes(field)) continue
-      updates[instanceId] = { ...(updates[instanceId] ?? {}), [field]: { action: 'clear' } }
-    }
-    for (const [key, value] of Object.entries(secretDrafts)) {
-      if (!value.trim()) continue
-      const separator = key.indexOf(':')
-      const instanceId = key.slice(0, separator)
-      const field = key.slice(separator + 1)
-      if (!instanceId || !['username', 'password', 'token'].includes(field)) continue
-      updates[instanceId] = { ...(updates[instanceId] ?? {}), [field]: { action: 'set', value } }
-    }
-    return updates
-  }
-
-  async function save() {
-    if (!config || !payload) { showMessage('请输入合法的 JSON 配置，或等待后端连接', 'error'); return }
-    try {
-      const next = await applyAdminEnvironmentConfig({ config: payload, expected_revision: config.revision, secret_updates: buildSecretUpdates() })
-      onConfigChange(next)
-      setSecretDrafts({})
-      setSecretClears({})
-      showMessage('环境目录已原子保存；已有运行继续使用原快照', 'success')
-    } catch (error) {
-      showMessage(error instanceof Error ? error.message : '保存失败，请重试', 'error')
-    }
-  }
-
-  async function checkInstance(instanceId: string) {
-    setCheckResults((current) => ({ ...current, [instanceId]: { status: 'checking', detail: '正在检查插件实例…' } }))
-    try {
-      const result = await checkAdminPluginInstance(instanceId)
-      setCheckResults((current) => ({ ...current, [instanceId]: { status: result.status, detail: result.detail } }))
-    } catch (error) {
-      setCheckResults((current) => ({ ...current, [instanceId]: { status: 'error', detail: error instanceof Error ? error.message : '连接检查失败' } }))
-    }
-  }
-
-  return <div className="management-content">
-    <PageHeading
-      eyebrow="管理 / 环境与插件"
-      title="环境目录与工具插件"
-      description="先确认可用环境，再查看插件健康状态；只有需要精细调整时才进入高级配置。"
-      action={<div className="environment-heading-actions"><span className={`directory-badge ${config ? (config.writable ? 'ok' : 'neutral') : 'neutral'}`}>{config ? (config.writable ? '目录可写' : '只读目录') : '未连接'}</span>{config && <button className="quiet-button" onClick={() => setActivePanel('editor')}>编辑高级配置</button>}</div>}
-    />
-    <section className="panel directory-hero">
-      <div className="directory-hero-copy"><span className="section-kicker">环境目录</span><h2>{environments.items.length ? '诊断可以访问这些目标' : '还没有可用的诊断目标'}</h2><p>{environments.items.length ? '环境确认后会生成不可变快照，诊断只能读取快照里已启用的数据源。' : '配置一个环境和只读数据源后，新的诊断就可以按目标使用外部证据。'}</p></div>
-      <div className="directory-stats"><div><strong>{environments.items.length}</strong><span>可用环境</span></div><div><strong>{enabledSources.length}</strong><span>只读数据源</span></div><div><strong>{enabledInstances.length}</strong><span>启用实例</span></div><span className="directory-revision mono">{config ? `rev ${config.revision.slice(0, 10)}` : '未配置 revision'}</span></div>
-    </section>
-    <div className="environment-tabs" role="tablist" aria-label="环境管理视图"><button role="tab" aria-selected={activePanel === 'overview'} className={activePanel === 'overview' ? 'active' : ''} onClick={() => setActivePanel('overview')}>环境概览</button><button role="tab" aria-selected={activePanel === 'plugins'} className={activePanel === 'plugins' ? 'active' : ''} onClick={() => setActivePanel('plugins')}>插件状态 <span>{plugins.items.length}</span></button><button role="tab" aria-selected={activePanel === 'editor'} className={activePanel === 'editor' ? 'active' : ''} onClick={() => setActivePanel('editor')}>高级配置</button></div>
-
-    {activePanel === 'overview' && <>
-      <div className="environment-overview-grid">
-        <section className="panel"><PanelHeader title="可用环境" meta={`${environmentCards.length} 个`} />{environmentCards.length === 0 ? <div className="empty-state"><strong>尚未配置环境目录</strong><span>进入“高级配置”粘贴或编辑目录，然后先校验再保存。</span></div> : <div className="environment-card-list">{environmentCards.map((item) => <article className="environment-card" key={item.environment_id}><div className="environment-card-head"><span className="environment-mark">◈</span><div><strong>{item.display_name}</strong><small className="mono">{item.environment_id} · {item.level}{item.region ? ` · ${item.region}` : ''}</small></div><span className="directory-badge ok">可用于诊断</span></div><p>{item.aliases.length ? `别名：${item.aliases.join('、')}` : '未设置别名'} · {item.timezone}</p><div className="environment-card-stats"><span><strong>{item.sourceCount}</strong> 数据源</span><span><strong>{item.databaseCount}</strong> 数据库</span><span><strong>{item.serviceCount}</strong> 服务</span><span><strong>{item.nodeCount}</strong> 节点</span></div></article>)}</div>}</section>
-        <section className="panel sqlite-trial-card"><div className="sqlite-trial-top"><span className="plugin-icon">▦</span><div><span className="section-kicker">推荐试用</span><h2>SQLite 只读数据源</h2></div>{sqlitePlugin ? <span className="directory-badge ok">已接入</span> : <span className="directory-badge neutral">未安装</span>}</div><p>{sqlitePlugin ? '插件已被后端发现，可用于表结构查看和受限的参数化查询。' : '安装 SQLite 插件并重启后端，即可在这里完成实例检查。'}</p>{sqlitePlugin && <div className="sqlite-trial-meta"><span><strong>{instances.filter((instance) => instance.plugin_id === 'sqlite').length}</strong> 个插件实例</span><span><strong>{sourceRecords.filter((source) => source.kind === 'database' && instances.some((instance) => instance.id === source.plugin_instance_id && instance.plugin_id === 'sqlite')).length}</strong> 个数据库源</span></div>}<div className="sqlite-trial-actions"><button className="primary-button" onClick={() => setActivePanel('plugins')}>查看 SQLite 状态</button><button className="quiet-button" onClick={() => setActivePanel('editor')}>编辑数据源</button></div></section>
-      </div>
-      <section className="panel source-inventory"><PanelHeader title="只读数据源" meta={`${enabledSources.length} 个已启用`} />{enabledSources.length === 0 ? <div className="empty-state"><strong>还没有绑定数据源</strong><span>数据源会把环境、插件实例和具体数据位置连接起来。</span></div> : <div className="source-grid">{enabledSources.map((source) => { const instanceId = textValue(source.plugin_instance_id, '未绑定实例'); const instance = instances.find((item) => textValue(item.id) === instanceId); const kind = textValue(source.kind, '未知类型'); return <div className="source-card" key={textValue(source.id, instanceId)}><div className="source-card-icon">{sourceIcon(kind)}</div><div><strong>{textValue(source.id, '未命名数据源')}</strong><small>{sourceDisplayName(kind)} · {pluginDisplayName(textValue(instance?.plugin_id, '未安装插件'))}</small></div><span className="mono muted">{instanceId}</span></div> })}</div>}</section>
-    </>}
-
-    {activePanel === 'plugins' && <section className="panel plugin-directory-panel"><div className="plugin-directory-heading"><div><span className="section-kicker">工具插件目录</span><h2>已发现的只读连接器</h2><p>插件负责确定性读取；BugLens 控制环境边界、调用预算和审计。</p></div><span className="directory-badge neutral">{plugins.items.length} 个已发现</span></div>{plugins.items.length === 0 ? <div className="empty-state"><strong>没有已安装插件</strong><span>外部工具默认关闭。安装插件包并重启后端后，会在这里显示。</span></div> : <div className="plugin-detail-list">{plugins.items.map((plugin) => { const pluginInstances = instances.filter((instance) => instance.plugin_id === plugin.plugin_id); const enabledCount = pluginInstances.filter((instance) => instance.enabled !== false).length; return <article className={`plugin-detail-card ${plugin.plugin_id === 'sqlite' ? 'featured' : ''}`} key={plugin.plugin_id}><div className="plugin-detail-head"><span className="plugin-icon">{plugin.plugin_id === 'sqlite' ? '▦' : '◌'}</span><div className="plugin-detail-title"><span className="plugin-friendly-name">{pluginDisplayName(plugin.plugin_id)}</span><h2 className="mono">{plugin.plugin_id}</h2><p>{plugin.capabilities.map(capabilityDisplayName).join(' · ') || '已注册，只读能力由插件声明。'}</p></div><div className="plugin-version"><strong>v{plugin.implementation_version}</strong><small>Plugin API {plugin.api_major}</small></div></div><div className="plugin-detail-summary"><span className={`directory-badge ${enabledCount ? 'ok' : 'neutral'}`}>{enabledCount} 个启用实例</span><span>{plugin.health_check ? '支持连接检查' : '未提供连接检查'}</span></div><div className="plugin-instance-list">{pluginInstances.length === 0 ? <div className="plugin-unbound">插件已发现，但还没有在环境目录中创建实例。</div> : pluginInstances.map((instance) => { const id = textValue(instance.id, '未命名实例'); const result = checkResults[id]; const status = result?.status ?? (instance.enabled === false ? 'disabled' : 'configured'); return <div className="plugin-instance-card" key={id}><div className="plugin-instance-copy"><span className={`instance-pulse ${healthTone(status)}`} /><div><strong className="mono">{id}</strong><small>{instance.enabled === false ? '实例已停用' : result?.detail ?? '已配置，尚未执行连接检查'}</small></div></div><div className="plugin-instance-actions"><span className={`plugin-health ${healthTone(status)}`}><i />{healthLabel(status)}</span><button className="quiet-button" onClick={() => checkInstance(id)} disabled={status === 'checking' || !plugin.health_check}>检查连接</button></div></div> })}</div><details className="schema-details"><summary>查看配置 Schema</summary><div className="schema-grid"><div><span>实例配置</span><pre>{JSON.stringify(plugin.instance_config_schema, null, 2)}</pre></div><div><span>数据源配置</span><pre>{JSON.stringify(plugin.source_config_schema, null, 2)}</pre></div></div></details></article> })}</div>}</section>}
-
-    {activePanel === 'editor' && <section className="panel environment-editor"><div className="editor-heading"><div><span className="section-kicker">高级配置</span><h2>环境目录 JSON</h2><p>仅编辑非敏感字段；保存前会先校验，已有运行继续使用原快照。</p></div><div className="editor-meta"><span className={`directory-badge ${config?.writable ? 'ok' : 'neutral'}`}>{config?.writable ? '可写' : '只读'}</span><span className="mono">{config ? `revision ${config.revision}` : '未连接'}</span></div></div><p className="config-callout">密码、token、用户名不会从后端返回；保留字段中的 is_set 标记即可。凭据只能通过下方 set/clear 操作更新。</p>{config ? <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} rows={18} spellCheck={false} disabled={!config.writable} /> : <div className="empty-state">后端未提供环境目录配置。</div>}<div className="secret-editor"><div className="secret-editor-heading"><div><h3>凭据轮换</h3><p>只在需要更新时填写；提交后不会回显原值。</p></div><span className="mono">{instances.length} 个实例</span></div>{instances.length === 0 ? <div className="empty-state">当前目录没有需要管理凭据的插件实例。</div> : instances.map((instance) => { const id = textValue(instance.id); const pluginId = textValue(instance.plugin_id, 'unknown'); return <div className="secret-row" key={id}><div className="secret-row-title"><strong>{id || '未命名实例'}</strong><small>{pluginDisplayName(pluginId)} · 凭据仅用于本次提交</small></div>{(['username', 'password', 'token'] as const).map((field) => { const key = `${id}:${field}`; return <div className="secret-field" key={field}><label>{field === 'username' ? '用户名' : field === 'password' ? '密码' : 'Token'}<input type={field === 'username' ? 'text' : 'password'} value={secretDrafts[key] ?? ''} onChange={(event) => { const value = event.target.value; setSecretDrafts((current) => ({ ...current, [key]: value })); if (value) setSecretClears((current) => ({ ...current, [key]: false })) }} placeholder="留空表示不变" autoComplete="new-password" /></label><label className="clear-secret"><input type="checkbox" checked={secretClears[key] ?? false} onChange={(event) => { const checked = event.target.checked; setSecretClears((current) => ({ ...current, [key]: checked })); if (checked) setSecretDrafts((current) => ({ ...current, [key]: '' })) }} /> 清除</label></div> })}<button type="button" className="quiet-button secret-check-button" onClick={() => checkInstance(id)} disabled={!id}>检查连接</button></div> })}</div><div className="settings-actions"><button className="quiet-button" onClick={validate} disabled={!config?.writable}>验证目录</button><button className="primary-button" onClick={save} disabled={!config?.writable}>保存环境配置</button></div>{message && <div className={`form-message ${messageTone}`}>{message}</div>}</section>}
-  </div>
 }
 
 type ModelEntry = { model: string; base_url: string; api_key: string; timeout: number; streaming: boolean | null }

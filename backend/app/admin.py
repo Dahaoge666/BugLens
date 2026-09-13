@@ -17,7 +17,9 @@ from pydantic import Field
 
 from .application import ApplicationService
 from .config import ConfigNotWritableError, ConfigRevisionConflictError
+from .connector_guidance import usage_template
 from .environment import (
+    ConnectorUsage,
     EnvironmentConfigError,
     EnvironmentConfigNotWritableError,
     EnvironmentRepository,
@@ -93,6 +95,14 @@ class EnvironmentListView(StrictModel):
 
 class PluginView(StrictModel):
     plugin_id: str
+    display_name: str | None = None
+    category: str = "other"
+    description: str = ""
+    supported_transports: list[Literal["driver", "mcp", "cli", "ssh"]] = Field(
+        default_factory=lambda: ["driver", "mcp", "cli", "ssh"]
+    )
+    default_transport: Literal["driver", "mcp", "cli", "ssh"] = "driver"
+    usage_template: ConnectorUsage = Field(default_factory=ConnectorUsage)
     implementation_version: str
     api_major: int
     capabilities: list[str]
@@ -103,8 +113,46 @@ class PluginView(StrictModel):
     source_config_schema: dict[str, Any] = Field(default_factory=dict)
 
 
+class PluginCategoryView(StrictModel):
+    id: str
+    display_name: str
+    description: str
+
+
 class PluginListView(StrictModel):
     items: list[PluginView]
+    categories: list[PluginCategoryView] = Field(
+        default_factory=lambda: [
+            PluginCategoryView(
+                id="database",
+                display_name="数据库",
+                description="查看表结构、只读查询业务数据",
+            ),
+            PluginCategoryView(
+                id="logs",
+                display_name="日志",
+                description="检索本地或远程日志与请求时间线",
+            ),
+            PluginCategoryView(
+                id="host",
+                display_name="主机诊断",
+                description="读取主机系统、负载和资源状态",
+            ),
+            PluginCategoryView(
+                id="knowledge", display_name="知识库", description="检索文档和诊断知识"
+            ),
+            PluginCategoryView(
+                id="traffic",
+                display_name="流量",
+                description="查询已采集的网络流量证据",
+            ),
+            PluginCategoryView(
+                id="other",
+                display_name="其他连接器",
+                description="使用已配置的 MCP、CLI 等连接器",
+            ),
+        ]
+    )
 
 
 class EnvironmentConfigView(StrictModel):
@@ -117,6 +165,20 @@ class EnvironmentConfigMutation(StrictModel):
     config: dict[str, Any]
     expected_revision: str = Field(min_length=8, max_length=128)
     secret_updates: dict[str, dict[str, dict[str, Any]]] = Field(default_factory=dict)
+
+
+class PluginInstanceRevision(StrictModel):
+    expected_revision: str = Field(min_length=8, max_length=128)
+
+
+class PluginInstanceMutation(PluginInstanceRevision):
+    instance: dict[str, Any]
+    sources: list[dict[str, Any]] = Field(max_length=2_000)
+    secret_updates: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class ServiceMutation(PluginInstanceRevision):
+    service: dict[str, Any]
 
 
 class PluginHealthView(StrictModel):
@@ -468,6 +530,12 @@ class AdminApplicationService:
             )
         manifests = list(manager.manifests())
         known_plugin_ids = {manifest.plugin_id for manifest in manifests}
+        installed_ids = set(known_plugin_ids)
+        if "connector" not in known_plugin_ids and callable(
+            getattr(manager, "manifest", None)
+        ):
+            manifests.append(manager.manifest("connector"))
+            known_plugin_ids.add("connector")
         # Declarative MCP/CLI/SSH instances have no entry point to discover,
         # but should still appear in the admin directory and support the same
         # connection check UX as installed driver plugins.
@@ -490,6 +558,37 @@ class AdminApplicationService:
             result.append(
                 PluginView(
                     plugin_id=manifest.plugin_id,
+                    display_name=manifest.display_name,
+                    category=manifest.category
+                    if manifest.category != "other"
+                    else next(
+                        (
+                            kind
+                            for kind in (
+                                "database",
+                                "logs",
+                                "host",
+                                "knowledge",
+                                "traffic",
+                            )
+                            if kind in manifest.capabilities
+                            or any(
+                                capability.startswith(kind + ".")
+                                for capability in manifest.capabilities
+                            )
+                        ),
+                        "other",
+                    ),
+                    description=manifest.description,
+                    supported_transports=(
+                        ["driver", "mcp", "cli", "ssh"]
+                        if manifest.plugin_id in installed_ids
+                        else ["mcp", "cli", "ssh"]
+                    ),
+                    default_transport="driver"
+                    if manifest.plugin_id in installed_ids
+                    else "mcp",
+                    usage_template=usage_template(manifest),
                     implementation_version=manifest.implementation_version,
                     api_major=manifest.api_major,
                     capabilities=manifest.capabilities,
@@ -571,6 +670,126 @@ class AdminApplicationService:
             secret_updates=mutation.secret_updates,
         )
         return self.environment_config()
+
+    def save_plugin_instance(
+        self,
+        mutation: PluginInstanceMutation,
+        *,
+        instance_id: str | None = None,
+    ) -> EnvironmentConfigView:
+        """Replace one environment integration without accepting other records."""
+        view = self.environment_config()
+        if mutation.expected_revision != view.revision:
+            raise EnvironmentRevisionConflictError(
+                "environment config revision changed"
+            )
+        candidate = copy.deepcopy(view.config)
+        instances = candidate.get("plugin_instances", [])
+        sources = candidate.get("sources", [])
+        submitted = copy.deepcopy(mutation.instance)
+        submitted_id = submitted.get("id")
+        if not isinstance(submitted_id, str) or not submitted_id:
+            raise EnvironmentConfigError("plugin instance id is required")
+        if not submitted.get("environment_id"):
+            raise EnvironmentConfigError("plugin instance environment_id is required")
+        old = next((item for item in instances if item["id"] == submitted_id), None)
+        if instance_id is None:
+            if old is not None:
+                raise EnvironmentConfigError("plugin instance id already exists")
+        elif instance_id != submitted_id or old is None:
+            raise EnvironmentConfigError(
+                "plugin instance id does not match an existing instance"
+            )
+        for source in mutation.sources:
+            if source.get("plugin_instance_id") != submitted_id:
+                raise EnvironmentConfigError(
+                    "source must belong to this plugin instance"
+                )
+            if source.get("environment_id") != submitted["environment_id"]:
+                raise EnvironmentConfigError("source must belong to this environment")
+            if any(
+                item["id"] == source.get("id")
+                and item["plugin_instance_id"] != submitted_id
+                for item in sources
+            ):
+                raise EnvironmentConfigError(
+                    "source id belongs to another plugin instance"
+                )
+        candidate["plugin_instances"] = [
+            submitted if item["id"] == submitted_id else item for item in instances
+        ]
+        if old is None:
+            candidate["plugin_instances"].append(submitted)
+        candidate["sources"] = [
+            item for item in sources if item["plugin_instance_id"] != submitted_id
+        ] + copy.deepcopy(mutation.sources)
+        return self.apply_environment_config(
+            EnvironmentConfigMutation(
+                config=candidate,
+                expected_revision=mutation.expected_revision,
+                secret_updates={submitted_id: mutation.secret_updates},
+            )
+        )
+
+    def save_service(
+        self, mutation: ServiceMutation, *, service_id: str | None = None
+    ) -> EnvironmentConfigView:
+        view = self.environment_config()
+        if mutation.expected_revision != view.revision:
+            raise EnvironmentRevisionConflictError(
+                "environment config revision changed"
+            )
+        candidate = copy.deepcopy(view.config)
+        submitted = copy.deepcopy(mutation.service)
+        submitted_id = submitted.get("id")
+        if not submitted_id or not submitted.get("environment_id"):
+            raise EnvironmentConfigError("service id and environment_id are required")
+        records = candidate.get("services", [])
+        old = next((item for item in records if item["id"] == submitted_id), None)
+        if service_id is None and old is not None:
+            raise EnvironmentConfigError("service id already exists")
+        if service_id is not None and (service_id != submitted_id or old is None):
+            raise EnvironmentConfigError(
+                "service id does not match an existing service"
+            )
+        if old and old.get("environment_id") != submitted["environment_id"]:
+            raise EnvironmentConfigError("service environment cannot be changed")
+        candidate["services"] = [
+            submitted if item["id"] == submitted_id else item for item in records
+        ]
+        if old is None:
+            candidate["services"].append(submitted)
+        return self.apply_environment_config(
+            EnvironmentConfigMutation(
+                config=candidate, expected_revision=mutation.expected_revision
+            )
+        )
+
+    def delete_plugin_instance(
+        self, instance_id: str, mutation: PluginInstanceRevision
+    ) -> EnvironmentConfigView:
+        view = self.environment_config()
+        if mutation.expected_revision != view.revision:
+            raise EnvironmentRevisionConflictError(
+                "environment config revision changed"
+            )
+        candidate = copy.deepcopy(view.config)
+        instances = candidate.get("plugin_instances", [])
+        if not any(item["id"] == instance_id for item in instances):
+            raise EnvironmentConfigError("plugin instance is unknown")
+        candidate["plugin_instances"] = [
+            item for item in instances if item["id"] != instance_id
+        ]
+        candidate["sources"] = [
+            item
+            for item in candidate.get("sources", [])
+            if item["plugin_instance_id"] != instance_id
+        ]
+        return self.apply_environment_config(
+            EnvironmentConfigMutation(
+                config=candidate, expected_revision=mutation.expected_revision
+            )
+        )
 
     async def check_plugin_instance(self, instance_id: str) -> PluginHealthView:
         repository = self._environments()
@@ -771,6 +990,8 @@ __all__ = [
     "SessionListView",
     "ToolExecutionView",
     "PluginHealthView",
+    "PluginInstanceMutation",
+    "PluginInstanceRevision",
     "PluginListView",
     "PluginView",
     "VersionView",

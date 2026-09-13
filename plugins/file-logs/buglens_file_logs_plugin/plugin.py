@@ -20,7 +20,10 @@ from buglens_plugin_api import (
 
 manifest = PluginManifest(
     plugin_id="file_logs",
-    implementation_version="1.0.1",
+    display_name="文件日志",
+    category="logs",
+    description="从后端服务器上的日志检索错误、时间线与关联请求。",
+    implementation_version="1.1.0",
     api_major=1,
     api_version="1",
     capabilities=["logs", "text", "jsonl", "rotation", "bounded_scan"],
@@ -105,6 +108,19 @@ class FileLogsPlugin:
             return ToolResult(
                 status=ToolResultStatus.REJECTED, warnings=["unsupported_operation"]
             )
+        try:
+            root = (
+                Path(str(self.instance_config.get("root_path"))).expanduser().resolve()
+            )
+            paths = self._paths(source_config, root)
+        except ValueError:
+            return ToolResult(
+                status=ToolResultStatus.REJECTED, warnings=["log_path_rejected"]
+            )
+        return self.scan_paths(source_config, request, context, root=root, paths=paths)
+
+    def scan_paths(self, source_config, request, context, *, root, paths):
+        """Scan bounded read-only path objects, also usable by SFTP connectors."""
         start = _parse_time(request.get("start_time"))
         end = _parse_time(request.get("end_time"))
         if start is None or end is None:
@@ -118,15 +134,6 @@ class FileLogsPlugin:
         if (end - start).total_seconds() > 24 * 60 * 60:
             return ToolResult(
                 status=ToolResultStatus.REJECTED, warnings=["time_window_too_large"]
-            )
-        try:
-            root = (
-                Path(str(self.instance_config.get("root_path"))).expanduser().resolve()
-            )
-            paths = self._paths(source_config, root)
-        except ValueError:
-            return ToolResult(
-                status=ToolResultStatus.REJECTED, warnings=["log_path_rejected"]
             )
         text_query = str(request.get("text_query") or "").casefold()
         levels = {str(item).casefold() for item in request.get("levels", []) if item}

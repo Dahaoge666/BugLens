@@ -35,7 +35,7 @@ bash ./install.sh
 后端也可以独立安装。使用 `uv` 选择 Python 3.11+ 环境并按 `backend/uv.lock` 安装依赖：
 
 ```powershell
-uv sync --project backend --locked --extra dev --extra web
+uv sync --project backend --locked --extra dev --extra web --extra plugins
 ```
 
 真实模型运行前设置 `OPENAI_API_KEY`。后端可独立运行，不需要 Node.js：

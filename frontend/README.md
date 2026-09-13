@@ -15,6 +15,7 @@
 pnpm install --frozen-lockfile
 pnpm dev                 # http://localhost:5173，/v1 由 Vite 代理到 8000
 pnpm typecheck
+pnpm test                # 配置表单数据转换与隔离回归，不调用模型
 pnpm build
 ```
 
@@ -44,4 +45,6 @@ bash ./install.sh
 
 前后端 HTTP/SSE 与 Admin JSON 的稳定边界见根目录的[前后端对接契约](../frontend-backend-contract.md)。
 
-源码保持 `App.tsx`、`api.ts`、`types.ts`、`styles.css` 和 `main.tsx` 的扁平布局；按实际职责需要拆分。`pnpm typecheck` 同时检查未使用的变量和参数。前端测试待办见根目录 [TODO](../TODO.md)。
+每个内置插件的主表单支持驱动、MCP、CLI 接入；其他连接器可通过“自定义 MCP / CLI 连接器”创建。接入说明包含协议、适用场景、使用步骤和调用示例，按实例保存并提供给定位节点。CLI 程序需实现 BugLens JSON 协议，MCP 服务需提供对应只读工具；完整说明见[环境与插件交互](docs/operations-and-management-ux.md)。
+
+源码按页面、API 和配置表单职责拆分，保持扁平布局。环境与插件页按“选择环境 → 选择子服务 → 添加插件 → 选择类别 → 选择并配置”操作，支持创建环境和子服务、重复接入与单项配置管理。数据库类别包含 SQLite/PostgreSQL，日志类别包含文件日志/SSH 日志，主机诊断类别包含 SSH 固定检查。常用操作无需编辑 JSON；完整目录维护保留在高级视图。`pnpm typecheck` 同时检查未使用的变量和参数，`pnpm test` 使用 Node 原生测试执行配置转换、服务绑定与隔离回归。其余前端测试待办见根目录 [TODO](../TODO.md)。

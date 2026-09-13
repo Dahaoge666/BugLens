@@ -1,0 +1,60 @@
+# 使用前在 Web 中填写此实例独立的用户名/密码，或配置后端 SSH 私钥与 known_hosts。
+config_version: remote-example-v1
+environments:
+  staging:
+    display_name: 预发布环境
+    level: staging
+    timezone: Asia/Shanghai
+services:
+  orders:
+    name: 订单 API
+    environment_id: staging
+plugin_instances:
+  orders-db:
+    plugin_id: postgresql
+    environment_id: staging
+    service_id: orders
+    config:
+      host: db.example.internal
+      port: 5432
+      database: orders
+      sslmode: require
+  orders-host:
+    plugin_id: ssh
+    environment_id: staging
+    service_id: orders
+    config:
+      host: orders.example.internal
+      port: 22
+  orders-logs:
+    plugin_id: ssh_logs
+    environment_id: staging
+    service_id: orders
+    config:
+      host: orders.example.internal
+      port: 22
+      root_path: /var/log/orders
+sources:
+  orders-data:
+    kind: database
+    plugin_instance_id: orders-db
+    environment_id: staging
+    service_ids: [orders]
+    config:
+      schema: public
+      allowed_tables: [orders, order_events]
+      denied_columns: [payment_token]
+  orders-system:
+    kind: host
+    plugin_instance_id: orders-host
+    environment_id: staging
+    service_ids: [orders]
+    config:
+      checks: [system, uptime, disk, memory]
+  orders-log-files:
+    kind: logs
+    plugin_instance_id: orders-logs
+    environment_id: staging
+    service_ids: [orders]
+    config:
+      paths: [application.log, archive/*.log]

@@ -28,7 +28,10 @@ from buglens_plugin_api import (
 
 manifest = PluginManifest(
     plugin_id="sqlite",
-    implementation_version="1.0.1",
+    display_name="SQLite 数据库",
+    category="database",
+    description="查看数据库结构并只读查询诊断证据。",
+    implementation_version="1.1.0",
     api_major=1,
     api_version="1",
     capabilities=["database", "read_only_sql", "schema_description"],

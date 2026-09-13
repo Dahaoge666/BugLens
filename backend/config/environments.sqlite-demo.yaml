@@ -3,10 +3,22 @@ config_version: environments-v1
 plugin_instances:
   sqlite-local:
     plugin_id: sqlite
+    environment_id: staging
     enabled: true
     config:
       root_path: data/environments
       health_path: staging.sqlite
+    default_limits:
+      max_results: 200
+      timeout_seconds: 10
+      max_bytes: 65536
+  sqlite-production:
+    plugin_id: sqlite
+    environment_id: production
+    enabled: true
+    config:
+      root_path: data/environments
+      health_path: production.sqlite
     default_limits:
       max_results: 200
       timeout_seconds: 10
@@ -62,7 +74,7 @@ sources:
       denied_columns: [payment_token]
   production-orders-db:
     kind: database
-    plugin_instance_id: sqlite-local
+    plugin_instance_id: sqlite-production
     environment_id: production
     service_ids: [order-api-production]
     config:

@@ -709,6 +709,7 @@ class AnalyzeInput(StrictModel):
 
 class InvestigationInput(StrictModel):
     analysis: ProblemAnalysis
+    connector_guides: list[dict[str, Any]] = Field(default_factory=list, max_length=24)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
     target: ResolvedTarget | None = None
@@ -786,6 +787,7 @@ class NativeDiagnosisInput(StrictModel):
     """
 
     question: str = Field(min_length=1, max_length=12_000)
+    connector_guides: list[dict[str, Any]] = Field(default_factory=list, max_length=24)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
     target: ResolvedTarget | None = None

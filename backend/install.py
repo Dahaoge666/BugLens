@@ -32,6 +32,8 @@ def install(runtime_root: Path) -> Path:
         "--no-dev",
         "--extra",
         "web",
+        "--extra",
+        "plugins",
     ]
     print("Installing backend dependencies...")
     subprocess.run(command, cwd=BACKEND_ROOT, env=environment, check=True)

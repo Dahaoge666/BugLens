@@ -8,6 +8,9 @@ for package_root in (
     ROOT / "plugin-api",
     ROOT / "plugins" / "sqlite",
     ROOT / "plugins" / "file-logs",
+    ROOT / "plugins" / "postgresql",
+    ROOT / "plugins" / "ssh",
+    ROOT / "plugins" / "ssh-logs",
 ):
     value = str(package_root)
     if value not in sys.path:

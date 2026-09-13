@@ -7,7 +7,7 @@
 uv 会按 `uv.lock` 选择可用的 Python 3.11+ 解释器并创建、同步隔离环境：
 
 ```powershell
-uv sync --locked --extra dev --extra web
+uv sync --locked --extra dev --extra web --extra plugins
 ```
 
 只安装给原生运行管理器使用的生产后端环境时，执行：
@@ -52,7 +52,7 @@ CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。
 
 默认工具关闭且不需要审批。接入显式 `needs_approval=True` 的只读工具时，请设置 `BUGLENS_RUN_STATE_KEY`；它用于加密 SDK 恢复状态，必须在跨进程恢复审批的服务实例间一致。
 
-多环境插件规范见 [environment-plugin-spec.md](docs/environment-plugin-spec.md)。参考插件分别位于 `../plugins/sqlite` 和 `../plugins/file-logs`，需要独立构建/安装 wheel；设置 `BUGLENS_ENVIRONMENTS_CONFIG` 后，配置目录仍默认不向 Agent 暴露，必须在 profile 中显式打开只读工具。
+多环境插件规范见 [environment-plugin-spec.md](docs/environment-plugin-spec.md)。`--extra plugins` 安装仓库内 SQLite、文件日志、PostgreSQL、SSH 主机诊断和 SSH 日志五个独立插件包；原生安装器也安装此 extra。后端最小安装可省略它，需要的插件也可以单独安装 wheel。安装只使连接器出现在目录中，实际接入由环境与子服务按需配置；设置 `BUGLENS_ENVIRONMENTS_CONFIG` 后，配置目录仍默认不向 Agent 暴露，必须在 profile 中显式打开只读工具。远程连接示例见 `config/environments.remote.example.yaml`，各插件的认证与限制说明位于对应 `plugins/*/README.md`。
 
 新增数据源优先复用 `CapabilityRegistry` 的稳定能力 ID，并在实例的 `transport` 中选择 `driver`、MCP、CLI JSON-over-stdio 或固定 SSH 探针。这样知识库、日志、数据库、流量查询只需增加 source 配置或连接器映射；抓包等采集动作不属于当前只读工具面，必须另走审批作业。
 

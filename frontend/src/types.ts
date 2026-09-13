@@ -53,6 +53,12 @@ export type EnvironmentList = {
 
 export type PluginView = {
   plugin_id: string
+  display_name?: string | null
+  category?: string
+  description?: string
+  supported_transports?: ('driver' | 'mcp' | 'cli' | 'ssh')[]
+  default_transport?: 'driver' | 'mcp' | 'cli' | 'ssh'
+  usage_template?: Record<string, unknown>
   implementation_version: string
   api_major: number
   capabilities: string[]
@@ -63,7 +69,8 @@ export type PluginView = {
   source_config_schema: Record<string, unknown>
 }
 
-export type PluginList = { items: PluginView[] }
+export type PluginCategory = { id: string; display_name: string; description: string }
+export type PluginList = { items: PluginView[]; categories?: PluginCategory[] }
 
 export type PluginHealth = {
   status: 'ok' | 'degraded' | 'error'

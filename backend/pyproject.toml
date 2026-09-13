@@ -19,7 +19,7 @@ dependencies = [
   "cryptography>=42,<47",
   "pydantic>=2.8,<3",
   "PyYAML>=6,<7",
-  "buglens-plugin-api>=1,<2",
+  "buglens-plugin-api>=1.1,<2",
   "jsonschema>=4.20,<5",
 ]
 
@@ -36,11 +36,23 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv.sources]
 buglens-plugin-api = { path = "../plugin-api" }
+buglens-sqlite-plugin = { path = "../plugins/sqlite" }
+buglens-file-logs-plugin = { path = "../plugins/file-logs" }
+buglens-postgresql-plugin = { path = "../plugins/postgresql" }
+buglens-ssh-plugin = { path = "../plugins/ssh" }
+buglens-ssh-logs-plugin = { path = "../plugins/ssh-logs" }
 
 [tool.setuptools.packages.find]
 include = ["app*"]
 
 [project.optional-dependencies]
+plugins = [
+  "buglens-sqlite-plugin>=1.1,<2",
+  "buglens-file-logs-plugin>=1.1,<2",
+  "buglens-postgresql-plugin>=1,<2",
+  "buglens-ssh-plugin>=1,<2",
+  "buglens-ssh-logs-plugin>=1,<2",
+]
 web = [
   "uvicorn>=0.30,<1",
 ]
@@ -49,6 +61,9 @@ dev = [
   "pytest>=8,<9",
   "pytest-asyncio>=0.24,<1",
   "ruff>=0.16,<1",
+  "pglast>=7,<9",
+  "psycopg[binary]>=3.2,<4",
+  "paramiko>=3.5,<5",
 ]
 
 [tool.pytest.ini_options]

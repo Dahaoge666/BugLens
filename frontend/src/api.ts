@@ -153,11 +153,52 @@ export function applyAdminEnvironmentConfig(payload: { config: Record<string, un
     headers: { 'content-type': 'application/json', accept: 'application/json', ...authHeaders() },
     body: JSON.stringify(payload),
   }).then(async (response) => {
-    if (!response.ok) throw new Error(`环境配置保存失败（${response.status}）`)
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({})) as { message?: string }
+      throw new PluginConfigError(error.message ?? `环境配置保存失败（${response.status}）`, response.status)
+    }
     return response.json() as Promise<EnvironmentConfig>
   })
 }
 
 function authHeaders(): Record<string, string> {
   return adminToken ? { authorization: `Bearer ${adminToken}` } : {}
+}
+
+export class PluginConfigError extends Error {
+  constructor(message: string, public status: number) { super(message) }
+}
+
+export async function saveAdminPluginInstance(payload: { instance: Record<string, unknown>; sources: Record<string, unknown>[]; expected_revision: string; secret_updates: Record<string, { action: 'set' | 'clear'; value?: string }> }, existingId?: string) {
+  return mutatePluginInstance(existingId ? `/${encodeURIComponent(existingId)}` : '', existingId ? 'PUT' : 'POST', payload)
+}
+
+export async function deleteAdminPluginInstance(instanceId: string, expectedRevision: string) {
+  return mutatePluginInstance(`/${encodeURIComponent(instanceId)}`, 'DELETE', { expected_revision: expectedRevision })
+}
+
+export async function saveAdminService(payload: { service: Record<string, unknown>; expected_revision: string }, existingId?: string) {
+  const response = await fetch(`${baseUrl}/v1/admin/services${existingId ? `/${encodeURIComponent(existingId)}` : ''}`, {
+    method: existingId ? 'PUT' : 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({})) as { message?: string }
+    throw new PluginConfigError(error.message ?? `子服务保存失败（${response.status}）`, response.status)
+  }
+  return response.json() as Promise<EnvironmentConfig>
+}
+
+async function mutatePluginInstance(path: string, method: string, payload: unknown) {
+  const response = await fetch(`${baseUrl}/v1/admin/plugin-instances${path}`, {
+    method,
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({})) as { message?: string }
+    throw new PluginConfigError(error.message ?? `插件配置保存失败（${response.status}）`, response.status)
+  }
+  return response.json() as Promise<EnvironmentConfig>
 }

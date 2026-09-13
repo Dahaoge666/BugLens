@@ -150,6 +150,7 @@ def _catalog(output: Path) -> dict[str, Any]:
         "plugin_instances": {
             "staging-sqlite": {
                 "plugin_id": "sqlite",
+                "environment_id": "staging",
                 "enabled": True,
                 "config": {
                     "root_path": path_for("staging", "db"),
@@ -163,6 +164,7 @@ def _catalog(output: Path) -> dict[str, Any]:
             },
             "staging-file-logs": {
                 "plugin_id": "file_logs",
+                "environment_id": "staging",
                 "enabled": True,
                 "config": {
                     "root_path": path_for("staging", "logs"),
@@ -178,6 +180,7 @@ def _catalog(output: Path) -> dict[str, Any]:
             },
             "production-sqlite": {
                 "plugin_id": "sqlite",
+                "environment_id": "production",
                 "enabled": True,
                 "config": {
                     "root_path": path_for("production", "db"),
@@ -191,6 +194,7 @@ def _catalog(output: Path) -> dict[str, Any]:
             },
             "production-file-logs": {
                 "plugin_id": "file_logs",
+                "environment_id": "production",
                 "enabled": True,
                 "config": {
                     "root_path": path_for("production", "logs"),

@@ -1,0 +1,19 @@
+[project]
+name = "buglens-postgresql-plugin"
+version = "1.0.0"
+description = "Bounded read-only PostgreSQL diagnosis plugin for BugLens"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = []
+dependencies = ["buglens-plugin-api>=1.1,<2", "psycopg[binary]>=3.2,<4", "pglast>=7,<9"]
+
+[project.entry-points."buglens.tool_plugins"]
+postgresql = "buglens_postgresql_plugin:plugin_factory"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["buglens_postgresql_plugin*"]

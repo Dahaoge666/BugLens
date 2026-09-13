@@ -29,6 +29,82 @@ from .models import (
     StrictModel,
     TargetSpec,
 )
+from .security import sanitize_data
+
+ConnectorOperation = Literal[
+    "describe_database",
+    "query_database",
+    "search_logs",
+    "inspect_host",
+    "search_knowledge",
+    "search_traffic",
+]
+
+
+class ConnectorUsageExample(StrictModel):
+    operation: ConnectorOperation
+    request: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bound_request(self) -> ConnectorUsageExample:
+        try:
+            size = len(
+                json.dumps(self.request, ensure_ascii=False, allow_nan=False).encode(
+                    "utf-8"
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "connector usage example must contain JSON values"
+            ) from exc
+        if size > 2_048:
+            raise ValueError("connector usage example must be at most 2048 bytes")
+        object.__setattr__(self, "request", sanitize_data(self.request))
+        self.request.pop("source_id", None)
+        allowed = {
+            "describe_database": {"table_pattern"},
+            "query_database": {"sql", "parameters", "purpose"},
+            "search_logs": {
+                "start_time",
+                "end_time",
+                "text_query",
+                "service_ids",
+                "node_ids",
+                "levels",
+                "correlation_ids",
+                "cursor",
+            },
+            "inspect_host": {"check"},
+            "search_knowledge": {"query", "top_k", "filters", "cursor"},
+            "search_traffic": {
+                "start_time",
+                "end_time",
+                "text_query",
+                "service_ids",
+                "node_ids",
+                "correlation_ids",
+                "cursor",
+            },
+        }
+        if set(self.request) - allowed[self.operation]:
+            raise ValueError(f"unknown request parameters for {self.operation}")
+        return self
+
+
+class ConnectorUsage(StrictModel):
+    """Non-secret reference material, never authority or diagnosis evidence."""
+
+    name: str = Field(default="", max_length=128)
+    description: str = Field(default="", max_length=2_000)
+    when_to_use: str = Field(default="", max_length=2_000)
+    instructions: str = Field(default="", max_length=4_096)
+    examples: list[ConnectorUsageExample] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def redact_reference(self) -> ConnectorUsage:
+        for field in ("name", "description", "when_to_use", "instructions"):
+            object.__setattr__(self, field, sanitize_data(getattr(self, field)).strip())
+        return self
 
 
 class EnvironmentConfigError(ValueError):
@@ -204,11 +280,14 @@ class PluginInstanceConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     plugin_id: str = Field(min_length=1, max_length=128)
+    environment_id: str | None = Field(default=None, min_length=1, max_length=128)
+    service_id: str | None = Field(default=None, min_length=1, max_length=128)
     enabled: bool = True
     # Plugin-specific non-secret settings.  Credentials stay in separate
     # fields so the admin API can update them independently and redact them.
     config: dict[str, Any] = Field(default_factory=dict)
     transport: TransportConfig = Field(default_factory=TransportConfig)
+    usage: ConnectorUsage = Field(default_factory=ConnectorUsage)
     username: str | None = Field(
         default=None,
         max_length=512,
@@ -341,11 +420,23 @@ class EnvironmentDirectory(StrictModel):
         nodes = unique(self.nodes, "node")
         sources = unique(self.sources, "source")
         for instance in instances.values():
+            if instance.environment_id and instance.environment_id not in environments:
+                raise EnvironmentConfigError(
+                    f"plugin instance {instance.id} references unknown environment "
+                    f"{instance.environment_id}"
+                )
             _reject_credential_uris(
                 instance.config, f"plugin instance {instance.id} config"
             )
         for source in sources.values():
             _reject_credential_uris(source.config, f"source {source.id} config")
+        for instance in instances.values():
+            if instance.service_id:
+                service = services.get(instance.service_id)
+                if service is None or service.environment_id != instance.environment_id:
+                    raise EnvironmentConfigError(
+                        f"plugin instance {instance.id} service must belong to its environment"
+                    )
         if not environments and (services or nodes or sources):
             raise EnvironmentConfigError(
                 "services, nodes and sources require at least one environment"
@@ -410,6 +501,13 @@ class EnvironmentDirectory(StrictModel):
                 if nodes[item].environment_id
             }
             associated_environments.discard(None)
+            instance = instances[source.plugin_instance_id]
+            if instance.service_id and instance.service_id not in source.service_ids:
+                raise EnvironmentConfigError(
+                    f"source {source.id} must include its plugin instance service"
+                )
+            if instance.environment_id:
+                associated_environments.add(instance.environment_id)
             if source.environment_id:
                 associated_environments.add(source.environment_id)
                 if len(associated_environments) > 1:
@@ -432,6 +530,25 @@ class EnvironmentDirectory(StrictModel):
                 raise EnvironmentConfigError(
                     f"source {source.id} must identify an environment"
                 )
+        for instance in instances.values():
+            source_environments = {
+                source.environment_id
+                for source in sources.values()
+                if source.plugin_instance_id == instance.id
+            }
+            if len(source_environments) > 1:
+                raise EnvironmentConfigError(
+                    f"plugin instance {instance.id} mixes environments; "
+                    "create a separate instance for each environment"
+                )
+            if not instance.environment_id:
+                if source_environments:
+                    environment_id = next(iter(source_environments))
+                elif len(environments) == 1:
+                    environment_id = next(iter(environments))
+                else:
+                    continue
+                object.__setattr__(instance, "environment_id", environment_id)
         return self
 
 
@@ -467,8 +584,10 @@ class SnapshotPluginInstance(StrictModel):
 
     id: str
     plugin_id: str
+    service_id: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     transport: TransportConfig = Field(default_factory=TransportConfig)
+    usage: ConnectorUsage = Field(default_factory=ConnectorUsage)
     default_limits: ToolLimits = Field(default_factory=ToolLimits)
 
 
@@ -521,7 +640,108 @@ class ResolvedEnvironmentSnapshot(StrictModel):
                 }
                 for item in self.sources
             ],
+            "connector_guides": self.connector_guides(),
         }
+
+    def connector_guides(self) -> list[dict[str, Any]]:
+        """Project pinned guidance through the same read-only source vocabulary."""
+        from .capabilities import CapabilityRegistry
+
+        registry = CapabilityRegistry.default()
+        guides: list[dict[str, Any]] = []
+        remaining_bytes = 16_382
+        ordered_sources = sorted(
+            self.sources,
+            key=lambda source: (
+                self.primary_service_id not in source.service_ids
+                if self.primary_service_id
+                else False
+            ),
+        )
+        for source in ordered_sources:
+            instance = self.plugin_instance(source.plugin_instance_id)
+            if instance is None or not instance.usage.description:
+                continue
+            specs = [
+                spec
+                for spec in registry.for_source(source.kind)
+                if spec.effect == "read_only"
+                and (
+                    not source.capabilities
+                    or spec.id in source.capabilities
+                    or spec.operation in source.capabilities
+                    or source.kind in source.capabilities
+                    or "*" in source.capabilities
+                )
+                and (
+                    instance.transport.type != "mcp"
+                    or not instance.transport.tool_map
+                    or spec.operation in instance.transport.tool_map
+                )
+            ]
+            operations = {spec.operation for spec in specs}
+            if not operations:
+                continue
+            guide = instance.usage.model_dump(mode="json", exclude={"examples"})
+            guide.update(
+                source_id=source.id,
+                kind=source.kind,
+                available_operations=[spec.tool_name for spec in specs],
+                examples=[
+                    {
+                        "tool_name": example.operation,
+                        "arguments": {
+                            **sanitize_data(example.request),
+                            "source_id": source.id,
+                        },
+                    }
+                    for example in instance.usage.examples
+                    if example.operation in operations
+                ],
+            )
+            truncated = False
+            for field, limit in (
+                ("description", 1_500),
+                ("when_to_use", 1_000),
+                ("instructions", 3_500),
+            ):
+                encoded = guide[field].encode("utf-8")
+                if len(encoded) > limit:
+                    guide[field] = encoded[:limit].decode("utf-8", "ignore")
+                    truncated = True
+            if instance.plugin_id == "ssh" and instance.transport.type == "driver":
+                checks = source.config.get(
+                    "checks", ["system", "uptime", "disk", "memory", "processes"]
+                )
+                allowed_checks = [
+                    check
+                    for check in checks
+                    if check in {"system", "uptime", "disk", "memory", "processes"}
+                ]
+                guide["allowed_checks"] = allowed_checks
+                for example in guide["examples"]:
+                    if (
+                        allowed_checks
+                        and example["arguments"].get("check", "system")
+                        not in allowed_checks
+                    ):
+                        example["arguments"]["check"] = allowed_checks[0]
+            while (
+                len(json.dumps(guide, ensure_ascii=False).encode("utf-8")) > 8_192
+                and guide["examples"]
+            ):
+                guide["examples"].pop()
+                truncated = True
+            if truncated:
+                guide["truncated"] = True
+            size = len(json.dumps(guide, ensure_ascii=False).encode("utf-8")) + 2
+            if size > remaining_bytes:
+                continue
+            guides.append(guide)
+            remaining_bytes -= size
+            if len(guides) == 24:
+                break
+        return guides
 
 
 def _normalize(value: str | None) -> str:
@@ -934,8 +1154,10 @@ class EnvironmentRepository:
             SnapshotPluginInstance(
                 id=instance.id,
                 plugin_id=instance.plugin_id,
+                service_id=instance.service_id,
                 config=_remove_secrets(copy.deepcopy(instance.config)),
                 transport=instance.transport,
+                usage=instance.usage.model_copy(deep=True),
                 default_limits=instance.default_limits,
             )
             for instance in directory.plugin_instances
@@ -1000,7 +1222,28 @@ class EnvironmentRepository:
                     "environment config is not writable without BUGLENS_ENVIRONMENTS_CONFIG"
                 )
             incoming = self._merge_secret_updates(raw, secret_updates)
-            return self.validate_raw(incoming)
+            directory = self.validate_raw(incoming)
+            current_instances = {
+                item.id: item for item in self._directory.plugin_instances
+            }
+            for instance in directory.plugin_instances:
+                old = current_instances.get(instance.id)
+                if old and (
+                    old.plugin_id != instance.plugin_id
+                    or (
+                        old.environment_id is not None
+                        and old.environment_id != instance.environment_id
+                    )
+                    or (
+                        old.service_id is not None
+                        and old.service_id != instance.service_id
+                    )
+                ):
+                    raise EnvironmentConfigError(
+                        f"plugin instance {instance.id} identity cannot be changed; "
+                        "create a new instance"
+                    )
+            return directory
 
     def _merge_secret_updates(
         self,

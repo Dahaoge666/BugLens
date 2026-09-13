@@ -6,6 +6,17 @@ config_version: environments-v1
 plugin_instances:
   sqlite-local:
     plugin_id: sqlite
+    environment_id: staging
+    enabled: true
+    config:
+      root_path: data/environments
+    default_limits:
+      max_results: 200
+      timeout_seconds: 10
+      max_bytes: 65536
+  sqlite-production:
+    plugin_id: sqlite
+    environment_id: production
     enabled: true
     config:
       root_path: data/environments
@@ -15,6 +26,20 @@ plugin_instances:
       max_bytes: 65536
   file-logs-local:
     plugin_id: file_logs
+    environment_id: staging
+    enabled: true
+    config:
+      root_path: data/logs
+      encodings: [utf-8, utf-8-sig, latin-1]
+    default_limits:
+      max_results: 200
+      timeout_seconds: 10
+      max_bytes: 65536
+      max_scan_files: 100
+      max_scan_bytes: 16777216
+  file-logs-production:
+    plugin_id: file_logs
+    environment_id: production
     enabled: true
     config:
       root_path: data/logs
@@ -30,6 +55,7 @@ plugin_instances:
   # do not require a Python plugin wheel. Uncomment one and bind a source below.
   # knowledge-mcp:
   #   plugin_id: vendor-knowledge
+  #   environment_id: production
   #   transport:
   #     type: mcp
   #     url: https://knowledge.example/mcp
@@ -37,12 +63,14 @@ plugin_instances:
   #     credentials_ref: secret://buglens/knowledge
   # traffic-cli:
   #   plugin_id: vendor-traffic
+  #   environment_id: production
   #   transport:
   #     type: cli
   #     command: /opt/buglens/bin/traffic-connector
   #     args: [--stdio]
   # traffic-ssh:
   #   plugin_id: vendor-traffic-ssh
+  #   environment_id: production
   #   transport:
   #     type: ssh
   #     host: probe-01.example
@@ -103,7 +131,7 @@ sources:
   production-orders-db:
     kind: database
     capabilities: [database.describe.v1, database.query.v1]
-    plugin_instance_id: sqlite-local
+    plugin_instance_id: sqlite-production
     environment_id: production
     service_ids: [order-api-production]
     config:
@@ -122,7 +150,7 @@ sources:
   production-order-logs:
     kind: logs
     capabilities: [logs.search.v1]
-    plugin_instance_id: file-logs-local
+    plugin_instance_id: file-logs-production
     environment_id: production
     service_ids: [order-api-production]
     node_ids: [order-production-1]

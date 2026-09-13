@@ -84,10 +84,3 @@ AgentCommand = (
     | ApproveTool
     | RejectTool
 )
-
-
-def command_from_json(value: str) -> AgentCommand:
-    """Parse a command strictly after selecting its discriminating field."""
-    from pydantic import TypeAdapter
-
-    return TypeAdapter(AgentCommand).validate_json(value)

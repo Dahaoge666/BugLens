@@ -3,6 +3,7 @@ config_version: environments-v1
 plugin_instances:
   sqlite-local:
     plugin_id: sqlite
+    environment_id: staging
     enabled: true
     config:
       root_path: data/environments
@@ -13,6 +14,7 @@ plugin_instances:
       max_bytes: 65536
   file-logs-local:
     plugin_id: file_logs
+    environment_id: staging
     enabled: true
     config:
       root_path: data/logs

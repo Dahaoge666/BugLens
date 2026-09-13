@@ -4,6 +4,9 @@
 
 ## 条目
 
+- [0009 — 清理未使用代码](0009-unused-code-cleanup.md)
+- [0008 — 连接方式与节点使用说明](0008-connector-transports-and-usage.md)
+- [0007 — 按子服务分类接入插件](0007-service-scoped-plugin-integrations.md)
 - [0006 — 代码与文档清理](0006-code-and-documentation-cleanup.md)
 - [0005 — 自主探索模式](0005-autonomous-exploration-mode.md)
 - [0004 — 生命周期与审批恢复](0004-graph-lifecycle-and-approval-recovery.md)

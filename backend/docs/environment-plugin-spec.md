@@ -43,7 +43,10 @@ BugLens 核心拥有模型、Agent、工具 Schema、目标确认、调用预算
 ```text
 plugin-api/                 # buglens-plugin-api，只有 Pydantic 协议
 plugins/sqlite/             # buglens-plugin-sqlite 参考插件
-plugins/file-logs/          # buglens-plugin-file-logs 参考插件
+plugins/file-logs/          # 文件日志
+plugins/postgresql/         # PostgreSQL 数据库
+plugins/ssh/                # SSH 固定主机检查
+plugins/ssh-logs/           # SFTP 远程日志
 backend/app/plugins.py      # 核心发现、注册、调用和审计桥接
 ```
 
@@ -88,6 +91,7 @@ Agent 依赖的是稳定的能力 ID，而不是供应商插件 ID。内置能�
 | `database.describe.v1` | `describe_database` | `database` |
 | `database.query.v1` | `query_database` | `database` |
 | `logs.search.v1` | `search_logs` | `logs` |
+| `host.inspect.v1` | `inspect_host` | `host` |
 | `knowledge.search.v1` | `search_knowledge` | `knowledge` |
 | `traffic.search.v1` | `search_traffic` | `traffic` |
 
@@ -134,6 +138,7 @@ config_version: environments-v1
 plugin_instances:
   sqlite-local:
     plugin_id: sqlite
+    environment_id: staging
     enabled: true
     config:
       root_path: ./data
@@ -202,7 +207,13 @@ sources:
 - `EnvironmentConfig.id`/`tags[deployment.environment.name]` 对应 `deployment.environment.name`；
 - `region`、`timezone` 和 `tags` 保存部署区域及其他 resource attributes。
 
-一个 source 只能属于一个环境。它可以关联该环境内多个服务和节点；一次 run 可以访问确认环境内的多个 source，但绝不能访问其他环境的 source。没有环境快照的旧 run 不会自动获得外部工具。
+`plugin_id` 标识已安装插件类型，`PluginInstanceConfig.id` 标识一次独立接入。同一插件可在同一环境或不同环境接入多次，每次使用不同实例 ID；实例拥有自己的 `environment_id`、可选 `service_id`、连接配置、transport、凭据、默认限制和运行时对象，不能跨环境共用。注册插件对象时复制其可变状态；不能安全复制的连接器应提供实例 factory/create 方法。
+
+管理接入按环境与子服务组织。实例声明 `service_id` 时，该服务必须属于同环境，每个 source 必须包含其 ID；其他同环境关联用于诊断线索。历史实例没有此字段时保持兼容，旧 run 快照也可继续恢复。服务和单实例 API、分类元数据字段以根级[前后端契约](../../frontend-backend-contract.md)为准；类别是展示信息，能力网关仍独立判断访问权限。
+
+一个 source 只能属于一个环境，并且必须属于其插件实例的环境。它可以关联该环境内多个服务和节点；一次 run 可以访问确认环境内的多个 source，但绝不能访问其他环境的 source。没有环境快照的旧 run 不会自动获得外部工具。
+
+兼容旧目录时，未声明实例 `environment_id` 会从其唯一的数据源环境推导，单环境目录也可自动归属；多环境目录中没有数据源的旧实例可以保持未绑定。新接入 API 必须显式指定环境。同一旧实例被多个环境共用时，校验拒绝；需要为各环境创建独立实例，并修改对应 source 的 `plugin_instance_id`。仓库示例目录已拆分。已有实例 ID 的插件类型、环境和已绑定的子服务归属不可变，需要新建实例来迁移；恢复时也会检查当前实例仍属于原快照环境，再读取该实例的当前凭据。
 
 ## 4. 目标选择、确认与恢复
 
@@ -243,6 +254,7 @@ query_database(source_id, sql, parameters, purpose)
 search_logs(source_id, service_ids?, node_ids?, start_time, end_time,
             text_query, levels?, correlation_ids?, cursor?)
 search_knowledge(source_id, query, top_k?, filters?, cursor?)
+inspect_host(source_id, check?)
 search_traffic(source_id, start_time, end_time, text_query?,
                service_ids?, node_ids?, correlation_ids?, cursor?)
 ```
@@ -291,9 +303,21 @@ Agent 不传递环境 ID、插件 ID、连接地址、文件路径、用户名�
 - 返回相对路径和行号 locator，不返回任意主机绝对路径；
 - 普通文本按行解析为 message，JSON Lines 提取 timestamp、level、service、node、correlation ID 等安全字段。
 
+### 6.3 PostgreSQL
+
+`buglens-postgresql-plugin` 使用 Psycopg 3 的独立只读事务与 RawServerCursor。首条 SQL 前设置 `read_only`，固定事务内 search_path、statement_timeout 和 lock_timeout；所有调用结束后回滚并关闭。pglast 解析单条 SELECT，包括只读 CTE；拒绝写入 CTE、SELECT INTO、锁、表函数和外部访问函数，限制 Schema、表与列，允许的内置函数显式限定到 pg_catalog。命名参数转换成原生绑定，按行数、输出字节和 deadline 返回。元数据查询也筛选表与列。数据库角色只授予所需 SELECT 权限；数据库端视图、类型、操作符与规则不由插件管理。
+
+### 6.4 SSH 主机诊断
+
+`buglens-ssh-plugin` 提供 `host.inspect.v1`，核心暴露 `inspect_host(source_id, check)`。固定 Linux 检查包括系统、uptime、磁盘、内存与有限进程字段；source 的 checks 列表限制允许集合。Agent 无法传任意命令、地址或文件路径。连接用 Paramiko，验证 known_hosts、拒绝自动信任未知主机，不申请 PTY；输出受行数、字节、deadline 限制，所有通道和连接按调用关闭。与已有 SSH JSON 探针 transport 区分，主机检查无需安装远端探针。
+
+### 6.5 SSH 日志
+
+`buglens-ssh-logs-plugin` 用 SFTP 以 rb 打开远端文件，不调用远端 shell、不建立下载缓存，复用文件日志的 `scan_paths` 解析与筛选。root 是远端绝对目录，选择器只能是相对文件名或文件名通配符；拒绝目录穿越、递归匹配和文件/中间目录符号链接，并检查规范化位置仍在 root 内。目录枚举次数、扫描文件、实际读取字节、返回条数/字节和 deadline 均有上限；枚举截断时不承诺完整分页。凭据与同主机的其他接入独立。
+
 Loki、Elastic、远程日志代理、向量检索和流量平台等后续接入优先复用 `mcp`/`cli`/`ssh` transport，不改变 Agent 工具 Schema 或 run 生命周期；只有需要本地 SDK 的实现才新增 `ToolPlugin` 驱动。
 
-### 6.3 知识库与流量
+### 6.6 知识库与流量
 
 `search_knowledge` 只接受有限长度的 query、`top_k`（1–100）和结构化 filters；返回结果应包含文档/段落级可引用 ID，不返回连接凭据或任意管理链接。`search_traffic` 必须使用绝对时间，窗口不超过 24 小时，各类 service/node/correlation filter 最多 100 项。原始报文、PCAP 或大字段必须由连接器按 `max_bytes` 截断并返回引用，不应直接灌入模型上下文。
 
@@ -376,21 +400,22 @@ Checkpoint Schema 为 v3：
 | SQLite | DML/DDL/ATTACH/危险 PRAGMA/多语句/锁/超时/表列白名单 |
 | 日志 | 目录穿越、符号链接、轮转、编码、时间窗口和扫描限制 |
 | Admin | validate 不写入、原子回滚、If-Match 冲突、secret 只返回 `is_set` |
-| 构建 | 后端 wheel、`buglens-plugin-api` wheel、SQLite wheel、file-logs wheel 独立构建 |
+| 构建 | 后端、公共 API 和五个插件 wheel 独立构建 |
 
 本地验证命令：
 
 ```powershell
 cd backend
-uv sync --locked --extra dev --extra web
-uv run ruff check app tests
-uv run ruff format --check app tests
-uv run pytest -q
+uv sync --locked --extra dev --extra web --extra plugins
+uv run --extra dev --extra web --extra plugins ruff check app tests scripts ../plugin-api ../plugins
+uv run --extra dev --extra web --extra plugins ruff format --check app tests scripts ../plugin-api ../plugins
+uv run --extra dev --extra web --extra plugins pytest -q
 uv build
 
 cd ../frontend
 pnpm install --frozen-lockfile
 pnpm typecheck
+pnpm test
 pnpm build
 
 cd ../plugin-api
@@ -399,6 +424,18 @@ cd ../plugins/sqlite
 python -m build --wheel
 cd ../file-logs
 python -m build --wheel
+cd ../postgresql
+python -m build --wheel
+cd ../ssh
+python -m build --wheel
+cd ../ssh-logs
+python -m build --wheel
 ```
 
-默认 profile 和启动环境不启用外部工具；参考插件只有在独立安装 wheel、配置环境目录并将 profile 的 `tools.enabled` 打开后才参与诊断。
+默认 profile 和启动环境不启用外部工具；参考插件只有在通过 plugins extra 或独立 wheel 安装、配置环境目录并将 profile 的 `tools.enabled` 打开后才参与诊断。
+
+## 11. 连接器参考上下文
+
+内置驱动与 MCP/CLI/固定 SSH 传输使用同一源类型和只读能力词汇。非 driver 传输跳过原生配置 Schema；已安装插件仍保留其能力范围，未安装的声明式连接器只通过核心已注册操作调用。Admin 内置自定义连接器目录项无需 entry point，重复接入仍由 instance ID 隔离。
+
+`ConnectorUsage` 是实例的非敏感参考材料，字段与公共投影定义在根级契约。创建快照时复制说明；`ResolvedEnvironmentSnapshot.connector_guides()` 只投影可用源、只读能力和映射，并限制大小。`with_connector_guides()` 在 OpenAINodeRunner 和 NativeDiagnosisRunner 调用 SDK 前将该投影附到用户输入，不改变 Graph、不读取当前目录。SDK 审批恢复继续使用已保存 RunState 中的输入，普通恢复重新从原 run 快照投影。说明仅帮助工具选择和参数填写，不能改变授权、诊断规则或独立评测；仍需实际 ToolResult 和 evidence ID 支持结论。

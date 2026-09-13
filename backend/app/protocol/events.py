@@ -282,7 +282,3 @@ AgentEvent = (
     | RunFailed
     | RunCanceled
 )
-
-
-def event_to_json(event: AgentEvent) -> str:
-    return event.model_dump_json()

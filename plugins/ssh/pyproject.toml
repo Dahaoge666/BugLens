@@ -1,0 +1,19 @@
+[project]
+name = "buglens-ssh-plugin"
+version = "1.0.0"
+description = "Fixed read-only SSH host inspection for BugLens"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = []
+dependencies = ["buglens-plugin-api>=1.1,<2", "paramiko>=3.5,<5"]
+
+[project.entry-points."buglens.tool_plugins"]
+ssh = "buglens_ssh_plugin:plugin_factory"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["buglens_ssh_plugin*"]

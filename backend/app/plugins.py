@@ -63,7 +63,7 @@ class PluginConfigError(PluginError):
     code = "plugin_config_invalid"
 
 
-_TRANSPORT_PLUGIN_IDS = frozenset({"mcp", "cli", "ssh"})
+_TRANSPORT_PLUGIN_IDS = frozenset({"mcp", "cli", "ssh", "connector"})
 
 
 @dataclass(frozen=True)
@@ -190,7 +190,9 @@ class PluginManager:
             )
         if manifest.plugin_id in self._registrations:
             raise PluginDiscoveryError(f"duplicate plugin id: {manifest.plugin_id}")
-        if callable(plugin) and not hasattr(plugin, "execute"):
+        if inspect.isclass(plugin) or (
+            callable(plugin) and not hasattr(plugin, "execute")
+        ):
             factory = plugin
         else:
             prototype = plugin
@@ -198,7 +200,12 @@ class PluginManager:
             def factory(config: dict[str, Any], prototype: Any = prototype) -> Any:
                 if hasattr(prototype, "create") and callable(prototype.create):
                     return prototype.create(config)
-                instance = copy.copy(prototype)
+                try:
+                    instance = copy.deepcopy(prototype)
+                except (TypeError, ValueError) as exc:
+                    raise PluginConfigError(
+                        "plugin must provide a factory/create method for isolated instances"
+                    ) from exc
                 if hasattr(instance, "configure") and callable(instance.configure):
                     instance.configure(config)
                 elif hasattr(instance, "instance_config"):
@@ -221,6 +228,10 @@ class PluginManager:
 
         return PluginManifest(
             plugin_id=plugin_id,
+            display_name="自定义 MCP / CLI 连接器"
+            if plugin_id == "connector"
+            else plugin_id,
+            description="接入知识库、流量或其他只读数据，独立配置连接方式和节点使用说明。",
             implementation_version="builtin-transport-v1",
             capabilities=["*"],
             health_check=True,
@@ -236,6 +247,15 @@ class PluginManager:
 
     def manifest_for_instance(self, instance: PluginInstanceConfig) -> PluginManifest:
         if instance.transport.type != "driver":
+            registration = self._registrations.get(instance.plugin_id)
+            if registration is not None:
+                return registration.manifest.model_copy(
+                    update={
+                        "implementation_version": "builtin-transport-v1",
+                        "instance_config_schema": {},
+                        "source_config_schema": {},
+                    }
+                )
             return self._transport_manifest(instance.plugin_id)
         return self.manifest(instance.plugin_id)
 
@@ -266,6 +286,13 @@ class PluginManager:
         source_configs: list[dict[str, Any]] | None = None,
     ) -> None:
         if instance.transport.type != "driver":
+            if instance.plugin_id == "connector" and any(
+                not getattr(instance.usage, field).strip()
+                for field in ("name", "description", "instructions")
+            ):
+                raise PluginConfigError(
+                    "custom connector requires usage name, description and instructions"
+                )
             # Declarative MCP/CLI/SSH instances do not require a Python wheel.
             # The transport config is already strictly validated by Pydantic;
             # its endpoint is checked lazily by health or the first call.
@@ -330,9 +357,7 @@ class PluginManager:
                     f"enabled source {source.id} uses disabled plugin instance "
                     f"{instance.id}"
                 )
-            if instance.transport.type != "driver":
-                continue
-            capabilities = set(self.manifest(instance.plugin_id).capabilities)
+            capabilities = set(self.manifest_for_instance(instance).capabilities)
             required = source.capabilities or [source.kind]
             if not _manifest_supports_source(source.kind, required, capabilities):
                 detail = (
@@ -700,6 +725,19 @@ class EnvironmentToolService:
                             warnings=[request_error],
                         )
                     )
+            elif operation == "inspect_host" and request.get("check", "system") not in {
+                "system",
+                "uptime",
+                "disk",
+                "memory",
+                "processes",
+            }:
+                return _tool_result(
+                    ToolResult(
+                        status=ToolResultStatus.REJECTED,
+                        warnings=["host_check_not_allowed"],
+                    )
+                )
             try:
                 instance = self._current_instance(snapshot, source)
             except PluginError:
@@ -1058,14 +1096,22 @@ class EnvironmentToolService:
             current is None
             or not current.enabled
             or current.plugin_id != source.plugin_id
+            or current.environment_id != snapshot.environment_id
+            or (
+                pinned.service_id is not None
+                and current.service_id != pinned.service_id
+            )
         ):
             raise PluginConfigError("plugin instance is no longer enabled")
         return PluginInstanceConfig(
             id=pinned.id,
             plugin_id=pinned.plugin_id,
+            environment_id=snapshot.environment_id,
+            service_id=pinned.service_id,
             enabled=True,
             config=copy.deepcopy(pinned.config),
             transport=pinned.transport,
+            usage=pinned.usage.model_copy(deep=True),
             username=current.username,
             password=current.password,
             token=current.token,
@@ -1082,6 +1128,7 @@ class EnvironmentToolService:
             "search_logs": "search_logs",
             "search_knowledge": "search_knowledge",
             "search_traffic": "search_traffic",
+            "inspect_host": "inspect_host",
         }
         operation = operation_by_tool.get(tool_name)
         if operation is None or not isinstance(arguments, dict):
@@ -1291,6 +1338,13 @@ class EnvironmentToolRegistry(ToolRegistry):
             nodes={"investigate"},
             strict_mode=False,
         )
+        self.register(
+            self._inspect_host,
+            name="inspect_host",
+            version="environment-tools-v1",
+            nodes={"investigate"},
+            strict_mode=True,
+        )
 
     def tools_for(
         self, *, environment_snapshot_id: str | None = None, **kwargs: Any
@@ -1389,6 +1443,14 @@ class EnvironmentToolRegistry(ToolRegistry):
                 "filters": filters or {},
                 "cursor": cursor,
             },
+        )
+
+    async def _inspect_host(
+        self, context: RunContextWrapper[Any], source_id: str, check: str = "system"
+    ) -> dict[str, Any]:
+        """Read a configured SSH check: system, uptime, disk, memory or processes."""
+        return await self.service.call(
+            "inspect_host", context.context, {"source_id": source_id, "check": check}
         )
 
     async def _search_traffic(

@@ -1,6 +1,6 @@
 [project]
 name = "buglens-plugin-api"
-version = "1.0.1"
+version = "1.1.0"
 description = "Stable read-only plugin protocol for BugLens"
 requires-python = ">=3.11"
 license = "MIT"

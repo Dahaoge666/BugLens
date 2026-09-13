@@ -127,6 +127,12 @@ class CapabilityRegistry:
                     source_kinds=frozenset({"logs"}),
                 ),
                 CapabilitySpec(
+                    id="host.inspect.v1",
+                    tool_name="inspect_host",
+                    operation="inspect_host",
+                    source_kinds=frozenset({"host"}),
+                ),
+                CapabilitySpec(
                     id="knowledge.search.v1",
                     tool_name="search_knowledge",
                     operation="search_knowledge",

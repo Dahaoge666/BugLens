@@ -466,6 +466,11 @@ class McpTransport:
         request: dict[str, Any],
         context: ExecutionContext,
     ) -> ToolResult:
+        if self.tool_map and operation not in self.tool_map:
+            return ToolResult(
+                status=ToolResultStatus.REJECTED,
+                warnings=["mcp_operation_not_mapped"],
+            )
         server = await self._ensure_server()
         tool_name = self._mapped_tool(operation)
         if self._tool_names is not None and tool_name not in self._tool_names:

@@ -12,7 +12,7 @@ React 19、TypeScript、Vite 和原生 CSS 构成静态 SPA；请求使用 `fetc
 | `#tasks` | 任务列表、状态筛选和搜索 |
 | `#sessions` | SDK Session 的只读元数据和关联任务 |
 | `#settings` | 模型与诊断策略配置 |
-| `#environments` | 环境目录、插件信息和连接检查 |
+| `#environments` | 环境与子服务、分类选择插件、单项配置与连接检查 |
 | `#system` | 健康、版本和安装/更新说明 |
 | `#run` | 当前打开的诊断工作台 |
 
@@ -24,11 +24,17 @@ React 19、TypeScript、Vite 和原生 CSS 构成静态 SPA；请求使用 `fetc
 
 ```text
 frontend/src/
-├── App.tsx       # 页面、表单、快照和事件展示
-├── api.ts        # HTTP JSON、Command SSE 和历史事件读取
-├── types.ts      # 公开协议的 TypeScript 视图
-├── styles.css    # 设计变量、全局和页面样式
-└── main.tsx      # React 入口
+├── App.tsx                  # 页面、快照和事件展示
+├── EnvironmentPage.tsx      # 环境 → 子服务 → 插件类别与接入
+├── EnvironmentEditor.tsx    # 环境创建与信息编辑
+├── ServiceEditor.tsx        # 子服务创建、信息编辑与 revision 冲突
+├── PluginInstanceEditor.tsx # 单项接入、凭据、保存与检查
+├── PluginConfigFields.tsx   # Schema 和连接方式的表单字段
+├── pluginForm.ts            # 表单默认值、绑定与输入转换
+├── api.ts                   # HTTP JSON、Command SSE 和历史事件读取
+├── types.ts                 # 公开协议的 TypeScript 视图
+├── styles.css               # 设计变量、全局和页面样式
+└── main.tsx                 # React 入口
 ```
 
 按职责需要拆组件，避免提前创建空目录或引入未使用的依赖。前端不导入 Python，不复制 Graph 路由、节点重试、澄清预算或评测门禁。

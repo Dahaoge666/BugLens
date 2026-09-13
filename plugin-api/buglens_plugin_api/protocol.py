@@ -56,6 +56,9 @@ class PluginManifest(_StrictModel):
     # numeric compatibility gate.  Both forms are accepted by external plugins.
     api_version: str = Field(default=str(PLUGIN_API_MAJOR), min_length=1, max_length=32)
     capabilities: list[str] = Field(default_factory=list, max_length=50)
+    display_name: str | None = Field(default=None, max_length=128)
+    category: str = Field(default="other", min_length=1, max_length=64)
+    description: str = Field(default="", max_length=1_000)
     instance_config_schema: dict[str, JSONValue] = Field(
         default_factory=dict,
         json_schema_extra={"additionalProperties": False},
