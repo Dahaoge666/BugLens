@@ -46,10 +46,14 @@ flowchart LR
 | ConnectorTransport | 用同一个 async `execute/check_health/close` 边界承载 driver、MCP、CLI JSON-over-stdio 和固定 SSH 探针 | 暴露任意 MCP tool、Shell 命令或写操作 |
 | Tool plugin / driver | 在 `buglens.tool_plugins` entry point 下实现确定性的健康检查和只读查询；仅在需要本地 SDK 时使用 | Agent、Runner、模型密钥、CheckpointStore、Shell/SSH、修复 |
 | Store | 原子保存业务状态、state history、Command、Event、节点/工具审计、证据、租约和配置快照 | 保存或解释模型对话 |
+| Diagnosis Memory | 从已完成业务结果确定性整理案例，按范围检索历史指导；由 Runtime 接入、Store 持久化 | 读取 SDK 历史、把历史结论当作当前证据、执行验证或修复 |
+| Guide Application Service | 入口前检索分类指南、手工导入和 revision 更新；Store 从有效 Memory 自动生成指南 | 创建诊断 Run、调用模型、决定 Graph 路由或把历史指南当作本次结论 |
 | SDK Session | 保存一次原生 loop（或兼容 Graph 节点）的模型消息历史 | 业务状态、恢复游标和前端会话 |
 | Admin Service | 健康、能力、配置和只读运维查询 | 调用 Graph 或触发诊断节点 |
 
 ## Agent Graph
+
+CLI/Web 新问题入口先经 ApplicationService 查询分类指南，由提问者确认相似；选择指南时直接展示，无匹配或明确拒绝时才提交原有 StartDiagnosis。入口检索与指南管理不进入 Graph，也不写 SDK Session。生成及检索规则见 [diagnosis-guides.md](diagnosis-guides.md)。
 
 ```text
 NativeDiagnosisGraph.prepare_step
@@ -111,6 +115,7 @@ backend/app/
 ├── infra.py              # SQLite Store
 ├── config.py             # profile 与快照解析
 ├── context.py            # 节点上下文组装
+├── memory.py             # 结构化案例整理与相似问题排序
 ├── tools.py              # 只读工具注册与审计桥接
 ├── capabilities.py       # Agent-facing 能力 ID 与 source family 映射
 ├── transports.py         # driver/MCP/CLI/SSH 统一连接器边界

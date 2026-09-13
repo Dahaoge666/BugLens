@@ -85,6 +85,7 @@ class ContextAssembler:
                 raise ValueError("investigation context requires analysis")
             return InvestigationInput(
                 analysis=state.analysis,
+                memory_matches=state.memory_matches,
                 context=self.context(state),
                 evidence=evidence,
                 target=target,

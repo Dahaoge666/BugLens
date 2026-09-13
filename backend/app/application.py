@@ -8,6 +8,7 @@ from pydantic import Field
 
 from .config import ConfigRepository
 from .environment import EnvironmentRepository
+from .guides import GuideApplicationService, GuideLookup, GuideQuery
 from .models import StrictModel
 from .protocol.commands import AgentCommand, StartDiagnosis
 from .protocol.events import AgentEvent
@@ -38,6 +39,7 @@ class ApplicationService:
         environments: EnvironmentRepository | None = None,
     ) -> None:
         self.runtime = runtime
+        self.guides = GuideApplicationService(runtime.store)
         self.configs = configs
         self._require_model_credentials = require_model_credentials
         self._openai_base_url = openai_base_url
@@ -66,6 +68,15 @@ class ApplicationService:
             return
         async for event in self.runtime.run(command):
             yield event
+
+    async def find_guides(
+        self, query: GuideQuery, identity: Identity | None = None
+    ) -> GuideLookup:
+        return self.guides.lookup(
+            query,
+            tenant_id=identity.tenant_id if identity else None,
+            bind_identity=identity is not None,
+        )
 
     def _check_model_credentials(self, profile: str = "default") -> None:
         """Fail fast with an actionable error instead of deep inside Runner.

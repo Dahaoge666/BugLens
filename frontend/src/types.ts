@@ -10,6 +10,46 @@ export type LifecycleStatus =
   | 'canceled'
 
 export type Outcome = 'confirmed' | 'inconclusive'
+export type GuideCategory = 'application_error' | 'performance' | 'availability' | 'data_consistency' | 'configuration' | 'integration' | 'security_access'
+export type GuideContent = {
+  title: string
+  category: GuideCategory
+  phenomenon: string
+  symptoms: string[]
+  environment?: string | null
+  service?: string | null
+  component?: string | null
+  version?: string | null
+  runtime?: string | null
+  applicability: string
+  steps: { instruction: string; expected_observation?: string | null }[]
+  historical_conclusion?: string | null
+  unverified_causes?: string[]
+  limitations?: string[]
+  enabled: boolean
+}
+export type DiagnosisGuide = GuideContent & {
+  guide_id: string
+  revision: number
+  origin: 'memory' | 'manual'
+  source_memory_id?: string | null
+  source_run_id?: string | null
+  created_at: string
+  updated_at: string
+}
+export type GuideQuery = {
+  question: string
+  context: Record<string, ContextValue>
+  evidence: Evidence[]
+  target: TargetSpec
+  category?: GuideCategory
+}
+export type GuideLookup = {
+  next_action: 'confirm_similarity' | 'diagnose'
+  matches: { guide: DiagnosisGuide; similarity: number; matched_terms: string[] }[]
+}
+export type GuideList = { items: DiagnosisGuide[]; total: number }
+export type GuideCategories = { items: { id: GuideCategory; display_name: string }[] }
 export type NodeName = 'analyze' | 'investigate' | 'evaluate' | 'summarize'
 export type ContextValue = string | number | boolean | string[] | null
 

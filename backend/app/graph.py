@@ -351,6 +351,9 @@ class DiagnosisGraph:
         state: DiagnosisState,
         registered_evidence_ids: set[str] | None = None,
     ) -> None:
+        DiagnosisGraph._reject_historical_evidence(
+            set(result.evidence_ids), state, registered_evidence_ids
+        )
         known_ids = {record.evidence_id for record in state.source_evidence}
         if state.analysis is not None:
             known_ids.update(
@@ -445,6 +448,18 @@ class DiagnosisGraph:
     ) -> None:
         if result.interaction_request:
             cls._validate_interaction(result.interaction_request, "investigate", state)
+        cls._reject_historical_evidence(
+            {
+                identifier
+                for hypothesis in result.hypotheses
+                for identifier in [
+                    *hypothesis.supporting_evidence,
+                    *hypothesis.contradicting_evidence,
+                ]
+            },
+            state,
+            registered_evidence_ids,
+        )
         known_ids = {record.evidence_id for record in state.source_evidence}
         if state.analysis is not None:
             known_ids.update(
@@ -469,6 +484,28 @@ class DiagnosisGraph:
                 raise GraphContractError(
                     "Hypothesis evidence must reference registered evidence IDs"
                 )
+
+    @staticmethod
+    def _reject_historical_evidence(
+        references: set[str],
+        state: DiagnosisState,
+        registered_evidence_ids: set[str] | None = None,
+    ) -> None:
+        historical_ids = {
+            identifier
+            for match in state.memory_matches
+            for hypothesis in match.case.hypotheses
+            for identifier in hypothesis.historical_evidence_ids
+        }
+        current_ids = {item.evidence_id for item in state.source_evidence}
+        current_ids.update(
+            item.evidence_id for answer in state.answers for item in answer.attachments
+        )
+        current_ids.update(registered_evidence_ids or set())
+        if references & (historical_ids - current_ids):
+            raise GraphContractError(
+                "Historical evidence IDs cannot replace current registered evidence"
+            )
 
     @staticmethod
     def _has_new_progress(
@@ -771,6 +808,7 @@ class NativeDiagnosisGraph(DiagnosisGraph):
         policy = config.policy
         payload = NativeDiagnosisInput(
             question=state.user_question,
+            memory_matches=state.memory_matches,
             context=state.context,
             evidence=self.context_assembler.evidence(state),
             target=self.context_assembler.target(state),
@@ -981,6 +1019,11 @@ class NativeDiagnosisGraph(DiagnosisGraph):
         review_budget_exceeded = raw_review_count > max_review_count
         review_count = min(10, raw_review_count)
         if analysis is not None:
+            self._reject_historical_evidence(
+                {item.evidence_id for item in analysis.extracted_evidence},
+                current,
+                registered_evidence_ids,
+            )
             self._validate_analysis(analysis)
         if investigation is not None:
             current = replace_state(

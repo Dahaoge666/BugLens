@@ -478,6 +478,59 @@ class DiagnosisReport(StrictModel):
     limitations: list[str] = Field(default_factory=list, max_length=50)
 
 
+class MemoryHypothesis(StrictModel):
+    cause: str = Field(min_length=1, max_length=1_000)
+    status: Literal["evidence_supported", "unverified"]
+    rationale: str = Field(min_length=1, max_length=1_000)
+    # References belong to source_run_id, never to the current diagnosis.
+    historical_evidence_ids: list[
+        Annotated[str, Field(min_length=1, max_length=128)]
+    ] = Field(default_factory=list, max_length=20)
+    verification_steps: list[Annotated[str, Field(min_length=1, max_length=500)]] = (
+        Field(default_factory=list, max_length=5)
+    )
+
+
+class DiagnosisMemory(StrictModel):
+    """A bounded case derived from a committed report, not SDK messages."""
+
+    memory_id: str = Field(min_length=1, max_length=128)
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_revision: int = Field(ge=0)
+    source_config_version: str = Field(max_length=128)
+    recorded_at: datetime
+    category: ProblemCategory
+    outcome: DiagnosisOutcome
+    problem_summary: str = Field(min_length=1, max_length=2_000)
+    symptoms: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=10
+    )
+    environment: str | None = Field(default=None, max_length=256)
+    service: str | None = Field(default=None, max_length=256)
+    component: str | None = Field(default=None, max_length=256)
+    version: str | None = Field(default=None, max_length=256)
+    runtime: str | None = Field(default=None, max_length=256)
+    confirmed_conclusion: str | None = Field(default=None, max_length=1_000)
+    hypotheses: list[MemoryHypothesis] = Field(default_factory=list, max_length=3)
+    information_gaps: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=10
+    )
+    next_data_to_collect: list[Annotated[str, Field(min_length=1, max_length=500)]] = (
+        Field(default_factory=list, max_length=10)
+    )
+    limitations: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=10
+    )
+
+
+class MemoryMatch(StrictModel):
+    case: DiagnosisMemory
+    similarity: float = Field(ge=0, le=1)
+    matched_terms: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        default_factory=list, max_length=10
+    )
+
+
 class DiagnosisState(StrictModel):
     run_id: str = Field(min_length=1, max_length=128)
     user_question: str = Field(min_length=1, max_length=12_000)
@@ -533,6 +586,8 @@ class DiagnosisState(StrictModel):
     review_count: int = Field(default=0, ge=0, le=10)
     reviewed_candidate_hash: str | None = Field(default=None, max_length=128)
     available_actions: list[str] = Field(default_factory=list, max_length=8)
+    memory_matches: list[MemoryMatch] = Field(default_factory=list, max_length=3)
+    memory_selection_completed: bool = False
 
     @model_validator(mode="after")
     def validate_lifecycle_invariants(self) -> DiagnosisState:
@@ -709,6 +764,7 @@ class AnalyzeInput(StrictModel):
 
 class InvestigationInput(StrictModel):
     analysis: ProblemAnalysis
+    memory_matches: list[MemoryMatch] = Field(default_factory=list, max_length=3)
     connector_guides: list[dict[str, Any]] = Field(default_factory=list, max_length=24)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
@@ -787,6 +843,7 @@ class NativeDiagnosisInput(StrictModel):
     """
 
     question: str = Field(min_length=1, max_length=12_000)
+    memory_matches: list[MemoryMatch] = Field(default_factory=list, max_length=3)
     connector_guides: list[dict[str, Any]] = Field(default_factory=list, max_length=24)
     context: DiagnosisContext = Field(default_factory=DiagnosisContext)
     evidence: list[EvidenceRecord] = Field(default_factory=list, max_length=100)
@@ -871,5 +928,6 @@ def replace_state(state: DiagnosisState, **updates: Any) -> DiagnosisState:
     # persisted DiagnosisState.  Keep state transitions compatible with a
     # RunView returned by the runtime.
     data.pop("environment_snapshot", None)
+    data.pop("memory_case", None)
     data.update(updates)
     return DiagnosisState.model_validate(data)

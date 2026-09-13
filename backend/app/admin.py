@@ -332,6 +332,9 @@ class AdminApplicationService:
         return CapabilitiesView(
             features={
                 "diagnosis_runs": True,
+                "diagnosis_memory": True,
+                "diagnosis_guides": True,
+                "guide_import": True,
                 "server_sent_events": True,
                 "admin_health": True,
                 "admin_config": True,

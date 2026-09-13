@@ -4,6 +4,9 @@
 
 ## 条目
 
+- [0011 — 分类定位指南与入口确认](0011-diagnosis-guides.md)
+
+- [0010 — 诊断案例 Memory](0010-diagnosis-memory.md)
 - [0009 — 清理未使用代码](0009-unused-code-cleanup.md)
 - [0008 — 连接方式与节点使用说明](0008-connector-transports-and-usage.md)
 - [0007 — 按子服务分类接入插件](0007-service-scoped-plugin-integrations.md)

@@ -35,12 +35,15 @@ from .infra import (
     ValidationFailedError,
 )
 from .models import (
+    DiagnosisMemory,
     DiagnosisOutcome,
     DiagnosisState,
     ExecutionFailure,
     FailureRecord,
     GraphNode,
+    InvestigationInput,
     LifecycleStatus,
+    NativeDiagnosisInput,
     PendingApproval,
     PendingTargetConfirmation,
     TargetSpec,
@@ -189,6 +192,7 @@ class RunView(DiagnosisState):
     """Read model returned to adapters; it contains no SDK session details."""
 
     environment_snapshot: dict[str, Any] | None = None
+    memory_case: DiagnosisMemory | None = None
 
 
 class DiagnosisRuntime:
@@ -643,6 +647,26 @@ class DiagnosisRuntime:
                 resume_for_call = approval_resume
                 approval_resume = None
                 plan = self.graph.prepare_step(state, config)
+                if (
+                    resume_for_call is None
+                    and not state.memory_selection_completed
+                    and isinstance(
+                        plan.input_model, (InvestigationInput, NativeDiagnosisInput)
+                    )
+                ):
+                    matches = self.store.search_memories(state)
+                    state = replace_state(
+                        state,
+                        memory_matches=matches,
+                        memory_selection_completed=True,
+                    )
+                    plan = plan.model_copy(
+                        update={
+                            "input_model": plan.input_model.model_copy(
+                                update={"memory_matches": matches}
+                            )
+                        }
+                    )
                 if resume_for_call is not None:
                     if not state.active_execution_id:
                         raise ValidationFailedError(
@@ -1646,6 +1670,7 @@ class DiagnosisRuntime:
         state = self._recover_stale_run(state, config)
         state = self._hydrate_evidence(state)
         payload = state.model_dump()
+        payload["memory_case"] = self.store.get_memory(run_id)
         snapshot = self._environment_snapshot(state)
         payload["environment_snapshot"] = (
             snapshot.public_view() if snapshot is not None else None

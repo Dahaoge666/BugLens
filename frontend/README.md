@@ -7,6 +7,7 @@
 
 - [产品与前端架构](docs/product-and-architecture.md)
 - [配置与管理交互](docs/operations-and-management-ux.md)
+- 新问题先查找相似指南；工作区“问题定位指南”支持分类、手工表单/JSON 文件导入、编辑及启用/停用。
 - 多环境选择、目标确认和插件管理的稳定字段见根目录的[前后端对接契约](../frontend-backend-contract.md)及后端的[多环境插件规范](../backend/docs/environment-plugin-spec.md)。
 
 本地运行：
@@ -15,7 +16,7 @@
 pnpm install --frozen-lockfile
 pnpm dev                 # http://localhost:5173，/v1 由 Vite 代理到 8000
 pnpm typecheck
-pnpm test                # 配置表单数据转换与隔离回归，不调用模型
+pnpm test                # 配置转换、隔离与指南入口分流回归，不调用模型
 pnpm build
 ```
 

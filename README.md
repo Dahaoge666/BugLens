@@ -95,6 +95,8 @@ uv run --project backend buglens `
 
 CLI、Web 和远程客户端都使用同一个 Application Service 与 Runtime；CLI 不复制 Web 或 Graph 逻辑。使用 `buglens --help` 查看全部选项，使用 `--json` 获取结构化结果。
 
+新问题入口先查找相似定位指南：确认相似后直接阅读，无匹配或选择不相似时再开始诊断。指南从现象明确且有证据支持的 Memory 自动生成，也支持手工导入、分类和启用/停用。Web 工作区提供“问题定位指南”管理页，CLI 用法和 JSON 样例见[定位指南说明](backend/docs/diagnosis-guides.md)。
+
 ## 配置
 
 后端通过环境变量读取运行配置；密钥不写入诊断状态、配置快照或事件：

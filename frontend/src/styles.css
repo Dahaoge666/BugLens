@@ -288,6 +288,42 @@ pre { font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace; fo
 /* ---------- 新建诊断弹窗 ---------- */
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(0, 0, 0, 0.3); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
 .new-diagnosis-modal { width: min(580px, 100%); background: var(--surface); box-shadow: var(--shadow-lg); border-radius: 20px; padding: 28px; }
+.guide-entry-modal { width: min(720px, 100%); max-height: calc(100dvh - 48px); overflow-y: auto; }
+.guide-entry-modal fieldset, .guide-import fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.guide-entry-status { font-size: 13px; color: var(--text-2); line-height: 1.6; }
+.guide-error { padding: 12px 14px; border-radius: 8px; background: var(--red-soft); color: #b62420; overflow-wrap: anywhere; font-size: 13px; }
+.guide-match-list { display: grid; gap: 14px; margin: 18px 0; }
+.guide-match-card, .guide-library-card { border: 1px solid var(--border-soft); border-radius: 12px; padding: 18px; }
+.guide-match-card h3, .guide-library-card h3 { margin: 12px 0 8px; font-size: 17px; }
+.guide-match-card p, .guide-library-card p { margin: 8px 0; color: var(--text-2); font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.guide-match-card > div, .guide-library-card > div:first-child { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.guide-match-card > button { display: block; margin-top: 14px; }
+.guide-match-card small, .guide-library-card small, .guide-provenance { font-size: 12px; color: var(--text-3); overflow-wrap: anywhere; }
+.guide-category { display: inline-block; padding: 5px 9px; background: var(--accent-soft); color: var(--accent); font-size: 11px; border-radius: 6px; }
+.guide-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 18px; font-size: 12px; color: var(--text-3); }
+.guide-detail { font-size: 13px; line-height: 1.75; padding: 12px 0; overflow-wrap: anywhere; }
+.guide-detail h3 { font-size: 14px; margin: 22px 0 8px; }
+.guide-detail p { margin: 8px 0; white-space: pre-wrap; }
+.guide-detail ul, .guide-detail ol { padding-left: 22px; }
+.guide-scope { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.guide-scope div { display: flex; gap: 12px; }
+.guide-scope dt { color: var(--text-3); flex: 0 0 64px; }
+.guide-scope dd { margin: 0; }
+.guide-reference-note { background: var(--accent-soft); color: var(--accent); padding: 12px; border-radius: 8px; }
+.guide-steps li { padding: 4px 0 12px 8px; }
+.guide-steps small { color: var(--text-2); }
+.guides-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+.guide-library, .guide-import, .guide-selected { padding: 20px; }
+.guide-library .panel-header, .guide-import .panel-header, .guide-selected .panel-header { padding: 0 0 16px; }
+.guide-library-card { margin: 14px 0; }
+.guide-empty { color: var(--text-3); padding: 20px 0; font-size: 13px; }
+.guide-import form { margin-top: 18px; }
+.guide-import label, .guide-library label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 14px; }
+.guide-import input, .guide-import textarea, .guide-import select, .guide-library select { display: block; width: 100%; padding: 10px 12px; margin-top: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); resize: vertical; font-size: 13px; }
+.guide-import textarea:focus, .guide-import input:focus, .guide-import select:focus, .guide-library select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.guide-selected { margin-top: 22px; }
+@media (max-width: 960px) { .guides-layout { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) { .guide-entry-modal { padding: 18px; max-height: calc(100dvh - 32px); } .guide-scope { grid-template-columns: minmax(0, 1fr); } }
 .modal-heading { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
 .modal-heading h2 { margin: 8px 0 0; letter-spacing: -.01em; font-size: 22px; font-weight: 700; }
 .close-button { border: 0; background: transparent; color: var(--text-3); font-size: 26px; line-height: 1; }

@@ -23,6 +23,14 @@ from .environment import (
     EnvironmentConfigNotWritableError,
     EnvironmentRevisionConflictError,
 )
+from .guides import (
+    CATEGORY_LABELS,
+    GuideImportRequest,
+    GuideNotFoundError,
+    GuideQuery,
+    GuideRevisionConflictError,
+    GuideUpdateRequest,
+)
 from .infra import (
     FencingTokenError,
     InvalidRunStatusError,
@@ -91,6 +99,43 @@ class BugLensASGI:
             if method == "POST" and path == "/v1/runs":
                 command = TypeAdapter(AgentCommand).validate_json(body)
                 return await self._events(send, self.service.send(command))
+            if method == "POST" and path == "/v1/guides/search":
+                query = GuideQuery.model_validate_json(body)
+                found = await self.service.find_guides(query)
+                return await self._json(send, 200, found.model_dump(mode="json"))
+            if method == "GET" and path == "/v1/guides/categories":
+                return await self._json(
+                    send,
+                    200,
+                    {
+                        "items": [
+                            {"id": key.value, "display_name": label}
+                            for key, label in CATEGORY_LABELS.items()
+                        ]
+                    },
+                )
+            if method == "GET" and path == "/v1/admin/guides":
+                query = self._query(scope)
+                listed = self.service.guides.list(
+                    category=self._query_value(query, "category"),
+                    limit=self._query_int(query, "limit", 100),
+                    offset=self._query_int(query, "offset", 0),
+                )
+                return await self._json(send, 200, listed.model_dump(mode="json"))
+            if method == "POST" and path == "/v1/admin/guides/import":
+                imported = self.service.guides.import_manual(
+                    GuideImportRequest.model_validate_json(body)
+                )
+                return await self._json(send, 201, imported.model_dump(mode="json"))
+            if (
+                method == "PUT"
+                and len(parts) == 5
+                and parts[1:4] == ["v1", "admin", "guides"]
+            ):
+                updated = self.service.guides.update(
+                    parts[4], GuideUpdateRequest.model_validate_json(body)
+                )
+                return await self._json(send, 200, updated.model_dump(mode="json"))
             if method == "POST" and len(parts) == 5 and parts[1:3] == ["v1", "runs"]:
                 command = TypeAdapter(AgentCommand).validate_json(body)
                 return await self._events(send, self.service.send(command))
@@ -306,8 +351,12 @@ class BugLensASGI:
             return await self._json(send, 404, {"code": "not_found"})
         except Exception as exc:
             status = 400
-            if isinstance(exc, RunNotFoundError):
+            if isinstance(exc, (RunNotFoundError, GuideNotFoundError)):
                 status = 404
+            elif path.startswith(("/v1/guides", "/v1/admin/guides")) and isinstance(
+                exc, ValidationError
+            ):
+                status = 422
             elif path.startswith(
                 ("/v1/admin/plugin-instances", "/v1/admin/services")
             ) and isinstance(exc, (EnvironmentConfigError, ValidationError)):
@@ -324,6 +373,7 @@ class BugLensASGI:
                     PendingRequestMismatchError,
                     LeaseConflictError,
                     FencingTokenError,
+                    GuideRevisionConflictError,
                 ),
             ):
                 status = 409

@@ -97,6 +97,7 @@ created → running ─┬→ waiting_user ─→ running
 - 状态、Command 幂等记录和 Event 同事务提交。
 - revision 提供乐观锁；短租约防止两个执行者同时推进同一 run。
 - 每次 run 保存配置 snapshot ID；恢复不读取已变化的当前配置。
+- 首次定位输入的历史 memory 引用与节点开始检查点一并固定，恢复沿用原引用；完成诊断时自动整理的案例与终态同事务保存。详见 [诊断 Memory](diagnosis-memory.md)。
 - 目录确认后的 run 额外保存 environment snapshot ID；当前目录热更新不改变已有 run 的环境边界，凭据则按调用从当前实例配置读取以支持轮换。
 
 稳定错误至少包括 `run_not_found`、`revision_conflict`、`invalid_run_status`、`pending_request_mismatch` 和 `validation_failed`。`RunFailed` 只公开稳定 code、脱敏 message、node、retryable 和时间。

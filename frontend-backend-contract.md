@@ -99,6 +99,45 @@ data: {"protocol_version":"2","event_id":"evt_123","run_id":"diag_123","sequence
 
 Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_interaction`、`pending_approval`、`revision` 和 `available_actions` 由后端决定。确认过环境的 Run 还可包含无凭据的 `environment_snapshot` 展示投影（环境、服务、节点和 source 摘要）；source 的 `kind` 是可扩展字符串，`capabilities` 是可选的稳定能力 ID 列表，其中不包含连接配置或插件实例凭据。`pending_approval` 只包含脱敏的工具展示参数和请求 ID，不包含 SDK RunState；前端不得根据状态名称自行推断“可重试”“可取消”或 Graph 下一节点。
 
+Run 查询还可返回以下可选 Memory 字段（旧客户端可忽略，无需提交新 Command）：
+
+- `memory_selection_completed`：后端是否已固定本次历史参考；空引用也可能表示检索已完成。
+- `memory_matches`：最多 3 项，整体最多 32768 UTF-8 字节，每项包含 `case`、`similarity`（0–1 的词项相似度，非根因概率）和 `matched_terms`（最多 10 个匹配词项）。
+- `memory_case`：本次已完成诊断自动整理的案例；尚未归档或案例不可用时为 null。
+
+案例 `case` / `memory_case` 包含 `memory_id`、`source_run_id`、`source_revision`、`source_config_version`、`recorded_at`（UTC）、`category`、`outcome`、`problem_summary`、`symptoms`、`environment`、`service`、`component`、`version`、`runtime`、`confirmed_conclusion`、`hypotheses`、`information_gaps`、`next_data_to_collect` 和 `limitations`。可空字段为 environment/service/component/version/runtime/confirmed_conclusion。每条 hypothesis 包含 cause、status（`evidence_supported | unverified`）、rationale、`historical_evidence_ids` 和 `verification_steps`。ID 及配置版本最多 128 字符，环境等适用性字段最多 256 字符，问题摘要最多 2000 字符，主结论/cause/rationale 最多 1000 字符；symptoms、information_gaps、next_data_to_collect、limitations 各最多 10 条、每条最多 500 字符；hypotheses 最多 3 条，每条历史证据 ID 最多 20 个（每个最多 128 字符）、验证步骤最多 5 条（每条最多 500 字符）。
+
+案例状态和证据只描述来源 run，不属于本次报告的证据。客户端不能根据匹配相似度推断已确认根因，也不能自动执行案例中的步骤。前端案例库管理页面不属于当前接口范围。
+
+## 问题入口与定位指南
+
+入口查询和指南管理使用 JSON，不进入诊断 Command/Event 流。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/v1/guides/search` | 查找相似指南，不创建 Run 或调用模型 |
+| GET | `/v1/guides/categories` | 公开问题类别 `{items:[{id,display_name}]}` |
+
+搜索请求为 `{question, context?, evidence?, target?, category?}`。question、context、evidence、target 沿用 StartDiagnosis 的输入类型和限制；不发送 profile、run_id、command_id 等诊断字段。category 可选，使用 ProblemCategory。请求严格拒绝额外字段。
+
+响应为 `{next_action, matches}`，matches 最多 3 项，每项为 `{guide, similarity, matched_terms}`。similarity 为 0–1 的词项相似度，matched_terms 最多 10 个、每个最多 128 字符；候选数组最多 98304 UTF-8 字节。
+
+- `next_action=confirm_similarity`：展示候选，让提问者确认。选择相似后直接展示 guide，不发送 StartDiagnosis、不创建或伪造 completed Run；选择不相似后提交原问题与证据进入原诊断流程。
+- `next_action=diagnose`：未找到候选，客户端可提交原有 StartDiagnosis。
+- 查询失败：展示错误并保留草稿，不视为无匹配，也不自动提交诊断。
+
+搜索仅使用已启用指南，并在既有租户范围内匹配。自动指南严格匹配环境/服务，缺省值不作为通配符；手工指南可明确省略环境/服务，作为当前租户内通用指南。已知版本/组件/runtime 不一致时排除。范围及缺省值不会因现象相似而扩大；客户端仍需展示适用条件，不能由相似度推断本次根因。入口范围标签不新增多租户认证。
+
+### 指南数据
+
+`GuideContent` 必填字段：title（1–200 字符）、category、phenomenon（1–2000 字符）、symptoms（1–10 条，每条 1–500 字符）、steps（1–10 步）。每步 instruction 为 1–1000 字符，expected_observation 可空，最多 1000 字符。标题、现象、症状和步骤不能为全空白。
+
+可选字段：environment/service（可空；非空时 1–256 字符）、component/version/runtime（可空、最多 256 字符）、applicability（最多 2000 字符，默认提醒核对本次条件）、historical_conclusion（可空、最多 1000 字符）、unverified_causes（最多 3 条）、limitations（最多 10 条；这两种列表每条 1–500 字符）、enabled（默认 true）。
+
+指南 category 不接受 unknown，可用类别为 `application_error`、`performance`、`availability`、`data_consistency`、`configuration`、`integration`、`security_access`，中文显示名由类别查询返回。
+
+`DiagnosisGuide` 在 GuideContent 上增加只读字段：guide_id（1–128 字符）、revision（从 1 开始的整数）、origin（memory/manual）、source_memory_id/source_run_id（可空、最多 128 字符）、created_at/updated_at（UTC）。导入或编辑不得发送这些只读字段。历史结论、待验证原因、限制和来源应分开展示，不属于本次诊断的证据或结论。
+
 ## Admin JSON API
 
 管理 API 使用独立的 JSON 查询/变更 DTO，不进入 AgentCommand/Event 流：
@@ -110,6 +149,9 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/version` | 后端版本和协议版本 |
 | GET | `/v1/admin/capabilities` | 能力与可用操作 |
 | GET | `/v1/admin/config` | 当前非敏感配置 |
+| GET | `/v1/admin/guides` | 按 category/limit/offset 查询指南，含停用项 |
+| POST | `/v1/admin/guides/import` | 原子批量手工导入指南 |
+| PUT | `/v1/admin/guides/{guide_id}` | 按独立数字 revision 编辑指南或启用/停用 |
 | GET | `/v1/environments` | 可选择环境摘要和目录 revision；不返回凭据 |
 | GET | `/v1/admin/plugins` | 已发现的驱动插件和已配置的 MCP/CLI/SSH 连接器、版本、能力、Schema 和实例状态 |
 | GET | `/v1/admin/environment-config` | 非敏感环境目录；凭据只返回 `is_set` |
@@ -130,6 +172,10 @@ Run 快照中的 `lifecycle_status`、`outcome`、`current_node`、`pending_inte
 | GET | `/v1/admin/runs/{run_id}/tools` | 查询脱敏工具调用审计 |
 
 配置更新必须发送 `expected_revision`。后端返回 409 时，前端重新读取配置并显示差异；API key 等 secret 只允许写入或清除，永远不会在响应中返回原值。SDK 审批检查点只在后端使用 `BUGLENS_RUN_STATE_KEY` 加密保存，HTTP/SSE 不返回序列化 RunState。
+
+指南查询默认 limit=100、offset=0，limit 限定为 1–100、offset 最低 0，category 可省略；返回 `{items:[DiagnosisGuide], total}`，按更新时间和 ID 降序。导入请求为 `{tenant_id?, guides:[GuideContent]}`，tenant_id 最多 128 字符，一批 1–50 份；全部校验和脱敏后原子写入，成功返回 201 和 `{items,total}`。编辑请求为 `{expected_revision:1, guide:GuideContent}`，成功返回 200 和新 DiagnosisGuide；保留来源和创建时间，revision 加一。停用通过 enabled=false 保存，停用项不参与入口检索。
+
+指南管理复用现有 Admin Bearer Token，启用管理鉴权时缺少或错误 Token 返回 401。无效指南/search DTO 返回 422（validation_failed），无效查询参数返回 400；指南不存在返回 404（guide_not_found），revision 冲突返回 409（guide_revision_conflict）。错误消息经过脱敏。冲突后保留草稿并重新载入，不自动覆盖。指南维护不执行步骤或触发诊断。
 
 环境目录更新同样使用 opaque `expected_revision`/`If-Match`；两者同时提供时必须一致。`secret_updates` 明确声明 `username`、`password` 或 `token` 的 `set`/`clear`；遗漏表示保留。已创建 Run 使用目标确认时的无凭据环境快照，凭据轮换对下一次插件调用生效。
 

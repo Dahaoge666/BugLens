@@ -13,9 +13,20 @@ from uuid import uuid4
 
 from .config import ResolvedRunConfig
 from .environment import ResolvedEnvironmentSnapshot
+from .guides import (
+    DiagnosisGuide,
+    GuideList,
+    GuideNotFoundError,
+    GuideRevisionConflictError,
+    GuideUpdateRequest,
+    guide_from_memory,
+)
+from .memory import build_memory, memory_scope, rank_memories
 from .models import (
+    DiagnosisMemory,
     DiagnosisState,
     EvidenceRecord,
+    MemoryMatch,
     NodeExecutionPlan,
     replace_state,
 )
@@ -55,7 +66,7 @@ class FencingTokenError(RuntimeError):
 class SQLiteCheckpointStore:
     """Small SQLite repository with explicit, repeatable schema migrations."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 5
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -224,6 +235,33 @@ class SQLiteCheckpointStore:
                 reason TEXT,
                 processed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS diagnosis_memories (
+                memory_id TEXT PRIMARY KEY,
+                source_run_id TEXT NOT NULL UNIQUE,
+                source_revision INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                service TEXT NOT NULL,
+                category TEXT NOT NULL,
+                case_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memories_scope
+                ON diagnosis_memories(tenant_id, environment, service, recorded_at);
+            CREATE TABLE IF NOT EXISTS diagnosis_guides (
+                guide_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                service TEXT NOT NULL,
+                category TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                guide_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_guides_scope
+                ON diagnosis_guides(tenant_id, enabled, environment, service, updated_at);
             """
         )
         self._ensure_column("diagnosis_commands", "command_json", "TEXT")
@@ -245,6 +283,13 @@ class SQLiteCheckpointStore:
             self._ensure_column("diagnosis_tool_executions", column, definition)
         self._ensure_column("diagnosis_sdk_run_states", "decision", "TEXT")
         self._ensure_column("diagnosis_sdk_run_states", "decision_reason", "TEXT")
+        previous_schema = self.db.execute(
+            "SELECT version FROM buglens_schema WHERE singleton = 1"
+        ).fetchone()
+        if previous_schema is None or previous_schema["version"] < 4:
+            self._backfill_memories()
+        if previous_schema is None or previous_schema["version"] < 5:
+            self._backfill_guides()
         self.db.execute(
             "INSERT OR IGNORE INTO buglens_schema(singleton, version) VALUES (1, ?)",
             (self.SCHEMA_VERSION,),
@@ -296,6 +341,213 @@ class SQLiteCheckpointStore:
 
     def close(self) -> None:
         self.db.close()
+
+    def _save_memory_locked(self, state: DiagnosisState) -> None:
+        case = build_memory(state)
+        if case is None:
+            return
+        tenant, environment, service = memory_scope(state)
+        self.db.execute(
+            """INSERT INTO diagnosis_memories
+            (memory_id, source_run_id, source_revision, tenant_id, environment,
+             service, category, case_json, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_run_id) DO UPDATE SET
+                source_revision = excluded.source_revision,
+                case_json = excluded.case_json,
+                recorded_at = excluded.recorded_at
+            WHERE excluded.source_revision > diagnosis_memories.source_revision""",
+            (
+                case.memory_id,
+                case.source_run_id,
+                case.source_revision,
+                tenant,
+                environment,
+                service,
+                case.category.value,
+                case.model_dump_json(),
+                case.recorded_at.isoformat(),
+            ),
+        )
+        guide = guide_from_memory(case)
+        if guide is not None:
+            self._insert_guide_locked(guide, tenant)
+
+    def _insert_guide_locked(self, guide: DiagnosisGuide, tenant_id: str) -> None:
+        self.db.execute(
+            """INSERT OR IGNORE INTO diagnosis_guides
+            (guide_id, revision, tenant_id, environment, service, category, origin,
+             enabled, guide_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                guide.guide_id,
+                guide.revision,
+                tenant_id,
+                guide.environment or "",
+                guide.service or "",
+                guide.category.value,
+                guide.origin,
+                int(guide.enabled),
+                guide.model_dump_json(),
+                guide.updated_at.isoformat(),
+            ),
+        )
+
+    def _backfill_guides(self) -> None:
+        rows = self.db.execute(
+            "SELECT tenant_id, case_json FROM diagnosis_memories"
+        ).fetchall()
+        for row in rows:
+            try:
+                case = DiagnosisMemory.model_validate_json(row["case_json"])
+            except ValueError:
+                continue
+            guide = guide_from_memory(case)
+            if guide is not None:
+                self._insert_guide_locked(guide, row["tenant_id"])
+
+    def import_guides(self, guides: list[DiagnosisGuide], tenant_id: str) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for guide in guides:
+                self._insert_guide_locked(guide, tenant_id)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def update_guide(
+        self, guide_id: str, request: GuideUpdateRequest
+    ) -> DiagnosisGuide:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT * FROM diagnosis_guides WHERE guide_id = ?", (guide_id,)
+            ).fetchone()
+            if row is None:
+                raise GuideNotFoundError("guide not found")
+            if row["revision"] != request.expected_revision:
+                raise GuideRevisionConflictError("guide revision changed")
+            old = DiagnosisGuide.model_validate_json(row["guide_json"])
+            updated = DiagnosisGuide.model_validate(
+                {
+                    **old.model_dump(),
+                    **request.guide.model_dump(),
+                    "revision": old.revision + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self.db.execute(
+                """UPDATE diagnosis_guides SET revision = ?, environment = ?, service = ?,
+                category = ?, enabled = ?, guide_json = ?, updated_at = ? WHERE guide_id = ?""",
+                (
+                    updated.revision,
+                    updated.environment or "",
+                    updated.service or "",
+                    updated.category.value,
+                    int(updated.enabled),
+                    updated.model_dump_json(),
+                    updated.updated_at.isoformat(),
+                    guide_id,
+                ),
+            )
+            self.db.commit()
+            return updated
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def list_guides(
+        self, *, category: str | None, limit: int, offset: int
+    ) -> GuideList:
+        where = " WHERE category = ?" if category else ""
+        values = [category] if category else []
+        total = self.db.execute(
+            "SELECT count(*) FROM diagnosis_guides" + where, values
+        ).fetchone()[0]
+        rows = self.db.execute(
+            "SELECT guide_json FROM diagnosis_guides"
+            + where
+            + " ORDER BY updated_at DESC, guide_id DESC LIMIT ? OFFSET ?",
+            [*values, max(1, min(limit, 100)), max(0, offset)],
+        ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                items.append(DiagnosisGuide.model_validate_json(row["guide_json"]))
+            except ValueError:
+                continue
+        return GuideList(items=items, total=total)
+
+    def guide_candidates(self, state: DiagnosisState, category) -> list[DiagnosisGuide]:
+        tenant, environment, service = memory_scope(state)
+        clauses = [
+            "tenant_id = ?",
+            "enabled = 1",
+            "((environment = ? AND service = ?) OR (origin = 'manual' AND (environment = '' OR environment = ?) AND (service = '' OR service = ?)))",
+        ]
+        values: list[Any] = [tenant, environment, service, environment, service]
+        if category is not None:
+            clauses.append("category = ?")
+            values.append(category.value)
+        rows = self.db.execute(
+            "SELECT guide_json FROM diagnosis_guides WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY updated_at DESC, guide_id DESC LIMIT 200",
+            values,
+        ).fetchall()
+        guides = []
+        for row in rows:
+            try:
+                guides.append(DiagnosisGuide.model_validate_json(row["guide_json"]))
+            except ValueError:
+                continue
+        return guides
+
+    def _backfill_memories(self) -> None:
+        for row in self.db.execute("SELECT state_json FROM diagnosis_runs").fetchall():
+            try:
+                state = DiagnosisState.model_validate_json(row["state_json"])
+            except ValueError:
+                continue
+            self._save_memory_locked(state)
+
+    def search_memories(self, state: DiagnosisState) -> list[MemoryMatch]:
+        tenant, environment, service = memory_scope(state)
+        clauses = [
+            "tenant_id = ?",
+            "environment = ?",
+            "service = ?",
+            "source_run_id != ?",
+        ]
+        values: list[Any] = [tenant, environment, service, state.run_id]
+        if state.analysis and state.analysis.category.value != "unknown":
+            clauses.append("category = ?")
+            values.append(state.analysis.category.value)
+        rows = self.db.execute(
+            "SELECT case_json FROM diagnosis_memories WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY recorded_at DESC, memory_id DESC LIMIT 200",
+            values,
+        ).fetchall()
+        cases = []
+        for row in rows:
+            try:
+                cases.append(DiagnosisMemory.model_validate_json(row["case_json"]))
+            except ValueError:
+                continue
+        return rank_memories(state, cases)
+
+    def get_memory(self, run_id: str) -> DiagnosisMemory | None:
+        row = self.db.execute(
+            "SELECT case_json FROM diagnosis_memories WHERE source_run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return DiagnosisMemory.model_validate_json(row["case_json"])
+        except ValueError:
+            return None
 
     def save_config_snapshot(self, config: ResolvedRunConfig) -> None:
         payload = _remove_secrets(json.loads(config.as_json()))
@@ -480,6 +732,7 @@ class SQLiteCheckpointStore:
                     "UPDATE diagnosis_run_control SET processed_at = ? WHERE run_id = ?",
                     (datetime.now(UTC).isoformat(), state.run_id),
                 )
+            self._save_memory_locked(state)
             self.db.commit()
             return normalized
         except Exception:

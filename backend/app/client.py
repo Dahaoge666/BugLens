@@ -7,6 +7,7 @@ from typing import AsyncIterator, Protocol
 from urllib.request import Request, urlopen
 
 from .application import ApplicationService
+from .guides import GuideImportRequest, GuideList, GuideLookup, GuideQuery
 from .infra import event_from_json
 from .protocol.commands import AgentCommand, CancelDiagnosis, StartDiagnosis
 from .protocol.events import AgentEvent
@@ -16,6 +17,8 @@ from .runtime import RunView
 class AgentClient(Protocol):
     def send(self, command: AgentCommand) -> AsyncIterator[AgentEvent]: ...
     async def get_run(self, run_id: str) -> RunView: ...
+    async def find_guides(self, query: GuideQuery) -> GuideLookup: ...
+    async def import_guides(self, request: GuideImportRequest) -> GuideList: ...
 
 
 class LocalAgentClient:
@@ -29,10 +32,17 @@ class LocalAgentClient:
     async def get_run(self, run_id: str) -> RunView:
         return await self.service.get_run(run_id)
 
+    async def find_guides(self, query: GuideQuery) -> GuideLookup:
+        return await self.service.find_guides(query)
+
+    async def import_guides(self, request: GuideImportRequest) -> GuideList:
+        return self.service.guides.import_manual(request)
+
 
 class RemoteAgentClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, admin_token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        self.admin_token = admin_token
 
     async def send(self, command: AgentCommand) -> AsyncIterator[AgentEvent]:
         endpoint = f"{self.base_url}/v1/runs"
@@ -56,3 +66,32 @@ class RemoteAgentClient:
         response = await asyncio.to_thread(urlopen, f"{self.base_url}/v1/runs/{run_id}")
         data = await asyncio.to_thread(response.read)
         return RunView.model_validate_json(data)
+
+    async def find_guides(self, query: GuideQuery) -> GuideLookup:
+        request = Request(
+            f"{self.base_url}/v1/guides/search",
+            data=query.model_dump_json().encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
+        def read():
+            with urlopen(request) as response:
+                return response.read()
+
+        return GuideLookup.model_validate_json(await asyncio.to_thread(read))
+
+    async def import_guides(self, request: GuideImportRequest) -> GuideList:
+        headers = {"Content-Type": "application/json"}
+        if self.admin_token:
+            headers["Authorization"] = f"Bearer {self.admin_token}"
+        http_request = Request(
+            f"{self.base_url}/v1/admin/guides/import",
+            data=request.model_dump_json().encode(),
+            headers=headers,
+        )
+
+        def read():
+            with urlopen(http_request) as response:
+                return response.read()
+
+        return GuideList.model_validate_json(await asyncio.to_thread(read))

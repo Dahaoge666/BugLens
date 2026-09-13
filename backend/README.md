@@ -41,6 +41,15 @@ uv run buglens `
 
 CLI 和 Web 都只调用同一个 `ApplicationService` 与 `DiagnosisRuntime`。一次执行在完成或进入等待用户输入时结束；恢复通过新的 Command 完成，不维持长期挂起的进程或 HTTP 请求。
 
+新问题默认先查找相似定位指南，确认相似后直接返回指南；没有匹配或选择不相似时再创建诊断。自动指南来源于证据支持的 Memory，也支持手工导入：
+
+```powershell
+uv run buglens --import-guides config/diagnosis-guides.example.json --json
+uv run buglens "数据库连接池等待超时" --find-guides --json
+```
+
+交互选择、非交互退出码和远程导入见[定位指南说明](docs/diagnosis-guides.md)。
+
 ## 配置
 
 - `config/buglens.example.yaml`：运行 profile 示例；
@@ -69,6 +78,8 @@ uv run buglens-web --host 127.0.0.1 --port 8000
 
 ## 文档
 
+- [诊断 Memory](docs/diagnosis-memory.md)：自动整理案例、相似问题检索、历史参考与当前证据的边界；
+- [问题定位指南](docs/diagnosis-guides.md)：自动生成、分类、手工导入、维护及问题入口分流；
 - [架构与 SDK 边界](docs/architecture.md)：组件职责、原生 loop、handoff/as_tool 与 SDK 能力边界；
 - [Runtime、协议与恢复](docs/runtime-protocol.md)：Command/Event、状态机、检查点、幂等与并发；
 - [配置、Admin 与运维](docs/configuration-and-operations.md)：配置分层、快照、控制面和部署安全；

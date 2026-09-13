@@ -1,4 +1,4 @@
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, NodeExecution, PluginHealth, PluginList, Run, ToolExecution } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, AdminVersion, DomainEvent, EnvironmentConfig, EnvironmentList, NodeExecution, PluginHealth, PluginList, Run, ToolExecution, DiagnosisGuide, GuideContent, GuideQuery, GuideLookup, GuideList, GuideCategories } from './types'
 
 const baseUrl = (import.meta.env.VITE_BUGLENS_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 const adminToken = (import.meta.env.VITE_BUGLENS_ADMIN_TOKEN as string | undefined)?.trim()
@@ -163,6 +163,44 @@ export function applyAdminEnvironmentConfig(payload: { config: Record<string, un
 
 function authHeaders(): Record<string, string> {
   return adminToken ? { authorization: `Bearer ${adminToken}` } : {}
+}
+
+export function getGuideCategories() {
+  return getJson<GuideCategories>('/v1/guides/categories')
+}
+
+export function getAdminGuides(category = '', offset = 0) {
+  const params = new URLSearchParams({ limit: '100', offset: String(offset) })
+  if (category) params.set('category', category)
+  return getJson<GuideList>(`/v1/admin/guides?${params}`)
+}
+
+async function guideRequest<T>(path: string, payload: unknown, method = 'POST', admin = false): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method, headers: { 'content-type': 'application/json', accept: 'application/json', ...(admin ? authHeaders() : {}) },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({})) as { message?: string }
+    throw new GuideRequestError(error.message ?? `指南请求失败（${response.status}）`, response.status)
+  }
+  return response.json() as Promise<T>
+}
+
+export class GuideRequestError extends Error {
+  constructor(message: string, public status: number) { super(message) }
+}
+
+export function findGuides(query: GuideQuery) {
+  return guideRequest<GuideLookup>('/v1/guides/search', query)
+}
+
+export function importAdminGuides(payload: unknown) {
+  return guideRequest<GuideList>('/v1/admin/guides/import', payload, 'POST', true)
+}
+
+export function updateAdminGuide(guide: DiagnosisGuide, content: GuideContent) {
+  return guideRequest<DiagnosisGuide>(`/v1/admin/guides/${encodeURIComponent(guide.guide_id)}`, { expected_revision: guide.revision, guide: content }, 'PUT', true)
 }
 
 export class PluginConfigError extends Error {

@@ -12,6 +12,14 @@ from .application import ModelCredentialsError
 from .bootstrap import build_local_client
 from .client import AgentClient, RemoteAgentClient
 from .config import Settings
+from .guides import (
+    CATEGORY_LABELS,
+    DiagnosisGuide,
+    GuideImportRequest,
+    GuideList,
+    GuideLookup,
+    GuideQuery,
+)
 from .models import (
     Evidence,
     LifecycleStatus,
@@ -135,6 +143,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式要求按环境/服务提示推断并确认",
     )
     parser.add_argument("--profile", default=None, help="versioned runtime profile")
+    entry = parser.add_mutually_exclusive_group()
+    entry.add_argument(
+        "--find-guides", action="store_true", help="只查找相似问题指南，不创建诊断"
+    )
+    entry.add_argument(
+        "--guide", metavar="GUIDE_ID", help="确认使用匹配结果中的指定指南，不创建诊断"
+    )
+    entry.add_argument(
+        "--diagnose", action="store_true", help="已确认指南不相似，直接开始诊断"
+    )
+    entry.add_argument(
+        "--import-guides", type=Path, metavar="JSON", help="手工导入定位指南 JSON 文件"
+    )
     parser.add_argument(
         "--config", type=Path, help="local administrator runtime config"
     )
@@ -171,7 +192,7 @@ async def _client(
     settings: Settings,
 ) -> tuple[AgentClient, object | None, object | None]:
     if settings.remote:
-        return RemoteAgentClient(settings.remote), None, None
+        return RemoteAgentClient(settings.remote, settings.admin_token), None, None
     return build_local_client(settings)
 
 
@@ -219,6 +240,13 @@ async def run_cli(
     settings = _settings(args)
     client, store, runner = await _client(settings)
     try:
+        if args.import_guides:
+            request = GuideImportRequest.model_validate_json(
+                args.import_guides.read_text(encoding="utf-8-sig")
+            )
+            imported = await client.import_guides(request)
+            _guide_output(args, imported)
+            return 0
         run_id = args.resume or args.status or args.cancel or args.skip
         if args.status:
             state = await client.get_run(args.status)
@@ -327,6 +355,48 @@ async def run_cli(
                     primary_service_id=args.service_id,
                 ),
             )
+            if not args.diagnose:
+                lookup = await client.find_guides(
+                    GuideQuery(
+                        question=start.question,
+                        context=start.context,
+                        evidence=start.evidence,
+                        target=start.target,
+                    )
+                )
+                if args.find_guides:
+                    _guide_output(args, lookup)
+                    return 0
+                selected = None
+                if args.guide:
+                    selected = next(
+                        (
+                            item.guide
+                            for item in lookup.matches
+                            if item.guide.guide_id == args.guide
+                        ),
+                        None,
+                    )
+                    if selected is None:
+                        raise ValueError("指定指南不在本次相似问题匹配结果中")
+                elif lookup.next_action == "confirm_similarity":
+                    console = clarifier or ConsoleClarifier()
+                    if not console._stream.isatty():
+                        _guide_output(args, lookup)
+                        if not args.json:
+                            print(
+                                "请用 --guide GUIDE_ID 确认相似；不相似时使用 --diagnose。尚未创建诊断。"
+                            )
+                        return 2
+                    _guide_output(args, lookup)
+                    raw = input("选择相似问题编号（0 表示不相似，进入诊断）：").strip()
+                    if not raw.isdigit() or not 0 <= int(raw) <= len(lookup.matches):
+                        raise ValueError("请输入列出的编号或 0")
+                    if int(raw):
+                        selected = lookup.matches[int(raw) - 1].guide
+                if selected is not None:
+                    _guide_output(args, selected)
+                    return 0
             await _send_interactively(client, start, clarifier or ConsoleClarifier())
             state = await client.get_run(start.run_id)
             run_id = start.run_id
@@ -360,6 +430,45 @@ async def run_cli(
             runner.close()
         if store is not None:
             store.close()
+
+
+def _guide_output(args, result: DiagnosisGuide | GuideLookup | GuideList) -> None:
+    encoded = result.model_dump_json(indent=2)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded + "\n", encoding="utf-8")
+    if args.json:
+        print(encoded)
+    elif isinstance(result, DiagnosisGuide):
+        print(f"\n定位指南：{result.title}（{CATEGORY_LABELS[result.category]}）")
+        print(f"现象：{result.phenomenon}")
+        print(f"适用条件：{result.applicability}")
+        print(
+            f"环境：{result.environment or '通用'}；服务：{result.service or '通用'}；版本：{result.version or '需核对'}"
+        )
+        print("指南提供验证方向，不代表本次根因已确认。")
+        for index, step in enumerate(result.steps, 1):
+            print(f"{index}. {step.instruction}")
+            if step.expected_observation:
+                print(f"   观察目标：{step.expected_observation}")
+        if result.historical_conclusion:
+            print(f"历史参考结论：{result.historical_conclusion}")
+        for cause in result.unverified_causes:
+            print(f"待验证原因：{cause}")
+        for limitation in result.limitations:
+            print(f"限制：{limitation}")
+        if result.source_run_id:
+            print(f"来源诊断：{result.source_run_id}")
+    elif isinstance(result, GuideLookup):
+        if not result.matches:
+            print("未找到相似问题指南。")
+        for index, match in enumerate(result.matches, 1):
+            print(
+                f"{index}. {match.guide.title} [{match.guide.guide_id}] · {CATEGORY_LABELS[match.guide.category]}"
+            )
+            print(f"   现象：{match.guide.phenomenon}")
+    else:
+        print(f"已导入 {result.total} 份定位指南。")
 
 
 def main() -> None:

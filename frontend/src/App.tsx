@@ -1,10 +1,12 @@
 import { FormEvent, useEffect, useState } from 'react'
 import { EnvironmentPage } from './EnvironmentPage'
+import { GuidesPage } from './GuidesPage'
+import { NewDiagnosis } from './NewDiagnosis'
 import { applyAdminConfig, createRunId, getAdminConfig, getAdminEnvironmentConfig, getAdminHealth, getAdminPlugins, getAdminRuns, getAdminSessions, getAdminVersion, getEnvironments, getNodeExecutions, getRun, getRunTools, readCommandStream, readEvents, validateAdminConfig } from './api'
 import { sourceDisplayName } from './pluginForm'
-import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, EnvironmentSummary, Evidence, Hypothesis, InteractionRequest, NodeExecution, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
+import type { AdminConfig, AdminHealth, AdminRun, AdminSession, DomainEvent, EnvironmentConfig, EnvironmentList, Evidence, Hypothesis, InteractionRequest, NodeExecution, PendingApproval, PendingTargetConfirmation, PluginList, Run, TargetSpec, ToolExecution } from './types'
 
-type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'environments' | 'system' | 'run'
+type WorkspacePage = 'dashboard' | 'tasks' | 'sessions' | 'settings' | 'environments' | 'guides' | 'system' | 'run'
 
 const demoRuns: AdminRun[] = [
   { run_id: 'diag_7f2c9d1a', question: '生产环境 order-api 从 10:20 开始持续超时', lifecycle_status: 'completed', status: 'completed', outcome: 'confirmed', current_node: 'done', profile: 'default', config_version: 'default-v1', config_snapshot_id: 'cfg_7f2c9d1a', attempt: 1, clarification_round: 0, pending_input: false, created_at: '2026-09-07T10:20:00+08:00', updated_at: '2026-09-07T10:26:18+08:00', last_error: null },
@@ -243,7 +245,7 @@ function App() {
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [page, setPage] = useState<WorkspacePage>(() => {
     const value = window.location.hash.replace(/^#\/?/, '') as WorkspacePage
-    return ['dashboard', 'tasks', 'sessions', 'settings', 'environments', 'system', 'run'].includes(value)
+    return ['dashboard', 'tasks', 'sessions', 'settings', 'environments', 'guides', 'system', 'run'].includes(value)
       ? value
       : 'dashboard'
   })
@@ -251,7 +253,7 @@ function App() {
   useEffect(() => {
     const onPopState = () => {
       const value = window.location.hash.replace(/^#\/?/, '') as WorkspacePage
-      if (['dashboard', 'tasks', 'sessions', 'settings', 'environments', 'system', 'run'].includes(value)) setPage(value)
+      if (['dashboard', 'tasks', 'sessions', 'settings', 'environments', 'guides', 'system', 'run'].includes(value)) setPage(value)
     }
     window.addEventListener('popstate', onPopState)
     window.addEventListener('hashchange', onPopState)
@@ -310,22 +312,32 @@ function App() {
   async function startDiagnosis(question: string, context: Record<string, string>, evidence: Evidence[], profile: string, target: TargetSpec) {
     const runId = createRunId()
     const command = { protocol_version: '2', command_id: crypto.randomUUID(), run_id: runId, expected_revision: null, submitted_at: new Date().toISOString(), command_type: 'start_diagnosis', question, context, evidence, profile, target }
-    setShowNew(false)
-    navigate('run')
     setEvents([])
     setNotice('正在提交诊断…')
+    const showSnapshot = (snapshot: Run) => {
+      setRun((current) => current.run_id === snapshot.run_id && current.revision > snapshot.revision ? current : snapshot)
+      setShowNew(false)
+      navigate('run')
+    }
     try {
-      await readCommandStream('/v1/runs', command, (event) => setEvents((current) => appendEvent(current, event)))
+      await readCommandStream('/v1/runs', command, (event) => {
+        setEvents((current) => appendEvent(current, event))
+        if (event.event_type === 'run_started') getRun(runId).then(showSnapshot).catch(() => undefined)
+      })
       const nextRun = await getRun(runId)
-      setRun(nextRun)
+      showSnapshot(nextRun)
       getRunTools(runId).then((result) => setToolExecutions(result.items)).catch(() => setToolExecutions([]))
       getNodeExecutions(runId).then((result) => setNodeExecutions(result.items)).catch(() => setNodeExecutions([]))
       getAdminRuns().then((result) => setAdminRuns(result.items)).catch(() => undefined)
       setNotice('已连接到 BugLens API，正在同步运行状态')
-    } catch {
-      setNotice('当前使用演示模式：已保留界面，API 尚未连接')
-      setRun({ ...demoRun, run_id: runId, user_question: question, user_context: context, source_evidence: evidence, lifecycle_status: 'running', outcome: null, current_node: 'analyze', report: null, evaluation: null, investigation: null, analysis: null, revision: 0, available_actions: ['cancel'], target })
-      setEvents([{ event_id: 'local-1', event_type: 'run_started', sequence: 1, revision: 0, occurred_at: new Date().toLocaleTimeString(), summary: '已在本地创建演示运行' }])
+    } catch (cause) {
+      try {
+        showSnapshot(await getRun(runId))
+        setNotice('连接中断，已回查诊断快照；可刷新查看进展。')
+      } catch {
+        setNotice('诊断提交未完成，请检查连接后重试。')
+        throw cause
+      }
     }
   }
 
@@ -498,6 +510,7 @@ function Sidebar({ page, health, version, runCount, navigate }: { page: Workspac
   const items: Array<[WorkspacePage, string, string]> = [
     ['dashboard', '⌂', '总览'],
     ['tasks', '▤', '诊断任务'],
+    ['guides', '▥', '问题定位指南'],
     ['sessions', '◌', 'Agent Sessions'],
   ]
   return <aside className="sidebar">
@@ -521,6 +534,7 @@ function ManagementPage({ page, runs, sessions, config, environments, environmen
   if (page === 'sessions') return <SessionsPage sessions={sessions} onOpenRun={onOpenRun} />
   if (page === 'settings') return <SettingsPage config={config} onConfigChange={onConfigChange} fetchError={fetchError} />
   if (page === 'environments') return <EnvironmentPage environments={environments} config={environmentConfig} plugins={plugins} onConfigChange={onEnvironmentConfigChange} />
+  if (page === 'guides') return <GuidesPage environments={environments.items} />
   return <SystemPage health={health} version={version} />
 }
 
@@ -1001,28 +1015,6 @@ function ApprovalCard({ request, onResolve, canApprove, canReject }: { request: 
   }
   const args = Object.entries(request.arguments ?? {})
   return <section className="clarification-card approval-card"><div className="section-kicker"><span className="attention">!</span> 工具调用需要审批</div><h2>{request.explanation}</h2><p className="approval-tool">工具：<strong>{request.tool_name}</strong></p>{args.length > 0 && <div className="approval-arguments"><label>请求参数</label>{args.map(([key, value]) => <code key={key}>{key}: {Array.isArray(value) ? value.join(', ') : String(value ?? 'null')}</code>)}</div>}<div className="clarification-actions"><button className="primary-button" disabled={!canApprove || submitting} onClick={() => resolve('approve')}>{submitting ? '正在处理…' : '批准并继续'}</button><button className="quiet-button" disabled={!canReject || submitting} onClick={() => resolve('reject')}>拒绝并继续</button><span>仅允许已注册的只读工具，决定会记录在审计账本中。</span></div></section>
-}
-
-function NewDiagnosis({ profiles, environments, onClose, onSubmit }: { profiles: string[]; environments: EnvironmentSummary[]; onClose: () => void; onSubmit: (question: string, context: Record<string, string>, evidence: Evidence[], profile: string, target: TargetSpec) => void }) {
-  const [question, setQuestion] = useState('')
-  const [mode, setMode] = useState<'explicit' | 'infer'>('infer')
-  const [environment, setEnvironment] = useState(environments[0]?.environment_id ?? '')
-  const [environmentHint, setEnvironmentHint] = useState('')
-  const [service, setService] = useState('')
-  const [log, setLog] = useState('')
-  const [profile, setProfile] = useState(profiles[0] ?? 'default')
-  const [autoExplore, setAutoExplore] = useState(false)
-  useEffect(() => {
-    if (!environment && environments[0]) setEnvironment(environments[0].environment_id)
-  }, [environment, environments])
-  function submit(event: FormEvent) {
-    event.preventDefault()
-    if (!question.trim() || (mode === 'explicit' && !environment)) return
-    const hint = mode === 'infer' ? environmentHint.trim() : environment
-    const context: Record<string, string> = { ...(hint ? { environment: hint } : {}), ...(service ? { service } : {}), ...(autoExplore ? { auto_explore: 'true' } : {}) }
-    onSubmit(question, context, log.trim() ? [{ source: 'log', content: log }] : [], profile, { mode, environment_id: hint || null, primary_service_id: service || null })
-  }
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="new-diagnosis-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">新的诊断运行</span><h2>把问题说清楚，剩下的交给 BugLens</h2></div><button type="button" className="close-button" onClick={onClose}>×</button></div><label>问题描述<span className="required">必填</span><textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={4} placeholder="例如：生产环境订单接口从 10:20 开始大量超时…" autoFocus /></label><div className="form-row"><label>目标方式<select value={mode} onChange={(event) => setMode(event.target.value as 'explicit' | 'infer')}><option value="infer">自动推断后确认</option><option value="explicit">明确选择环境</option></select></label>{mode === 'explicit' ? <label>环境<select value={environment} onChange={(event) => setEnvironment(event.target.value)}><option value="" disabled>请选择已配置环境</option>{environments.map((item) => <option key={item.environment_id} value={item.environment_id}>{item.display_name} · {item.environment_id}</option>)}</select></label> : <label>环境/别名提示<input value={environmentHint} onChange={(event) => setEnvironmentHint(event.target.value)} placeholder="production、prod 或线上" /></label>}</div><label>主服务提示<span className="optional">可选</span><input value={service} onChange={(event) => setService(event.target.value)} placeholder="order-api" /></label><label>已有日志或证据<span className="optional">可选</span><textarea value={log} onChange={(event) => setLog(event.target.value)} rows={3} placeholder="粘贴一小段与问题直接相关的日志、指标或变更记录" /></label><div className="form-row profile-row"><label>策略 Profile<select value={profile} onChange={(event) => setProfile(event.target.value)}>{profiles.map((name) => <option key={name}>{name}</option>)}</select></label><label className="auto-explore-toggle"><input type="checkbox" checked={autoExplore} onChange={(event) => setAutoExplore(event.target.checked)} /><span><strong>自主探索模式</strong><small>自动跳过澄清，不等用户补充</small></span></label></div><div className="modal-footer"><span>确认后会生成不可变环境快照</span><button type="submit" className="primary-button" disabled={!question.trim() || (mode === 'explicit' && !environment)}>开始诊断 →</button></div></form></div>
 }
 
 function PanelHeader({ title, meta }: { title: string; meta?: string }) { return <div className="panel-header"><h2>{title}</h2>{meta && <span>{meta}</span>}</div> }

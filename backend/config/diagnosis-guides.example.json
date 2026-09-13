@@ -1,0 +1,24 @@
+{
+  "guides": [
+    {
+      "title": "数据库连接池等待超时",
+      "category": "performance",
+      "phenomenon": "接口延迟升高，日志出现 timeout waiting for database connection。",
+      "symptoms": ["数据库连接池等待超时", "timeout waiting for database connection", "接口延迟升高"],
+      "applicability": "适用于使用数据库连接池的服务。先核对故障时间窗口、组件和版本。",
+      "steps": [
+        {
+          "instruction": "查看故障时间窗口内连接池使用率、等待时间及请求量。",
+          "expected_observation": "确认连接池使用率是否达到上限，等待时间是否同步升高。"
+        },
+        {
+          "instruction": "核对同一时间窗口内慢查询、依赖耗时和连接持有时间。",
+          "expected_observation": "判断连接等待与数据库耗时或长时间持有连接是否相关。"
+        }
+      ],
+      "unverified_causes": ["慢查询或长事务增加连接持有时间", "请求增长超出当前连接池容量"],
+      "limitations": ["这些现象不能单独确认根因，需要本次指标与日志支持。"],
+      "enabled": true
+    }
+  ]
+}
